@@ -2,9 +2,21 @@
 
 ## Purpose
 
-Stage 00 turns **HEALPix- (or otherwise) sharded** star parquet from upstream into files that **stage 01** can stream: same world geometry for Morton codes, precomputed per-star fields where needed, and **per-file** sort order suitable for DuckDB queries that group by `node_id`.
+Stage 00 turns **HEALPix- (or otherwise) sharded** star parquet from upstream into files that **stage 01** can query efficiently with DuckDB to build octree nodes. It enriches each file with Morton codes and precomputed render fields, then sorts and splits the data so that DuckDB's row-group statistics make later queries fast.
 
-Stage 00 is **not** a global spatial merge: each input file is processed independently. Octree cells still span many files; stage 01’s row source is responsible for cross-shard queries and ordering.
+### Why sort by `morton_code`?
+
+Stage 01 builds one octree level at a time, issuing DuckDB queries that select stars for a target `node_id` range. Parquet stores **min/max statistics per row group** for every column; DuckDB uses these to skip row groups whose `morton_code` range doesn't overlap the query predicate. Sorting each file by `morton_code` ensures that stars belonging to the same octree cell are physically adjacent, so most row groups can be skipped outright.
+
+### Why split by magnitude band?
+
+Stars are assigned to octree levels by absolute magnitude. Stage 01 queries one level at a time, which maps to a magnitude range. Pre-splitting the files into **bright**, **medium**, and **faint** bands means each query only opens the band files it needs, avoiding even the row-group scan of irrelevant magnitude ranges.
+
+### Spatial locality from HEALPix
+
+Stage 00 processes each HEALPix file independently — it does **not** perform a global spatial merge across files. However, because each HEALPix pixel covers a narrow angular cone, stars within a single file are already **spatially clustered** (though not in octree order). After Morton-sorting, this natural clustering means most octree cells touched by that file occupy a contiguous run of `morton_code` values, which further concentrates the useful row groups and improves DuckDB skip rates.
+
+Stage 01's row source is responsible for cross-shard queries and ordering; stage 00's job is to make those queries as cheap as possible per file.
 
 **Next:** [pipeline-stage-01.md](pipeline-stage-01.md) (build intermediates).
 
@@ -13,7 +25,7 @@ Stage 00 is **not** a global spatial merge: each input file is processed indepen
 ## Execution order
 
 1. **`add_shard_columns`** — must run when input parquet has **no** `morton_code` (or you want to re-derive it from ICRS for consistency with `foundinspace.octree.config`).
-2. **`sort_shards`** — requires `morton_code` on disk; sorts each source file’s rows and splits into magnitude bands.
+2. **`sort_shards`** — requires `morton_code` on disk; sorts each source file's rows and splits into magnitude bands.
 
 Typical flow:
 
@@ -78,11 +90,20 @@ You can also run `python -m foundinspace.octree stage-00 …` (same options).
 
 **Module:** `foundinspace.octree.sources.sort_shards`
 
-**Role:** `run_sort_shards(src_root, dst_root, *, mag_config=..., clear_dst=..., verbose=...)`. For each ``*.parquet`` **file in the root of** ``src_root``, runs DuckDB `COPY` queries that:
+**Role:** `run_sort_shards(src_root, dst_root, *, mag_config=..., clear_dst=..., verbose=...)`. For each `*.parquet` **file in the root of** `src_root`, runs DuckDB `COPY` queries that:
 
 1. Filter rows into three **magnitude bands** using `LEVEL_CONFIG` and levels 11 / 12 (same semantics as `mag_levels.py`: lower bound exclusive, upper inclusive).
 2. **`ORDER BY morton_code, mag_abs`** within each band.
-3. Write partitioned parquet output (e.g. ~1 GB files, zstd).
+3. Write partitioned parquet output (e.g. ~1 GB files, zstd).
+
+### How this helps stage 01
+
+The combination of Morton sort order and magnitude band splitting produces parquet files whose row-group statistics are tightly bounded on both `morton_code` and `mag_abs`. When stage 01 queries for a specific octree level (magnitude range) and `node_id` range (`morton_code >> shift`), DuckDB can:
+
+* **skip entire band directories** that don't match the target magnitude range,
+* **skip row groups** within matching files whose `morton_code` min/max falls outside the target `node_id` range.
+
+This turns what would be a full scan of all star data into a narrow, statistics-driven read of only the relevant row groups.
 
 ### Bands
 
@@ -116,5 +137,5 @@ Keep these identical to what stage 01 and the final octree build use.
 ## Non-goals (stage 00)
 
 * Does not assign stars to final octree shard files (that is stage 01).
-* Does not guarantee **global** Morton order across files — only **within** each output partition/file from `sort_shards`.
+* Does not guarantee **global** Morton order across files — only **within** each output partition/file from `sort_shards`. Stars for a given octree cell may span many HEALPix-origin files; stage 01 handles the cross-file merge.
 * Does not replace DuckDB ordering in stage 01; stage 01 still assumes the query contract in `pipeline-stage-01.md`.
