@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Add render (16-byte fixed) and level (int32) columns to morton-sorted parquet files in-place.
+"""Add morton_code, render (16-byte fixed), and level (int32) to parquet files in-place.
 
-Reads morton_code, positions, mag_abs, teff; derives level from mag_abs via MagLevelConfig,
-gets cell (gx, gy, gz) from morton_code >> (3 * (MORTON_BITS - level)), then cell-relative quantized
-render bytes. Writes to a temp file and renames to replace the original. Skip files that
-already have both columns unless --force.
+Computes morton_code from x_icrs_pc, y_icrs_pc, z_icrs_pc using world geometry in
+foundinspace.octree.config and foundinspace.octree.encoding.morton (no upstream morton).
 
-Usage:
-  uv run python scripts/add_render_level_columns.py DATA_DIR [--force]
-  uv run python scripts/add_render_level_columns.py /data/astro/gaia-sorted-runs [--force]
+Derives level from mag_abs via MagLevelConfig; gets cell (gx, gy, gz) from
+morton_code >> (3 * (MORTON_BITS - level)), then cell-relative quantized render bytes.
+
+Writes to a temp file and renames to replace the original. Skip files that already have
+morton_code, render, and level unless ``force`` is True.
+
+Run before ``run_sort_shards`` (stage 00) when input lacks morton_code; see docs/pipeline-stage-00.md.
+
+Invoked from ``foundinspace.octree._cli``; use ``uv run fis-octree stage-00 ...``.
 """
 from __future__ import annotations
 
-import argparse
 import os
 import time
 from pathlib import Path
@@ -31,6 +34,7 @@ from foundinspace.octree.config import (
     WORLD_CENTER,
     WORLD_HALF_SIZE_PC,
 )
+from foundinspace.octree.encoding.morton import morton3d_u64_from_xyz_arrays
 from foundinspace.octree.encoding.teff import encode_teff
 
 # Numpy dtypes for vectorized pack/unpack (16-byte render, 10-byte meta)
@@ -140,14 +144,19 @@ def process_file(
     center: np.ndarray,
     half_size: float,
 ) -> tuple[bool, int, float]:
-    """Process one parquet file: add render and level columns, write in-place.
+    """Process one parquet file: add morton_code, render, and level; write in-place.
     Returns (written, n_stars, elapsed_sec); if skipped, (False, 0, 0.0)."""
     file_meta = pq.read_metadata(path)
     schema = file_meta.schema.to_arrow_schema()
     names = set(schema.names)
-    if "render" in names and "level" in names and not force:
+    if (
+        "render" in names
+        and "level" in names
+        and "morton_code" in names
+        and not force
+    ):
         return (False, 0, 0.0)
-    required = {"morton_code", "x_icrs_pc", "y_icrs_pc", "z_icrs_pc", "mag_abs"}
+    required = {"x_icrs_pc", "y_icrs_pc", "z_icrs_pc", "mag_abs"}
     missing = required - names
     if missing:
         raise ValueError(f"{path}: missing columns {missing}")
@@ -162,14 +171,10 @@ def process_file(
             pa.array(np.full(len(table), 5800.0, dtype=np.float64)),
         )
 
-    morton_code = table.column("morton_code")
-    if hasattr(morton_code, "to_numpy"):
-        morton_code = morton_code.to_numpy(zero_copy_only=False)
-    else:
-        morton_code = np.array(morton_code)
     x = np.asarray(table.column("x_icrs_pc"), dtype=np.float64)
     y = np.asarray(table.column("y_icrs_pc"), dtype=np.float64)
     z = np.asarray(table.column("z_icrs_pc"), dtype=np.float64)
+    morton_code = morton3d_u64_from_xyz_arrays(x, y, z)
     positions = np.column_stack([x, y, z])
     mag_abs = np.asarray(table.column("mag_abs"), dtype=np.float64)
     teff = np.asarray(table.column("teff"), dtype=np.float64)
@@ -178,13 +183,17 @@ def process_file(
         morton_code, positions, mag_abs, teff, center, half_size, mag_config
     )
     n_stars = len(render)
-    if "render" in names:
-        table = table.drop(["render"])
-    if "level" in names:
-        table = table.drop(["level"])
+    for col in ("morton_code", "render", "level"):
+        if col in names:
+            table = table.drop([col])
+    morton_col = pa.array(morton_code, type=pa.uint64())
     render_col = _make_fixed_size_binary_column(render)
     level_col = pa.array(level, type=pa.int32())
-    table = table.append_column("render", render_col).append_column("level", level_col)
+    table = (
+        table.append_column("morton_code", morton_col)
+        .append_column("render", render_col)
+        .append_column("level", level_col)
+    )
 
     tmp = path.with_suffix(path.suffix + ".tmp")
     pq.write_table(table, tmp, compression=compression)
@@ -193,71 +202,61 @@ def process_file(
     return (True, n_stars, elapsed)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Add render and level columns to morton-sorted parquet files in-place."
-    )
-    parser.add_argument(
-        "data_dir",
-        type=Path,
-        help="Directory to search for .parquet files (walks subtree)",
-    )
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Overwrite render/level even if columns already exist",
-    )
-    parser.add_argument(
-        "--v-mag",
-        type=float,
-        default=DEFAULT_MAG_VIS,
-        help=f"Indexing magnitude for level assignment (default: {DEFAULT_MAG_VIS})",
-    )
-    parser.add_argument(
-        "--max-level",
-        type=int,
-        default=DEFAULT_MAX_LEVEL,
-        help=f"Max octree level (default: {DEFAULT_MAX_LEVEL})",
-    )
-    args = parser.parse_args()
-    data_dir = args.data_dir
-    if not data_dir.is_dir():
-        raise SystemExit(f"Not a directory: {data_dir}")
+def run_add_shard_columns(
+    data_dir: Path,
+    *,
+    mag_config: MagLevelConfig | None = None,
+    force: bool = False,
+    v_mag: float | None = None,
+    max_level: int | None = None,
+    verbose: bool = True,
+) -> tuple[int, int]:
+    """
+    Walk ``data_dir`` recursively for ``*.parquet`` and add morton_code, render, level in-place.
 
-    if args.v_mag == DEFAULT_MAG_VIS and args.max_level == DEFAULT_MAX_LEVEL:
-        mag_config = LEVEL_CONFIG
-    else:
-        mag_config = MagLevelConfig(
-            v_mag=args.v_mag,
-            world_half_size=WORLD_HALF_SIZE_PC,
-            max_level=args.max_level,
-        )
+    If ``mag_config`` is given, it is used for level assignment. Otherwise ``v_mag`` / ``max_level``
+    (defaulting to config defaults) determine a ``MagLevelConfig``.
+
+    Returns ``(written_count, skipped_count)``.
+    """
+    if not data_dir.is_dir():
+        raise NotADirectoryError(f"Not a directory: {data_dir}")
+
+    if mag_config is None:
+        vm = DEFAULT_MAG_VIS if v_mag is None else v_mag
+        ml = DEFAULT_MAX_LEVEL if max_level is None else max_level
+        if vm == DEFAULT_MAG_VIS and ml == DEFAULT_MAX_LEVEL:
+            mag_config = LEVEL_CONFIG
+        else:
+            mag_config = MagLevelConfig(
+                v_mag=vm,
+                world_half_size=WORLD_HALF_SIZE_PC,
+                max_level=ml,
+            )
     center = WORLD_CENTER.copy()
     half_size = WORLD_HALF_SIZE_PC
 
     paths = sorted(data_dir.rglob("*.parquet"))
     if not paths:
-        print(f"No .parquet files under {data_dir}")
-        return
+        if verbose:
+            print(f"No .parquet files under {data_dir}")
+        return (0, 0)
+
     written = 0
     skipped = 0
     for p in paths:
-        try:
+        if verbose:
             label = p.relative_to(data_dir)
             print(f"Processing {label}....", end="", flush=True)
-            result = process_file(p, mag_config, args.force, center, half_size)
-            ok, n_stars, elapsed = result
-            if ok:
+        ok, n_stars, elapsed = process_file(p, mag_config, force, center, half_size)
+        if ok:
+            if verbose:
                 print(f" Wrote {n_stars:,} stars in {elapsed:.1f}s")
-                written += 1
-            else:
-                print(" Skipped (already has render+level).")
-                skipped += 1
-        except Exception as e:
-            print(f"Error {p}: {e}")
-            raise
-    print(f"Done: {written} written, {skipped} skipped.")
-
-
-if __name__ == "__main__":
-    main()
+            written += 1
+        else:
+            if verbose:
+                print(" Skipped (already has morton_code+render+level).")
+            skipped += 1
+    if verbose:
+        print(f"Done: {written} written, {skipped} skipped.")
+    return (written, skipped)

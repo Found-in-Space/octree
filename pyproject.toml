@@ -20,7 +20,7 @@ dependencies = [
 ]
 
 [project.scripts]
-fis-pipeline = "foundinspace.pipeline.cli:cli"
+fis-octree = "foundinspace.octree._cli:cli"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/foundinspace"]

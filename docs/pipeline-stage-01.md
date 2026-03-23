@@ -1,21 +1,25 @@
-# Pipeline 1 Specification: Build Intermediates
+# Pipeline stage 01: Build intermediates
+
+## Prerequisites
+
+Input parquet for this stage is expected to be prepared by **pipeline stage 00** (see [pipeline-stage-00.md](pipeline-stage-00.md)): ICRS coordinates, `morton_code` derived from the same world geometry as the octree, optional precomputed `render` / `level`, and shard-local sorting suitable for streaming cell flush.
 
 ## Purpose
 
-Pipeline 1 builds the **intermediate on-disk representation** used by the octree combine stage. It consumes a stream of stars that is **already sorted for the target cell order** and writes a set of append-only shard files:
+Stage 01 builds the **intermediate on-disk representation** used by the octree combine stage. It consumes a stream of stars that is **already sorted for the target cell order** and writes a set of append-only shard files:
 
 * a binary **payload file** containing one compressed payload blob per cell
 * a binary **index file** containing one fixed-size record per cell
 * a top-level **manifest** describing all generated shard files and the binary layout
 
-Pipeline 1 is a **bounded-memory writer**. It must never materialize the full dataset, the full set of cells, or any cross-level/global lookup structures in RAM. The only permitted in-memory state is:
+Stage 01 is a **bounded-memory writer**. It must never materialize the full dataset, the full set of cells, or any cross-level/global lookup structures in RAM. The only permitted in-memory state is:
 
 * the current input batch
 * the current cell accumulator
 * a bounded set of open writers / file handles
 * small codec scratch buffers
 
-The output of Pipeline 1 is designed so that Pipeline 2 can later:
+The output of Stage 01 is designed so that Pipeline 2 can later:
 
 * traverse cells in DFS order
 * relocate payloads directly into the final `stars.octree`
@@ -26,7 +30,7 @@ The output of Pipeline 1 is designed so that Pipeline 2 can later:
 
 ## Non-goals
 
-Pipeline 1 does **not**:
+Stage 01 does **not**:
 
 * build the final `stars.octree`
 * compute final payload offsets in the output octree
@@ -40,7 +44,7 @@ Pipeline 1 does **not**:
 
 ### 1. Bounded memory
 
-At no point may Pipeline 1 store all stars, all cells, all offsets, or all node keys in memory. The implementation must remain streaming in structure.
+At no point may Stage 01 store all stars, all cells, all offsets, or all node keys in memory. The implementation must remain streaming in structure.
 
 ### 2. Append-only writes
 
@@ -65,7 +69,7 @@ Rows arriving at the cell encoder for a given shard must already be ordered by:
 
 `(node_id, mag_abs[, stable_tiebreak])`
 
-Pipeline 1 must not add any secondary re-sort unless explicitly required by the payload format contract.
+Stage 01 must not add any secondary re-sort unless explicitly required by the payload format contract.
 
 ### 6. Shard-local order
 
@@ -171,7 +175,7 @@ class EncodedCell:
 
 ## Input contract
 
-Pipeline 1 consumes data from a row source that produces rows grouped and ordered for streaming cell flush.
+Stage 01 consumes data from a row source that produces rows grouped and ordered for streaming cell flush.
 
 ### Required logical fields
 
@@ -208,7 +212,7 @@ This ordering is part of the input contract. If the upstream query cannot guaran
 
 ### Determinism requirement
 
-If exact deterministic ordering is required for stars that share the same `node_id` and identical `mag_abs`, the upstream source must define a stable tiebreak key. Pipeline 1 must not invent one implicitly.
+If exact deterministic ordering is required for stars that share the same `node_id` and identical `mag_abs`, the upstream source must define a stable tiebreak key. Stage 01 must not invent one implicitly.
 
 ---
 
@@ -390,7 +394,7 @@ The manifest must only list completed shard files.
 
 ## Writer API
 
-Pipeline 1 should implement a shard writer abstraction.
+Stage 01 should implement a shard writer abstraction.
 
 ```python
 class IntermediateShardWriter:
@@ -428,7 +432,7 @@ For each cell, `write_cell()` must:
 
 ## Row source and cell encoding
 
-Pipeline 1 conceptually consists of three phases:
+Stage 01 conceptually consists of three phases:
 
 1. **row source**
 2. **cell encoder**
@@ -458,7 +462,7 @@ def iter_encoded_cells(rows: Iterator[StarRow], encoder: CellEncoder) -> Iterato
 
 ## Payload encoding requirements
 
-The payload encoder is outside the scope of the intermediate file contract, but Pipeline 1 must enforce these requirements:
+The payload encoder is outside the scope of the intermediate file contract, but Stage 01 must enforce these requirements:
 
 ### 1. One encoded payload per cell
 
@@ -480,7 +484,7 @@ The payload encoder must not depend on previous or future cells.
 
 ## Execution model
 
-Pipeline 1 should iterate levels in ascending order and within each level iterate shards in ascending `prefix` order.
+Stage 01 should iterate levels in ascending order and within each level iterate shards in ascending `prefix` order.
 
 Recommended execution order:
 
@@ -548,9 +552,9 @@ Each completed shard file pair should be validated before manifest publication.
 
 The implementation must favor sequential reads and writes.
 
-### 2. No global sort inside Pipeline 1
+### 2. No global sort inside Stage 01
 
-If sorting is needed, it must occur upstream in the row source. Pipeline 1 itself is not a sorting stage.
+If sorting is needed, it must occur upstream in the row source. Stage 01 itself is not a sorting stage.
 
 ### 3. Constant-memory cell flush
 
@@ -568,19 +572,19 @@ DuckDB may be used as the row source, but the surrounding API must not depend on
 
 ### Core decision
 
-Pipeline 1 should **preserve the existing two input modes** unless there is a deliberate later decision to remove one:
+Stage 01 should **preserve the existing two input modes** unless there is a deliberate later decision to remove one:
 
 1. **Raw-coordinate mode**
 
    * input provides physical star fields such as coordinates, temperature, and magnitude
-   * Pipeline 1 derives cell-local payload bytes itself
+   * Stage 01 derives cell-local payload bytes itself
 
 2. **Precomputed-render mode**
 
    * input already provides render-ready per-star bytes plus the target level
-   * Pipeline 1 groups those rows into cells and writes the compressed cell payloads without changing star order
+   * Stage 01 groups those rows into cells and writes the compressed cell payloads without changing star order
 
-The specification for Pipeline 1 defines and requires support for these two modes.
+The specification for Stage 01 defines and requires support for these two modes.
 
 ### Query-level invariants that must be preserved
 
@@ -588,11 +592,11 @@ The implementation must satisfy the following query semantics.
 
 #### 1. One query stream per target level
 
-Pipeline 1 operates level-by-level. The row source for a given level must only produce stars for that level’s target cells.
+Stage 01 operates level-by-level. The row source for a given level must only produce stars for that level’s target cells.
 
 #### 2. Stable cell grouping order
 
-Rows must arrive grouped by target cell so that Pipeline 1 can flush a cell when `node_id` changes.
+Rows must arrive grouped by target cell so that Stage 01 can flush a cell when `node_id` changes.
 
 This means the query layer must guarantee ordered rows by:
 
@@ -602,7 +606,7 @@ or an equivalent order that preserves the same grouping and same within-cell ord
 
 #### 3. No downstream reorder unless explicitly required by the payload contract
 
-Pipeline 1 must not silently reorder stars inside a cell. The query order is therefore part of the Pipeline 1 contract.
+Stage 01 must not silently reorder stars inside a cell. The query order is therefore part of the Stage 01 contract.
 
 #### 4. Input ordering is part of the spec, not an implementation accident
 
@@ -653,7 +657,7 @@ ORDER BY node_id, mag_abs
 
 * `shift = 3 * (MAX_MORTON_LEVEL - level)`
 * the exact magnitude filter must preserve current level-band semantics
-* Pipeline 1 must preserve the existing decision that rows are grouped by `node_id` and ordered by `mag_abs`
+* Stage 01 must preserve the existing decision that rows are grouped by `node_id` and ordered by `mag_abs`
 * if deterministic tiebreaking beyond `mag_abs` is required, that tiebreak must be defined explicitly rather than improvised later
 
 ## B. Precomputed-render mode
@@ -665,7 +669,7 @@ This mode corresponds to the existing behavior where parquet already contains:
 * `morton_code`
 * `mag_abs`
 
-and Pipeline 1 does not recompute per-star render bytes.
+and Stage 01 does not recompute per-star render bytes.
 
 ### Mode detection
 
@@ -699,11 +703,11 @@ ORDER BY node_id, mag_abs
 
 The required ordering contract is `node_id, mag_abs` (optionally followed by a stable tiebreaker if explicitly defined).
 
-For Pipeline 1, the preserved contract is:
+For Stage 01, the preserved contract is:
 
 * input is already in the required order
 * that order is `node_id, mag_abs` unless an explicit stable tiebreak is added
-* Pipeline 1 does not add an extra reorder step
+* Stage 01 does not add an extra reorder step
 
 ### Deep-level prefix / octant sharding
 
@@ -732,7 +736,7 @@ For each `(level, prefix_bits, prefix)` shard, the row source must ensure:
 
 ### Magnitude-band semantics
 
-The magnitude-band logic used to assign stars to levels is part of the Pipeline 1 contract and must be implemented exactly as defined by the level configuration.
+The magnitude-band logic used to assign stars to levels is part of the Stage 01 contract and must be implemented exactly as defined by the level configuration.
 
 That includes:
 
@@ -744,7 +748,7 @@ These rules must be implemented exactly; approximation is not permitted.
 
 ### Documentation requirement
 
-An implementation of Pipeline 1 should document, in code and tests:
+An implementation of Stage 01 should document, in code and tests:
 
 * the exact SQL shape for raw-coordinate mode
 * the exact SQL shape for precomputed-render mode
@@ -802,7 +806,7 @@ This pseudocode is normative in structure even if helper names differ.
 
 ## Summary of required outputs
 
-Pipeline 1 must produce:
+Stage 01 must produce:
 
 1. one payload file per shard
 2. one fixed-record index file per shard
@@ -820,7 +824,7 @@ The outputs must satisfy all of the following:
 
 ## Acceptance criteria
 
-Pipeline 1 is complete when all of the following are true:
+Stage 01 is complete when all of the following are true:
 
 * a full dataset can be processed without materializing the full index or cell set in memory
 * every cell is written exactly once into exactly one shard

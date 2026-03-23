@@ -30,14 +30,19 @@ def _spread21(v: np.ndarray) -> np.ndarray:
     return v
 
 
-def normalize_axis_to_u21(a: pd.Series) -> np.ndarray:
+def normalize_axis_array(a: np.ndarray) -> np.ndarray:
     """
-    Map physical coordinates in pc from [-200000, +200000] into uint21 grid coords.
+    Map physical coordinates in pc from [-half_width, +half_width] into uint grid coords.
     Values outside the cube are clipped.
     """
-    v = np.floor((a.to_numpy(dtype=np.float64, copy=False) + HALF_WIDTH_PC) * SCALE)
+    v = np.floor((a.astype(np.float64, copy=False) + HALF_WIDTH_PC) * SCALE)
     v = np.clip(v, 0, GRID_MAX)
     return v.astype(np.uint64)
+
+
+def normalize_axis_to_u21(a: pd.Series) -> np.ndarray:
+    """Same as normalize_axis_array for a pandas Series column."""
+    return normalize_axis_array(a.to_numpy(dtype=np.float64, copy=False))
 
 
 def morton3d_u64_from_xyz(
@@ -59,6 +64,20 @@ def morton3d_u64_from_xyz(
     iy = normalize_axis_to_u21(df[ycol])
     iz = normalize_axis_to_u21(df[zcol])
 
+    return _spread21(ix) | (_spread21(iy) << 1) | (_spread21(iz) << 2)
+
+
+def morton3d_u64_from_xyz_arrays(
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+) -> np.ndarray:
+    """
+    Vectorized Morton code from ICRS coordinates in pc (same semantics as morton3d_u64_from_xyz).
+    """
+    ix = normalize_axis_array(np.asarray(x, dtype=np.float64))
+    iy = normalize_axis_array(np.asarray(y, dtype=np.float64))
+    iz = normalize_axis_array(np.asarray(z, dtype=np.float64))
     return _spread21(ix) | (_spread21(iy) << 1) | (_spread21(iz) << 2)
 
 
