@@ -117,7 +117,6 @@ class BuildPlan:
     deep_shard_from_level: int
     deep_prefix_bits: int
     batch_size: int
-    use_precomputed_render: bool
 
 
 def build_intermediates(
@@ -133,12 +132,12 @@ def build_intermediates(
 
 `build_intermediates(...)` must:
 
-1. create all necessary shard payload/index files under `out_dir`
+1. create shard payload/index files under `out_dir` for shards that contain at least one cell
 2. write all cell payload blobs and matching index records
 3. write a complete `manifest.json`
 4. return the path to that manifest
 
-It must fail atomically at shard-file granularity: partial output for a shard is permitted during execution, but the final manifest must only describe successfully completed files.
+It must fail atomically at shard-file granularity: partial output for a shard is permitted during execution, but the final manifest must only describe successfully completed non-empty shard files.
 
 ---
 
@@ -179,28 +178,21 @@ Stage 01 consumes data from a row source that produces rows grouped and ordered 
 
 ### Required logical fields
 
-Every row must provide enough information to derive:
+Stage 01 consumes the Stage 00 output contract and expects precomputed render rows.
+Every row must provide:
 
-* target `level`
-* target `node_id`
+* `level`
+* `morton_code`
+* `mag_abs`
+* `render` (per-star precomputed bytes)
+
+From those fields Stage 01 derives:
+
+* target `node_id` via `morton_code >> shift`
 * `mag_abs`
 * payload encoding inputs
 
-Depending on mode, those payload inputs are one of:
-
-#### Raw-coordinate mode
-
-* `x_icrs_pc`
-* `y_icrs_pc`
-* `z_icrs_pc`
-* `teff` or equivalent defaultable value
-* `mag_abs`
-
-#### Precomputed-render mode
-
-* `render`
-* `mag_abs`
-* `node_id`
+Raw-coordinate mode is out of scope for Stage 01 in this version.
 
 ### Input ordering
 
@@ -213,6 +205,10 @@ This ordering is part of the input contract. If the upstream query cannot guaran
 ### Determinism requirement
 
 If exact deterministic ordering is required for stars that share the same `node_id` and identical `mag_abs`, the upstream source must define a stable tiebreak key. Stage 01 must not invent one implicitly.
+
+### Input uniqueness assumption
+
+Each star row appears in exactly one Stage 00 shard input. Stage 01 must not duplicate rows across shard streams.
 
 ---
 
@@ -242,6 +238,17 @@ A cell with `(level, node_id)` belongs to shard `(level, prefix_bits, prefix)` i
 * `node_id >> (3 * level - prefix_bits) == prefix`
 
 This rule must be applied consistently by both the build and combine stages.
+
+### Parameter guardrails
+
+The shard plan must satisfy:
+
+* `deep_shard_from_level >= 0`
+* `deep_prefix_bits >= 0`
+* for any sharded level `L`, `deep_prefix_bits <= 3 * L`
+* for every shard key, `0 <= prefix < 2^prefix_bits`
+
+At level 0, only `prefix_bits = 0` is valid.
 
 ### Shard naming
 
@@ -345,7 +352,7 @@ The manifest must describe:
 * maximum level
 * payload codec
 * exact binary layouts in use
-* all shard files that were successfully written
+* all non-empty shard files that were successfully written
 * per-shard record counts
 
 ### Example structure
@@ -388,7 +395,7 @@ The manifest must describe:
 }
 ```
 
-The manifest must only list completed shard files.
+The manifest must only list completed non-empty shard files.
 
 ---
 
@@ -404,7 +411,7 @@ class IntermediateShardWriter:
     def write_cell(self, cell: EncodedCell) -> None:
         ...
 
-    def close(self) -> dict:
+    def close(self) -> dict | None:
         ...
 ```
 
@@ -426,7 +433,8 @@ For each cell, `write_cell()` must:
 
 * flush and close both files
 * patch the index file header with the final `record_count`
-* return a manifest fragment describing the completed shard
+* if `record_count == 0`, remove the shard files and return `None`
+* otherwise return a manifest fragment describing the completed shard
 
 ---
 
@@ -462,7 +470,7 @@ def iter_encoded_cells(rows: Iterator[StarRow], encoder: CellEncoder) -> Iterato
 
 ## Payload encoding requirements
 
-The payload encoder is outside the scope of the intermediate file contract, but Stage 01 must enforce these requirements:
+Stage 01 receives precomputed per-star render bytes from Stage 00. It must group those rows into cells and emit one compressed payload blob per cell while preserving row order.
 
 ### 1. One encoded payload per cell
 
@@ -572,19 +580,8 @@ DuckDB may be used as the row source, but the surrounding API must not depend on
 
 ### Core decision
 
-Stage 01 should **preserve the existing two input modes** unless there is a deliberate later decision to remove one:
-
-1. **Raw-coordinate mode**
-
-   * input provides physical star fields such as coordinates, temperature, and magnitude
-   * Stage 01 derives cell-local payload bytes itself
-
-2. **Precomputed-render mode**
-
-   * input already provides render-ready per-star bytes plus the target level
-   * Stage 01 groups those rows into cells and writes the compressed cell payloads without changing star order
-
-The specification for Stage 01 defines and requires support for these two modes.
+Stage 01 operates in precomputed-render mode only for this version.
+Input rows are produced by Stage 00 and include `render`, `level`, `morton_code`, and `mag_abs`.
 
 ### Query-level invariants that must be preserved
 
@@ -612,68 +609,16 @@ Stage 01 must not silently reorder stars inside a cell. The query order is there
 
 If the data source is a set of parquet files, the implementation must not assume that physical parquet order alone is sufficient unless that guarantee is made explicit by the upstream dataset contract. If required, the DuckDB query layer must impose the order.
 
-### Existing query modes to preserve
+### Required row shape
 
-## A. Raw-coordinate mode
-
-This mode corresponds to the existing behavior where the query produces:
-
-* target `node_id`
-* `x_icrs_pc`
-* `y_icrs_pc`
-* `z_icrs_pc`
-* `mag_abs`
-* `teff` with defaulting behavior if missing
-
-### Raw-coordinate query semantics
-
-For level `L`, the row source must:
-
-1. compute `node_id` as the Morton prefix for the level
-2. filter rows into the level’s magnitude band
-3. exclude rows with null magnitude
-4. default `teff` if absent/null
-5. return rows ordered for cell streaming
-
-### Preserved logical query shape
-
-The required logical query shape is:
-
-```sql
-SELECT
-    morton_code >> :shift AS node_id,
-    x_icrs_pc,
-    y_icrs_pc,
-    z_icrs_pc,
-    mag_abs,
-    COALESCE(teff, 5800) AS teff
-FROM read_parquet(:parquet_glob)
-WHERE <level magnitude filter>
-  AND mag_abs IS NOT NULL
-ORDER BY node_id, mag_abs
-```
-
-### Raw-coordinate mode notes
-
-* `shift = 3 * (MAX_MORTON_LEVEL - level)`
-* the exact magnitude filter must preserve current level-band semantics
-* Stage 01 must preserve the existing decision that rows are grouped by `node_id` and ordered by `mag_abs`
-* if deterministic tiebreaking beyond `mag_abs` is required, that tiebreak must be defined explicitly rather than improvised later
-
-## B. Precomputed-render mode
-
-This mode corresponds to the existing behavior where parquet already contains:
+Input parquet is expected to contain:
 
 * `render`
 * `level`
 * `morton_code`
 * `mag_abs`
 
-and Stage 01 does not recompute per-star render bytes.
-
-### Mode detection
-
-If both `render` and `level` columns are present, the implementation must support precomputed-render mode unless explicitly disabled by configuration.
+Stage 01 does not recompute per-star render bytes.
 
 ### Precomputed-render query semantics
 
@@ -736,7 +681,10 @@ For each `(level, prefix_bits, prefix)` shard, the row source must ensure:
 
 ### Magnitude-band semantics
 
-The magnitude-band logic used to assign stars to levels is part of the Stage 01 contract and must be implemented exactly as defined by the level configuration.
+Level semantics are defined by `MagLevelConfig` and materialized by Stage 00 in the `level` column.
+Stage 01 must use `WHERE level = :level` as the correctness contract for level selection.
+
+The Stage 00 bright/medium/faint split is a performance optimization and may be used to prune scanned files, but it must not alter correctness.
 
 That includes:
 
@@ -750,9 +698,8 @@ These rules must be implemented exactly; approximation is not permitted.
 
 An implementation of Stage 01 should document, in code and tests:
 
-* the exact SQL shape for raw-coordinate mode
 * the exact SQL shape for precomputed-render mode
-* the level-band filter semantics
+* the `WHERE level = :level` selection semantics
 * the shard prefix filter semantics
 * the exact ordering contract delivered to the cell encoder
 
@@ -763,9 +710,8 @@ The row source layer should have explicit tests that verify:
 1. rows for a level are grouped by `node_id`
 2. within a node, rows are in ascending `mag_abs`
 3. prefix-sharded queries contain only rows for that shard
-4. raw-coordinate and precomputed-render modes both produce equivalent cell grouping behavior
-5. null `mag_abs` rows are excluded
-6. `teff` defaulting matches the current implementation contract
+4. null `mag_abs` rows are excluded
+5. Stage 01 input rows are unique (no duplicate star rows across source shards)
 
 ## Reference pseudocode
 
@@ -784,14 +730,15 @@ def build_intermediates(parquet_glob: str, out_dir: Path, *, plan: BuildPlan) ->
                     level=level,
                     shard=shard,
                     batch_size=plan.batch_size,
-                    use_precomputed_render=plan.use_precomputed_render,
                 )
 
                 encoder = make_cell_encoder(level=level)
                 for cell in iter_encoded_cells(rows, encoder):
                     writer.write_cell(cell)
 
-                manifest_entries.append(writer.close())
+                shard_manifest = writer.close()
+                if shard_manifest is not None:
+                    manifest_entries.append(shard_manifest)
             except Exception:
                 writer.abort_if_supported()
                 raise
@@ -808,9 +755,9 @@ This pseudocode is normative in structure even if helper names differ.
 
 Stage 01 must produce:
 
-1. one payload file per shard
-2. one fixed-record index file per shard
-3. one manifest describing all completed shards
+1. one payload file per non-empty shard
+2. one fixed-record index file per non-empty shard
+3. one manifest describing all completed non-empty shards
 
 The outputs must satisfy all of the following:
 
