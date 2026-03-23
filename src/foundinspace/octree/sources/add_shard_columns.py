@@ -21,14 +21,24 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from three_dee.build.mag_levels import MagLevelConfig
-from three_dee.build.octree_io import WORLD_CENTER, WORLD_HALF_SIZE_PC, _encode_teff
-from three_dee.config import DEFAULT_MAX_LEVEL, DEFAULT_MAG_VIS, LEVEL_CONFIG
-from three_dee.build.octree_sharded import _RENDER_DT
+
+from foundinspace.octree.mag_levels import MagLevelConfig
+from foundinspace.octree.config import DEFAULT_MAX_LEVEL, DEFAULT_MAG_VIS, LEVEL_CONFIG, WORLD_CENTER, WORLD_HALF_SIZE_PC
+from foundinspace.octree.encoding.teff import encode_teff
 
 # Morton code is 21 bits per axis (63 bits total)
 MORTON_BITS = 21
 
+# Numpy dtypes for vectorized pack/unpack (16-byte render, 10-byte meta)
+_RENDER_DT = np.dtype([
+    ("x", "<f4"),
+    ("y", "<f4"),
+    ("z", "<f4"),
+    ("mag", "<i2"),
+    ("teff", "u1"),
+    ("pad", "u1"),
+])
+assert _RENDER_DT.itemsize == 16
 
 def _compute_render_and_level(
     morton_code: np.ndarray,
@@ -52,7 +62,7 @@ def _compute_render_and_level(
             f"Higher levels require uint64 for node_id handling — extend and re-enable if needed."
         )
 
-    teff_log8 = _encode_teff(teff)
+    teff_log8 = encode_teff(teff)
     render_out = np.zeros(n, dtype=_RENDER_DT)
 
     for L in np.unique(level_arr):

@@ -12,8 +12,8 @@ import shutil
 
 import duckdb
 
-from three_dee.duckdb_util import configure_connection
-from three_dee.config import DEFAULT_MAX_LEVEL, WORLD_HALF_SIZE_PC, LEVEL_CONFIG
+from ..duckdb_util import configure_connection
+from ..config import LEVEL_CONFIG
 
 PARTITION_LEVEL = 13
 PARTITION_SHIFT = 3 * (21 - PARTITION_LEVEL) 
