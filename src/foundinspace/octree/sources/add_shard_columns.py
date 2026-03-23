@@ -2,7 +2,7 @@
 """Add render (16-byte fixed) and level (int32) columns to morton-sorted parquet files in-place.
 
 Reads morton_code, positions, mag_abs, teff; derives level from mag_abs via MagLevelConfig,
-gets cell (gx, gy, gz) from morton_code >> (3 * (21 - level)), then cell-relative quantized
+gets cell (gx, gy, gz) from morton_code >> (3 * (MORTON_BITS - level)), then cell-relative quantized
 render bytes. Writes to a temp file and renames to replace the original. Skip files that
 already have both columns unless --force.
 
@@ -23,11 +23,15 @@ import pyarrow.parquet as pq
 
 
 from foundinspace.octree.mag_levels import MagLevelConfig
-from foundinspace.octree.config import DEFAULT_MAX_LEVEL, DEFAULT_MAG_VIS, LEVEL_CONFIG, WORLD_CENTER, WORLD_HALF_SIZE_PC
+from foundinspace.octree.config import (
+    DEFAULT_MAX_LEVEL,
+    DEFAULT_MAG_VIS,
+    LEVEL_CONFIG,
+    MORTON_BITS,
+    WORLD_CENTER,
+    WORLD_HALF_SIZE_PC,
+)
 from foundinspace.octree.encoding.teff import encode_teff
-
-# Morton code is 21 bits per axis (63 bits total)
-MORTON_BITS = 21
 
 # Numpy dtypes for vectorized pack/unpack (16-byte render, 10-byte meta)
 _RENDER_DT = np.dtype([

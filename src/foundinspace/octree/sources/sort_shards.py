@@ -13,10 +13,10 @@ import shutil
 import duckdb
 
 from ..duckdb_util import configure_connection
-from ..config import LEVEL_CONFIG
+from ..config import LEVEL_CONFIG, MORTON_BITS
 
 PARTITION_LEVEL = 13
-PARTITION_SHIFT = 3 * (21 - PARTITION_LEVEL) 
+PARTITION_SHIFT = 3 * (MORTON_BITS - PARTITION_LEVEL) 
 
 
 con = duckdb.connect()
