@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-Input parquet for this stage is expected to be prepared by **pipeline stage 00** (see [pipeline-stage-00.md](pipeline-stage-00.md)): ICRS coordinates, `morton_code` derived from the same world geometry as the octree, optional precomputed `render` / `level`, and shard-local sorting suitable for streaming cell flush.
+Input parquet for this stage must be prepared by **pipeline stage 00** (see [pipeline-stage-00.md](pipeline-stage-00.md)). Stage 00 enriches each file with `morton_code`, precomputed `render` bytes, and `level`, then sorts and splits into magnitude bands. Stage 01 requires all four columns (`morton_code`, `render`, `level`, `mag_abs`) to be present.
 
 ## Purpose
 
@@ -85,7 +85,7 @@ Each emitted cell belongs to exactly one shard. No duplication across shard file
 
 ### Star row
 
-A single input row representing one star, either in raw coordinate form or as a precomputed render payload fragment.
+A single input row representing one star, with precomputed render bytes from Stage 00.
 
 ### Cell
 
@@ -97,7 +97,7 @@ A file pair `(payload, index)` containing all cells for one `(level, prefix_bits
 
 ### Prefix sharding
 
-For deeper levels, cells may be partitioned by the leading Morton bits of `node_id`. Octant sharding is the special case `prefix_bits = 3`.
+A query and file-partitioning strategy for deep levels. Cells at a level are distributed across multiple shard files by the leading Morton bits of `node_id`. This bounds query working sets and intermediate file sizes without fragmenting node payloads. Octant sharding is the special case `prefix_bits = 3`.
 
 ### Payload blob
 
@@ -214,6 +214,8 @@ Each star row appears in exactly one Stage 00 shard input. Stage 01 must not dup
 
 ## Sharding model
 
+Prefix sharding is a query and file-layout optimization. It does not fragment node payloads; each `(level, node_id)` maps to exactly one shard and is written as a single atomic record+blob.
+
 ### Shallow levels
 
 Levels below `deep_shard_from_level` use a single shard:
@@ -228,7 +230,7 @@ Levels at or above `deep_shard_from_level` use prefix-based sharding with:
 * `prefix_bits = deep_prefix_bits`
 * `prefix = 0 .. (2^prefix_bits - 1)`
 
-For octant sharding, `deep_prefix_bits = 3` and `prefix` is the top octant.
+The default is octant sharding: `deep_prefix_bits = 3`, giving 8 shards per deep level.
 
 ### Membership rule
 
@@ -249,6 +251,8 @@ The shard plan must satisfy:
 * for every shard key, `0 <= prefix < 2^prefix_bits`
 
 At level 0, only `prefix_bits = 0` is valid.
+
+These constraints must be validated once at startup. Violations must cause an immediate, clear error — no implicit clamping or fallback.
 
 ### Shard naming
 
@@ -518,16 +522,11 @@ If the process terminates mid-shard, the partially written shard files may remai
 
 ### Manifest publication
 
-The manifest should be written only after all shard writers have completed successfully.
+The manifest must be written only after all shard writers have completed successfully. It must be published atomically: write to a temporary file then rename to `manifest.json`.
 
 ### Restart behavior
 
-A restart strategy may choose to:
-
-* delete incomplete files and rebuild them, or
-* validate existing complete shard files and skip them
-
-Any skip/reuse logic must validate file headers and record counts against the manifest or local shard metadata.
+For v1, `build_intermediates` must fail if `out_dir` already exists and is non-empty. This avoids mixing outputs from different runs. A future version may add `--resume` (validate-and-skip complete shards) or `--clean` (delete and rebuild).
 
 ---
 
@@ -644,24 +643,13 @@ WHERE level = :level
 ORDER BY node_id, mag_abs
 ```
 
-### Important note on prior confusion
+### Ordering contract
 
-The required ordering contract is `node_id, mag_abs` (optionally followed by a stable tiebreaker if explicitly defined).
-
-For Stage 01, the preserved contract is:
-
-* input is already in the required order
-* that order is `node_id, mag_abs` unless an explicit stable tiebreak is added
-* Stage 01 does not add an extra reorder step
+The required ordering is `node_id, mag_abs`. For v1, no explicit stable tiebreak beyond `mag_abs` is defined. Stage 01 does not add an extra reorder step; the DuckDB query layer must deliver rows in this order.
 
 ### Deep-level prefix / octant sharding
 
-If a level is physically split into prefix shards, the query layer may either:
-
-1. run one query per shard with a prefix filter, or
-2. run a single query whose results are already known to be partitioned for shard-local writers
-
-For prefix-sharded levels, the preferred explicit query form is to add a shard-membership filter. For octant sharding, that is conceptually:
+For prefix-sharded levels, the row source must run one query per `(level, prefix)` with an explicit prefix filter. For octant sharding, that is conceptually:
 
 ```sql
 AND (morton_code >> :top_shift) = :prefix
@@ -681,18 +669,9 @@ For each `(level, prefix_bits, prefix)` shard, the row source must ensure:
 
 ### Magnitude-band semantics
 
-Level semantics are defined by `MagLevelConfig` and materialized by Stage 00 in the `level` column.
-Stage 01 must use `WHERE level = :level` as the correctness contract for level selection.
+Level semantics are defined by `MagLevelConfig` (see `src/foundinspace/octree/mag_levels.py`) and materialized by Stage 00 in the `level` column. Stage 01 must use `WHERE level = :level` as the correctness contract for level selection. Null `mag_abs` rows must be excluded.
 
-The Stage 00 bright/medium/faint split is a performance optimization and may be used to prune scanned files, but it must not alter correctness.
-
-That includes:
-
-* inclusive/exclusive bounds exactly as currently defined
-* behavior for unbounded top or bottom ranges
-* exclusion of null magnitude rows
-
-These rules must be implemented exactly; approximation is not permitted.
+The Stage 00 bright/medium/faint band split is a performance optimization and may be used to prune scanned files, but it must not alter correctness.
 
 ### Documentation requirement
 
@@ -766,6 +745,46 @@ The outputs must satisfy all of the following:
 * bounded-memory produced
 * shard-local sorted by `node_id`
 * directly consumable by a bounded-memory combine stage
+
+---
+
+## V1 defaults
+
+* `deep_prefix_bits = 3` (octant sharding)
+* `deep_shard_from_level` — configurable, no fixed default yet
+* `batch_size = 100_000`
+* `max_level` — from `MagLevelConfig` (default `DEFAULT_MAX_LEVEL` = 13)
+* input mode: precomputed-render only
+* restart policy: fail if `out_dir` is non-empty
+* manifest publish: atomic (write temp, rename)
+* ordering: `node_id, mag_abs` (no explicit tiebreak)
+
+---
+
+## CLI contract
+
+```
+uv run fis-octree stage-01 INPUT_GLOB OUT_DIR [options]
+```
+
+### Required arguments
+
+* **`INPUT_GLOB`** — glob pattern for Stage 00 output parquet (e.g. `sorted/*.parquet`)
+* **`OUT_DIR`** — directory for intermediate shard files and `manifest.json`
+
+### Options
+
+* `--max-level N` — maximum octree level (default: `DEFAULT_MAX_LEVEL`)
+* `--deep-shard-from-level N` — first level to use prefix sharding
+* `--deep-prefix-bits N` — prefix width for deep sharding (default: `3`)
+* `--batch-size N` — row batch size for streaming (default: `100000`)
+* `--v-mag F` — indexing magnitude (default: `DEFAULT_MAG_VIS`)
+
+### Error behavior
+
+* Fail immediately if `OUT_DIR` exists and is non-empty.
+* Fail immediately if shard plan parameters are invalid (see parameter guardrails).
+* Fail immediately if input parquet is missing required columns (`render`, `level`, `morton_code`, `mag_abs`).
 
 ---
 
