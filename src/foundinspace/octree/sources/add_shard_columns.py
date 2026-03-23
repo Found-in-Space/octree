@@ -16,19 +16,19 @@ Invoked from ``foundinspace.octree._cli``; use ``uv run fis-octree stage-00 ...`
 """
 from __future__ import annotations
 
+import gc
 import os
 import time
+from contextlib import suppress
 from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-
-from foundinspace.octree.mag_levels import MagLevelConfig
 from foundinspace.octree.config import (
-    DEFAULT_MAX_LEVEL,
     DEFAULT_MAG_VIS,
+    DEFAULT_MAX_LEVEL,
     LEVEL_CONFIG,
     MORTON_BITS,
     WORLD_CENTER,
@@ -36,6 +36,7 @@ from foundinspace.octree.config import (
 )
 from foundinspace.octree.encoding.morton import morton3d_u64_from_xyz_arrays
 from foundinspace.octree.encoding.teff import encode_teff
+from foundinspace.octree.mag_levels import MagLevelConfig
 
 # Numpy dtypes for vectorized pack/unpack (16-byte render, 10-byte meta)
 _RENDER_DT = np.dtype([
@@ -50,7 +51,9 @@ assert _RENDER_DT.itemsize == 16
 
 def _compute_render_and_level(
     morton_code: np.ndarray,
-    positions: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
     mag_abs: np.ndarray,
     teff: np.ndarray,
     center: np.ndarray,
@@ -58,26 +61,26 @@ def _compute_render_and_level(
     mag_config: MagLevelConfig,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute render (N, 16) uint8 and level (N,) int32 from parquet columns. Fully vectorized per level band."""
-    n = positions.shape[0]
+    n = x.shape[0]
     mag_abs = np.where(np.isfinite(mag_abs), mag_abs.astype(np.float64), 99.0)
     teff = np.where(np.isfinite(teff), teff.astype(np.float64), 5800.0)
     level_arr = mag_config.assign_level_array(mag_abs)
 
-    max_L = int(level_arr.max()) if n > 0 else 0
-    if max_L > 13:
+    max_level = int(level_arr.max()) if n > 0 else 0
+    if max_level > 13:
         raise NotImplementedError(
-            f"Max level {max_L} exceeds 13. This script is currently limited to level ≤ 13. "
+            f"Max level {max_level} exceeds 13. This script is currently limited to level ≤ 13. "
             f"Higher levels require uint64 for node_id handling — extend and re-enable if needed."
         )
 
     teff_log8 = encode_teff(teff)
     render_out = np.zeros(n, dtype=_RENDER_DT)
 
-    for L in np.unique(level_arr):
-        L = int(L)
-        indices_L = np.where(level_arr == L)[0]
-        shift = 3 * (MORTON_BITS - L)
-        node_ids = np.asarray(morton_code[indices_L], dtype=np.uint64) >> shift
+    for level in np.unique(level_arr):
+        level = int(level)
+        level_indices = np.where(level_arr == level)[0]
+        shift = 3 * (MORTON_BITS - level)
+        node_ids = np.asarray(morton_code[level_indices], dtype=np.uint64) >> shift
 
         # De-interleave only unique node_ids (num_cells << N)
         unq_nodes, inv = np.unique(node_ids, return_inverse=True)
@@ -85,13 +88,13 @@ def _compute_render_and_level(
         gx_u = np.zeros(m, dtype=np.uint32)
         gy_u = np.zeros(m, dtype=np.uint32)
         gz_u = np.zeros(m, dtype=np.uint32)
-        for b in range(L):
+        for b in range(level):
             gx_u |= ((unq_nodes >> (3 * b)) & 1).astype(np.uint32) << b
             gy_u |= ((unq_nodes >> (3 * b + 1)) & 1).astype(np.uint32) << b
             gz_u |= ((unq_nodes >> (3 * b + 2)) & 1).astype(np.uint32) << b
 
         # Vectorized cell centers for all unique cells, then expand per-star via inv
-        hs = max(half_size / (2**L), 1e-20)
+        hs = max(half_size / (2**level), 1e-20)
         cell_size = 2.0 * hs
         cx_u = center[0] + (gx_u.astype(np.float64) + 0.5) * cell_size - half_size
         cy_u = center[1] + (gy_u.astype(np.float64) + 0.5) * cell_size - half_size
@@ -101,14 +104,15 @@ def _compute_render_and_level(
         cy_s = cy_u[inv]
         cz_s = cz_u[inv]
 
-        pos_band = positions[indices_L]
-        rec = render_out[indices_L]
-        rec["x"] = np.clip((pos_band[:, 0] - cx_s) / hs, -1.0, 1.0)
-        rec["y"] = np.clip((pos_band[:, 1] - cy_s) / hs, -1.0, 1.0)
-        rec["z"] = np.clip((pos_band[:, 2] - cz_s) / hs, -1.0, 1.0)
-        rec["mag"] = np.clip(np.round(mag_abs[indices_L] * 100.0), -32768, 32767)
-        rec["teff"] = teff_log8[indices_L]
-        render_out[indices_L] = rec
+        render_out["x"][level_indices] = np.clip((x[level_indices] - cx_s) / hs, -1.0, 1.0)
+        render_out["y"][level_indices] = np.clip((y[level_indices] - cy_s) / hs, -1.0, 1.0)
+        render_out["z"][level_indices] = np.clip((z[level_indices] - cz_s) / hs, -1.0, 1.0)
+        render_out["mag"][level_indices] = np.clip(
+            np.round(mag_abs[level_indices] * 100.0),
+            -32768,
+            32767,
+        )
+        render_out["teff"][level_indices] = teff_log8[level_indices]
 
     render_bytes = np.ascontiguousarray(render_out.view(np.uint8).reshape(n, 16))
     assert render_bytes.flags["C_CONTIGUOUS"], "render buffer must be C-contiguous for pa.py_buffer"
@@ -175,12 +179,11 @@ def process_file(
     y = np.asarray(table.column("y_icrs_pc"), dtype=np.float64)
     z = np.asarray(table.column("z_icrs_pc"), dtype=np.float64)
     morton_code = morton3d_u64_from_xyz_arrays(x, y, z)
-    positions = np.column_stack([x, y, z])
     mag_abs = np.asarray(table.column("mag_abs"), dtype=np.float64)
     teff = np.asarray(table.column("teff"), dtype=np.float64)
 
     render, level = _compute_render_and_level(
-        morton_code, positions, mag_abs, teff, center, half_size, mag_config
+        morton_code, x, y, z, mag_abs, teff, center, half_size, mag_config
     )
     n_stars = len(render)
     for col in ("morton_code", "render", "level"):
@@ -198,6 +201,11 @@ def process_file(
     tmp = path.with_suffix(path.suffix + ".tmp")
     pq.write_table(table, tmp, compression=compression)
     os.replace(tmp, path)
+    # Encourage allocator / Arrow pool reuse-release between large files.
+    del table, x, y, z, morton_code, mag_abs, teff, render, level
+    gc.collect()
+    with suppress(AttributeError):
+        pa.default_memory_pool().release_unused()
     elapsed = time.perf_counter() - t0
     return (True, n_stars, elapsed)
 
