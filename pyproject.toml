@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "found-in-space-octree"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "astropy>=7.2.0",
+    "click>=8.3.1",
+    "numpy>=2.4.3",
+    "pandas>=3.0.1",
+    "pyarrow>=23.0.1",
+    "votpipe>=0.1.0",
+]
+
+[project.scripts]
+fis-pipeline = "foundinspace.pipeline.cli:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/foundinspace"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "pytest-cov>=6",
+  "coverage[toml]>=7",
+  "pre-commit>=4",
+  "ruff>=0.8",
+  "astropy>=6",
+  "pyarrow>=18",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.coverage.run]
+source = ["src/foundinspace"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = ["pragma: no cover"]
+
+[tool.pytest.ini_options]
+addopts = "--cov=foundinspace --cov-report=term-missing"
+testpaths = ["tests"]
+pythonpath = ["src"]
