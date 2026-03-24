@@ -98,6 +98,198 @@ All node-existence and payload lookups in `combine` are keyed by `(level, node_i
 
 ---
 
+## Pinned binary layouts
+
+This section defines the exact binary packing for the final file and final shard index. These layouts are normative.
+
+All integer fields are little-endian.
+
+### Top-level file header
+
+The final `stars.octree` file begins with a fixed 64-byte header.
+
+```python
+HEADER_FMT = struct.Struct("<4sHHQQ3ffHHf16s")
+HEADER_SIZE = 64
+```
+
+Fields, in order:
+
+1. `magic: 4s`
+
+   * file magic
+   * value: `b"STAR"`
+2. `version: u16`
+
+   * file format version
+   * value: `1`
+3. `flags: u16`
+
+   * global file flags
+   * currently `0`
+4. `index_offset: u64`
+
+   * absolute file offset of the shard-index section
+5. `index_length: u64`
+
+   * length in bytes of the shard-index section
+6. `world_center_x: f32`
+7. `world_center_y: f32`
+8. `world_center_z: f32`
+9. `world_half_size_pc: f32`
+10. `payload_record_size: u16`
+
+* fixed quantized render-record size in bytes
+* current value: `16`
+
+11. `max_level: u16`
+
+* maximum octree level represented in the file
+
+12. `mag_limit: f32`
+
+* apparent-magnitude cutoff used to build the file
+
+13. `reserved: 16s`
+
+* all zero for version 1
+
+The header is first written with `index_offset = 0` and `index_length = 0`, then patched during Phase C.
+
+### Final shard header
+
+Each shard begins with a fixed 80-byte header.
+
+```python
+SHARD_HDR_FMT = struct.Struct("<4sHBBIIHHHhIII8HHQQQ2x")
+SHARD_HDR_SIZE = 80
+```
+
+Fields, in order:
+
+1. `magic: 4s`
+
+   * shard magic
+   * value: `b"OSHR"`
+2. `version: u16`
+
+   * shard format version
+   * value: `1`
+3. `levels_in_shard: u8`
+
+   * fixed value `5`
+4. `flags: u8`
+
+   * shard-level flags, currently `0`
+5. `shard_id: u32`
+
+   * deterministic 1-based shard identifier in final write order
+6. `parent_shard_id: u32`
+
+   * `0` for root shard, otherwise parent shard id
+7. `parent_node_index: u16`
+
+   * shard-local node index in the parent shard that this shard continues from
+   * `0` for root shard
+8. `node_count: u16`
+
+   * number of node-table entries in this shard
+9. `reserved0: u16`
+
+   * reserved, must be `0` in version 1
+10. `parent_global_depth: i16`
+
+    * global depth of the shard’s implicit parent
+    * root shard uses `-1`
+11. `parent_grid_x: u32`
+12. `parent_grid_y: u32`
+13. `parent_grid_z: u32`
+
+    * grid coordinates of the shard’s implicit parent node
+14. `entry_nodes[8]: 8 * u16`
+
+    * shard-local node indices of the top-level explicit nodes, one per octant
+15. `first_frontier_index: u16`
+
+    * shard-local index of the first frontier node, or `0` if no frontier nodes exist
+16. `node_table_offset: u64`
+
+    * absolute file offset of the node table
+17. `frontier_table_offset: u64`
+
+    * absolute file offset of the frontier-reference table
+18. `payload_base_offset: u64`
+
+    * retained for compatibility/inspection; readers must use per-node absolute payload offsets
+19. `pad: 2 bytes`
+
+    * zero padding to 80 bytes
+
+### Final node record
+
+Each node-table entry is exactly 20 bytes.
+
+```python
+SHARD_NODE_FMT = struct.Struct("<HHBBBBQI")
+SHARD_NODE_SIZE = 20
+```
+
+Fields, in order:
+
+1. `first_child: u16`
+2. `local_path: u16`
+3. `child_mask: u8`
+4. `local_depth: u8`
+5. `flags: u8`
+6. `reserved: u8`
+
+   * must be `0` in version 1
+7. `payload_offset: u64`
+8. `payload_length: u32`
+
+`local_path` is `u16` because the maximum local path length is 5 octants, requiring at most 15 bits.
+
+### Final frontier-reference record
+
+Each frontier-reference entry is exactly 8 bytes.
+
+```python
+FRONTIER_REF_FMT = struct.Struct("<Q")
+FRONTIER_REF_SIZE = 8
+```
+
+Fields, in order:
+
+1. `continuation_shard_offset: u64`
+
+   * absolute file offset of the continuation shard
+   * `0` if the frontier node has no continuation children and the positional-alignment convention is used
+
+### Node flags
+
+Version 1 uses the following node-flag bits:
+
+* `HAS_PAYLOAD = 0x01`
+* `HAS_CHILDREN = 0x02`
+* `IS_FRONTIER = 0x04`
+
+All other bits are reserved and must be `0`.
+
+### Intermediate and relocation fixed-record files
+
+The intermediate and relocation files described below are also normative fixed-record files. Their exact layouts are defined in the build/intermediate specification and must be treated as part of the on-disk contract used by `combine`.
+
+### Width constraints implied by the layout
+
+These layouts impose the following limits:
+
+* `node_count <= 65535` for any one shard
+* shard-local node indices are `u16`
+* `local_path <= 0x7FFF`
+* `entry_nodes` and `parent_node_index` are `u16`
+
+Any implementation that would exceed those limits for a shard must fail explicitly rather than silently widening fields.
+
 ## File contracts used by `combine`
 
 ### Intermediate index file
@@ -196,6 +388,80 @@ DFS order here means preorder traversal of the logical octree over payload-beari
 * later traversal code may assume payload locality aligned with DFS
 
 ## DFS iterator contract
+
+### DFS traversal pruning rule
+
+`iter_cells_dfs()` must never enumerate the full conceptual `8^max_level` node space.
+
+It may only visit:
+
+* payload-bearing cells that actually exist in the intermediates
+* strict ancestors of those payload-bearing cells that are needed to guide DFS descent
+
+The traversal therefore operates over the **realized prefix set**, not the full theoretical tree.
+
+### Required pruning mechanism
+
+Before descending from candidate node `(level = L, node_id = N)` into child octant `o`, the iterator must prove that the child prefix contains at least one realized payload-bearing node at some level `D >= L + 1`.
+
+Let the child candidate be:
+
+* `child_level = L + 1`
+* `child_node_id = (N << 3) | o`
+
+For any deeper level `D >= child_level`, descendants of that child occupy the Morton-prefix range:
+
+* `lo(D) = child_node_id << (3 * (D - child_level))`
+* `hi(D) = ((child_node_id + 1) << (3 * (D - child_level))) - 1`
+
+A descendant exists in shard `(D, prefix_bits, prefix)` iff there exists at least one record with `node_id` in `[lo(D), hi(D)]`.
+
+This must be tested using lower-bound binary search on that shard’s sorted fixed-record file.
+
+### Shard filtering before binary search
+
+For a child prefix, `iter_cells_dfs()` must first eliminate shards that cannot possibly contain descendants.
+
+A shard at level `D` is relevant only if:
+
+* `D >= child_level`, and
+* the shard’s own `(prefix_bits, prefix)` constraint is compatible with the child prefix
+
+Compatibility means that the shard’s prefix range overlaps the child prefix range at level `D`.
+
+Only relevant shards may be queried.
+
+### Descent rule
+
+The iterator may recurse into child octant `o` only if at least one relevant shard at some level `D >= child_level` contains a record in that descendant range.
+
+If no relevant shard contains such a record, that child branch must be pruned immediately.
+
+### Complexity requirement
+
+This rule guarantees that traversal cost is proportional to the number of realized payload-bearing nodes and realized internal prefixes, not to the full size of the theoretical octree.
+
+### Bounded caches
+
+To avoid repeated identical binary searches, the iterator may use bounded caches for:
+
+* prefix-existence checks
+* recently used shard readers
+* lower-bound positions for nearby prefixes
+
+Such caches are permitted only if they are explicitly bounded by `CombinePlan.lookup_cache_records` or equivalent finite limits.
+
+### Preferred operational model
+
+The preferred implementation is prefix-driven DFS:
+
+1. start at the conceptual root prefix
+2. for octants `0..7`, test whether the child prefix has any realized descendants
+3. descend only into child prefixes that pass that test
+4. at each visited prefix, emit the cell if a payload-bearing node exists exactly at that `(level, node_id)`
+5. continue recursively until `max_level`
+
+This model preserves deterministic DFS order while ensuring aggressive pruning.
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -318,8 +584,8 @@ Phase B must distinguish between:
 
 * payload-bearing nodes
 * synthetic ancestor nodes introduced for structural completeness
-  n
-  Synthetic ancestor nodes exist in the final index even when they have no payload.
+
+Synthetic ancestor nodes exist in the final index even when they have no payload.
 
 ## Recommended construction model
 
@@ -974,28 +1240,28 @@ A compliant `combine` implementation must satisfy all of the following:
 ## Recommended module split
 
 ```text
-three_dee/build/octree_combine_pipeline.py
-three_dee/build/octree_dfs.py
-three_dee/build/octree_lookup.py
-three_dee/build/octree_records.py
-three_dee/build/octree_manifest.py
+foundinspace/octree/combine/pipeline.py
+foundinspace/octree/combine/dfs.py
+foundinspace/octree/combine/lookup.py
+foundinspace/octree/combine/records.py
+foundinspace/octree/combine/manifest.py
 ```
 
 ### Responsibilities
 
-* `octree_combine_pipeline.py`
+* `pipeline.py`
 
   * orchestration of Phases A, B, C
-* `octree_dfs.py`
+* `dfs.py`
 
   * DFS traversal and per-node visitation logic
-* `octree_lookup.py`
+* `lookup.py`
 
   * fixed-record file lookup and file-handle cache
-* `octree_records.py`
+* `records.py`
 
   * binary record/header packing and constants
-* `octree_manifest.py`
+* `manifest.py`
 
   * manifest parsing and validation
 
