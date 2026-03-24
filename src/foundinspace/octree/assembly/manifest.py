@@ -16,6 +16,35 @@ from .formats import (
 )
 
 
+def manifest_path(out_dir: Path) -> Path:
+    return out_dir / "manifest.json"
+
+
+def manifest_entries(manifest: dict) -> list[dict]:
+    entries: list[dict] = []
+    for level_entry in manifest.get("levels", []):
+        level = int(level_entry["level"])
+        for shard in level_entry.get("shards", []):
+            entries.append(
+                {
+                    "level": level,
+                    "prefix_bits": int(shard["prefix_bits"]),
+                    "prefix": int(shard["prefix"]),
+                    "index_path": shard["index_path"],
+                    "payload_path": shard["payload_path"],
+                    "record_count": int(shard["record_count"]),
+                }
+            )
+    return entries
+
+
+def read_manifest(out_dir: Path) -> dict | None:
+    path = manifest_path(out_dir)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())
+
+
 def validate_shard(out_dir: Path, entry: dict) -> None:
     """Structural validation of a completed shard file pair."""
     index_path = out_dir / entry["index_path"]
@@ -127,10 +156,10 @@ def write_manifest(
         "levels": levels,
     }
 
-    manifest_path = out_dir / "manifest.json"
+    out_manifest = manifest_path(out_dir)
     tmp_path = out_dir / ".manifest.json.tmp"
     with open(tmp_path, "w") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")
-    os.replace(tmp_path, manifest_path)
-    return manifest_path
+    os.replace(tmp_path, out_manifest)
+    return out_manifest

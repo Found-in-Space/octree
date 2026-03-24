@@ -7,10 +7,14 @@ import duckdb
 
 from ..duckdb_util import configure_connection
 from .encoder import iter_encoded_cells
-from .manifest import write_manifest
+from .manifest import manifest_entries, read_manifest, validate_shard, write_manifest
 from .plan import BuildPlan
 from .row_source import iter_sorted_rows
 from .writer import IntermediateShardWriter
+
+
+def _shard_id(level: int, prefix_bits: int, prefix: int) -> tuple[int, int, int]:
+    return (level, prefix_bits, prefix)
 
 
 def _check_input_columns(parquet_glob: str) -> None:
@@ -37,17 +41,42 @@ def build_intermediates(
     start_t = time.perf_counter()
     plan.validate()
 
-    if out_dir.exists() and any(out_dir.iterdir()):
-        raise FileExistsError(f"Output directory is not empty: {out_dir}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("Stage 01: validating input columns...", flush=True)
     _check_input_columns(parquet_glob)
     print("Stage 01: input columns OK.", flush=True)
 
-    manifest_entries: list[dict] = []
+    existing_manifest = read_manifest(out_dir)
+    if existing_manifest is None and any(out_dir.iterdir()):
+        raise FileExistsError(
+            f"Output directory is not empty and has no manifest: {out_dir}"
+        )
+
+    manifest_entries_list: list[dict] = []
+    completed_shards: set[tuple[int, int, int]] = set()
+    if existing_manifest is not None:
+        existing_max_level = int(existing_manifest.get("max_level", -1))
+        if existing_max_level != plan.max_level:
+            raise ValueError(
+                "Existing manifest max_level does not match build plan: "
+                f"{existing_max_level} != {plan.max_level}"
+            )
+        manifest_entries_list = manifest_entries(existing_manifest)
+        for entry in manifest_entries_list:
+            validate_shard(out_dir, entry)
+            completed_shards.add(
+                _shard_id(entry["level"], entry["prefix_bits"], entry["prefix"])
+            )
+        print(
+            f"Stage 01: resuming from existing manifest with "
+            f"{len(manifest_entries_list)} completed shard(s).",
+            flush=True,
+        )
+
     shard_total = 0
-    shard_non_empty = 0
+    shard_non_empty = len(manifest_entries_list)
+    skipped_shards = 0
     total_cells = 0
 
     for level in range(plan.max_level + 1):
@@ -60,6 +89,19 @@ def build_intermediates(
 
         for shard_i, shard in enumerate(shard_keys, start=1):
             shard_total += 1
+            shard_key_id = _shard_id(
+                shard.level,
+                shard.prefix_bits,
+                shard.prefix,
+            )
+            if shard_key_id in completed_shards:
+                skipped_shards += 1
+                print(
+                    "Stage 01: shard already complete in manifest, skipping.",
+                    flush=True,
+                )
+                continue
+
             print(
                 f"Stage 01: shard {shard_i}/{len(shard_keys)} at level {level} "
                 f"(prefix_bits={shard.prefix_bits}, prefix={shard.prefix})",
@@ -81,8 +123,11 @@ def build_intermediates(
                 shard_manifest = writer.close()
                 total_cells += shard_cells
                 if shard_manifest is not None:
-                    manifest_entries.append(shard_manifest)
+                    manifest_entries_list.append(shard_manifest)
+                    completed_shards.add(shard_key_id)
                     shard_non_empty += 1
+                    # Checkpoint manifest after every completed non-empty shard.
+                    write_manifest(out_dir, plan.max_level, manifest_entries_list)
                     print(
                         f"Stage 01: shard complete ({shard_cells} cell(s), "
                         f"{shard_manifest['record_count']} record(s)).",
@@ -95,15 +140,16 @@ def build_intermediates(
                 raise
 
     print(
-        f"Stage 01: writing manifest ({len(manifest_entries)} non-empty shard(s))...",
+        f"Stage 01: writing manifest ({len(manifest_entries_list)} non-empty shard(s))...",
         flush=True,
     )
-    manifest_path = write_manifest(out_dir, plan.max_level, manifest_entries)
+    manifest_path = write_manifest(out_dir, plan.max_level, manifest_entries_list)
     elapsed = time.perf_counter() - start_t
     print(
         f"Stage 01: done in {elapsed:.1f}s "
         f"(levels={plan.max_level + 1}, shards={shard_total}, "
-        f"non_empty_shards={shard_non_empty}, cells={total_cells}).",
+        f"non_empty_shards={shard_non_empty}, skipped_shards={skipped_shards}, "
+        f"new_cells={total_cells}).",
         flush=True,
     )
     return manifest_path
