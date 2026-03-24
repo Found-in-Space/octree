@@ -92,7 +92,58 @@ def stage_00(
 
 
 @cli.command("stage-01")
-def stage_01() -> None:
-    """Not implemented yet."""
-    click.echo("stage-01 is not implemented yet.", err=True)
-    raise SystemExit(1)
+@click.argument("input_glob", type=str)
+@click.argument("out_dir", type=click.Path(path_type=Path))
+@click.option(
+    "--max-level",
+    type=int,
+    default=None,
+    help=f"Max octree level (default: {DEFAULT_MAX_LEVEL}).",
+)
+@click.option(
+    "--deep-shard-from-level",
+    type=int,
+    required=True,
+    help="First level to use prefix sharding.",
+)
+@click.option(
+    "--deep-prefix-bits",
+    type=int,
+    default=3,
+    help="Prefix width for deep sharding (default: 3).",
+)
+@click.option(
+    "--batch-size",
+    type=int,
+    default=100_000,
+    help="Row batch size for streaming (default: 100000).",
+)
+@click.option(
+    "--v-mag",
+    type=float,
+    default=None,
+    help=f"Indexing magnitude (default: {DEFAULT_MAG_VIS}).",
+)
+def stage_01(
+    input_glob: str,
+    out_dir: Path,
+    max_level: int | None,
+    deep_shard_from_level: int,
+    deep_prefix_bits: int,
+    batch_size: int,
+    v_mag: float | None,
+) -> None:
+    """Build intermediate shard files from Stage 00 parquet."""
+    from foundinspace.octree.assembly import BuildPlan, build_intermediates
+
+    ml = DEFAULT_MAX_LEVEL if max_level is None else max_level
+
+    plan = BuildPlan(
+        max_level=ml,
+        deep_shard_from_level=deep_shard_from_level,
+        deep_prefix_bits=deep_prefix_bits,
+        batch_size=batch_size,
+    )
+
+    manifest_path = build_intermediates(input_glob, out_dir, plan=plan)
+    click.echo(f"Manifest written to {manifest_path}")
