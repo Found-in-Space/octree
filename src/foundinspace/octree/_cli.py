@@ -147,3 +147,38 @@ def stage_01(
 
     manifest_path = build_intermediates(input_glob, out_dir, plan=plan)
     click.echo(f"Manifest written to {manifest_path}")
+
+
+@cli.command("stage-02")
+@click.argument(
+    "manifest_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.argument("output_path", type=click.Path(path_type=Path))
+@click.option(
+    "--max-open-files",
+    type=int,
+    default=32,
+    show_default=True,
+    help="Maximum number of payload file handles kept open.",
+)
+@click.option(
+    "--retain-relocation-files",
+    is_flag=True,
+    help="Keep intermediate relocation files created during combine.",
+)
+def stage_02(
+    manifest_path: Path,
+    output_path: Path,
+    max_open_files: int,
+    retain_relocation_files: bool,
+) -> None:
+    """Combine intermediates into final stars.octree output."""
+    from foundinspace.octree.combine import CombinePlan, combine_octree
+
+    plan = CombinePlan(
+        max_open_files=max_open_files,
+        retain_relocation_files=retain_relocation_files,
+    )
+    combine_octree(manifest_path, output_path, plan=plan)
+    click.echo(f"Wrote {output_path}")
