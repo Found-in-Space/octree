@@ -117,8 +117,13 @@ def write_manifest(
     out_dir: Path,
     max_level: int,
     shard_entries: list[dict],
+    *,
+    mag_limit: float,
 ) -> Path:
-    """Validate shard files and atomically publish manifest.json."""
+    """Validate shard files and atomically publish manifest.json.
+
+    ``mag_limit`` is stored for Stage 02 (final octree header).
+    """
     for entry in shard_entries:
         validate_shard(out_dir, entry)
 
@@ -150,6 +155,7 @@ def write_manifest(
         "world_center": WORLD_CENTER.tolist(),
         "world_half_size_pc": WORLD_HALF_SIZE_PC,
         "max_level": max_level,
+        "mag_limit": float(mag_limit),
         "payload_codec": PAYLOAD_CODEC,
         "index_header_struct": INDEX_FILE_HDR.format,
         "index_record_struct": INDEX_RECORD.format,

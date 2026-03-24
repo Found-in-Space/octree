@@ -45,7 +45,7 @@ def test_non_empty_out_dir_without_manifest_fails(tmp_path, monkeypatch):
 
 def test_resume_skips_completed_shards(tmp_path, monkeypatch):
     entry = _make_entry(tmp_path, level=0, prefix_bits=0, prefix=0)
-    write_manifest(tmp_path, max_level=0, shard_entries=[entry])
+    write_manifest(tmp_path, max_level=0, shard_entries=[entry], mag_limit=6.5)
 
     monkeypatch.setattr(
         "foundinspace.octree.assembly.build._check_input_columns",
@@ -76,7 +76,7 @@ def test_resume_skips_completed_shards(tmp_path, monkeypatch):
 
 def test_resume_manifest_max_level_mismatch_fails(tmp_path, monkeypatch):
     entry = _make_entry(tmp_path, level=0, prefix_bits=0, prefix=0)
-    write_manifest(tmp_path, max_level=2, shard_entries=[entry])
+    write_manifest(tmp_path, max_level=2, shard_entries=[entry], mag_limit=6.5)
     monkeypatch.setattr(
         "foundinspace.octree.assembly.build._check_input_columns",
         lambda _glob: None,

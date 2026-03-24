@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
+from ..config import DEFAULT_MAG_VIS
 from .types import ShardKey
 
 
@@ -11,6 +13,7 @@ class BuildPlan:
     deep_shard_from_level: int
     deep_prefix_bits: int
     batch_size: int
+    mag_limit: float = DEFAULT_MAG_VIS
 
     def validate(self) -> None:
         if self.max_level < 0:
@@ -25,6 +28,8 @@ class BuildPlan:
             )
         if self.batch_size <= 0:
             raise ValueError(f"batch_size must be > 0, got {self.batch_size}")
+        if not math.isfinite(self.mag_limit):
+            raise ValueError("mag_limit must be finite")
         for level in range(self.deep_shard_from_level, self.max_level + 1):
             if level > 0 and self.deep_prefix_bits > 3 * level:
                 raise ValueError(

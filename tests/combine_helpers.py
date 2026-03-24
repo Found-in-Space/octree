@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import gzip
-import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -45,8 +44,9 @@ def build_intermediates(
         if result is not None:
             entries.append(result)
 
-    manifest_path = write_manifest(tmp_path, max_level=max_level, shard_entries=entries)
-    manifest = json.loads(manifest_path.read_text())
-    manifest["mag_limit"] = float(mag_limit)
-    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
-    return manifest_path
+    return write_manifest(
+        tmp_path,
+        max_level=max_level,
+        shard_entries=entries,
+        mag_limit=mag_limit,
+    )

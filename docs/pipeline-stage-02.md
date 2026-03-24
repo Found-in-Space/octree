@@ -509,6 +509,52 @@ Existence checks must use fixed-record binary search or bounded shard-local curs
 
 ## File-handle policy
 
+```python
+@dataclass(frozen=True, slots=True)
+class CellPayloadRef:
+    shard: ShardKey
+    level: int
+    node_id: int
+    payload_offset: int
+    payload_length: int
+    star_count: int
+
+
+def iter_cells_dfs(manifest_path: Path) -> Iterator[CellPayloadRef]:
+    ...
+```
+
+`iter_cells_dfs()` is the heart of the combine design.
+
+It must:
+
+* traverse the logical tree in DFS order
+* use per-level/per-shard sorted index files as on-disk lookup structures
+* keep only bounded cursor state and bounded caches
+* never allocate a global cell array
+
+## Acceptable implementation strategies
+
+### Preferred strategy
+
+Use disk-backed per-shard sequential cursors plus DFS traversal over node prefixes.
+
+For each node prefix visited in DFS order:
+
+* determine whether a payload-bearing cell exists at `(level, node_id)`
+* if yes, emit the cell
+* descend to children in octant order
+
+Existence checks must use fixed-record binary search or bounded shard-local cursors.
+
+### Not acceptable
+
+* concatenate all index arrays into one global array
+* compute all DFS keys globally and sort them in memory
+* build a full in-memory relocation map
+
+## File-handle policy
+
 Phase A may keep only a bounded number of shard files open at once.
 
 When the number of open handles would exceed `max_open_files`, handles must be closed using LRU or equivalent policy.
@@ -667,15 +713,44 @@ All child references that stay within the shard are shard-local node indices.
 
 ### Deterministic node ordering inside a shard
 
-Nodes inside a shard are stored in deterministic DFS/preorder order over the shard-local subtree.
+Nodes inside a shard are stored in **depth/path order**, not strict preorder DFS.
 
-The ordering rule is:
+This ordering is normative.
 
-* primary key: `local_depth`
-* within a shared ancestor path, children appear in octant order `0..7`
-* operationally, this is the existing packed sort-path ordering used to produce stable DFS order inside a shard
+The sort key is:
 
-This ordering guarantees that a node’s descendants, if present in the same shard, occur later in the table than the node itself.
+1. `local_depth` ascending
+2. `local_path` ascending
+
+where `local_path` is compared as the packed octant-path value for nodes at the same `local_depth`.
+
+#### Important clarification
+
+This is **not** strict preorder DFS over the shard-local subtree.
+
+In particular:
+
+* all depth-1 nodes appear before all depth-2 nodes
+* all depth-2 nodes appear before all depth-3 nodes
+* and so on
+
+This ordering is chosen deliberately because it guarantees that:
+
+* parents always appear before children
+* all frontier nodes (`local_depth = LEVELS_PER_SHARD`) form a contiguous suffix of the node table
+* immediate children of a non-frontier node are contiguous in octant order within the next depth band
+
+The specification must not describe this order as DFS/preorder. The implementation and on-disk contract are depth-major.
+
+#### Consequences for readers
+
+Readers must not assume that a node’s full descendant subtree occupies a contiguous range of the node table.
+
+Only the following contiguity guarantee is provided:
+
+* the **immediate in-shard children** of a non-frontier node occupy a contiguous run, in octant order, beginning at `first_child`
+
+No stronger subtree contiguity property is guaranteed.
 
 ### Shard header
 
@@ -831,7 +906,9 @@ Example:
 
 `first_child` points to the shard-local node index of the **first in-shard child** of the node.
 
-Children present in the same shard are stored contiguously in octant order.
+Because node-table order is depth-major, the child run for a node lies within the band of nodes at `local_depth + 1`.
+
+Children present in the same shard are stored contiguously in octant order within that band.
 
 Therefore, given `first_child` and `child_mask`, a reader can enumerate the node’s in-shard children without storing eight separate pointers.
 
@@ -844,7 +921,7 @@ Let:
 
 If the node is **not** a frontier node:
 
-* all children represented by bits set in `child_mask` that are in the same shard are stored contiguously beginning at node index `i`
+* all in-shard children represented by bits set in `child_mask` are stored contiguously beginning at node index `i`
 * the child for the lowest present octant is at `i`
 * the child for the next present octant is at `i + 1`
 * and so on in increasing octant order
@@ -855,7 +932,7 @@ Formally, for octant `o`, if bit `o` is set and the child is in-shard, then its 
 
 This is the full meaning of the “next nodes” model.
 
-There is no linked list and no separate sibling pointer chain. The node table order plus contiguity is the mechanism.
+There is no linked list and no separate sibling pointer chain.
 
 #### Constraint required for correctness
 
@@ -964,16 +1041,18 @@ The writer must guarantee all of the following.
 
 1. Node table indices are 1-based.
 2. `entry_nodes` point only to nodes with `local_depth = 1`.
-3. Node table order is deterministic.
-4. For non-frontier nodes, in-shard children are contiguous and ordered by octant.
-5. `first_child = 0` iff there are no in-shard children.
-6. `child_mask = 0` iff the node has no logical children.
-7. `HAS_CHILDREN` iff `child_mask != 0`.
-8. `IS_FRONTIER` iff `local_depth = LEVELS_PER_SHARD`.
-9. Frontier nodes never use `first_child` for continuation; continuation is via frontier refs only.
-10. `parent_node_index` of a continuation shard points to a frontier node in the parent shard.
-11. Payload fields are consistent with `HAS_PAYLOAD`.
-12. All offsets written into headers, node records, and frontier refs are absolute file offsets.
+3. Node table order is deterministic and is exactly depth-major `(local_depth, local_path)` order.
+4. The node table is **not** required to be strict preorder DFS.
+5. For non-frontier nodes, immediate in-shard children are contiguous and ordered by octant.
+6. `first_child = 0` iff there are no in-shard children.
+7. `child_mask = 0` iff the node has no logical children.
+8. `HAS_CHILDREN` iff `child_mask != 0`.
+9. `IS_FRONTIER` iff `local_depth = LEVELS_PER_SHARD`.
+10. Frontier nodes form a contiguous suffix of the node table.
+11. Frontier nodes never use `first_child` for continuation; continuation is via frontier refs only.
+12. `parent_node_index` of a continuation shard points to a frontier node in the parent shard.
+13. Payload fields are consistent with `HAS_PAYLOAD`.
+14. All offsets written into headers, node records, and frontier refs are absolute file offsets.
 
 ### Notes on implementation
 

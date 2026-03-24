@@ -6,6 +6,7 @@ import json
 import pytest
 
 from foundinspace.octree.assembly.manifest import validate_shard, write_manifest
+from foundinspace.octree.config import DEFAULT_MAG_VIS
 from foundinspace.octree.assembly.types import CellKey, EncodedCell, ShardKey
 from foundinspace.octree.assembly.writer import IntermediateShardWriter
 
@@ -63,12 +64,15 @@ class TestValidateShard:
 class TestWriteManifest:
     def test_basic_manifest(self, tmp_path):
         entry = _write_test_shard(tmp_path)
-        manifest_path = write_manifest(tmp_path, max_level=13, shard_entries=[entry])
+        manifest_path = write_manifest(
+            tmp_path, max_level=13, shard_entries=[entry], mag_limit=DEFAULT_MAG_VIS
+        )
 
         assert manifest_path.name == "manifest.json"
         data = json.loads(manifest_path.read_text())
         assert data["format"] == "three_dee.octree.intermediates/v1"
         assert data["max_level"] == 13
+        assert data["mag_limit"] == DEFAULT_MAG_VIS
         assert data["payload_codec"] == "gzip"
         assert len(data["levels"]) == 1
         assert data["levels"][0]["level"] == 5
@@ -79,7 +83,7 @@ class TestWriteManifest:
         e1 = _write_test_shard(tmp_path, level=0, node_ids=(0,))
         e2 = _write_test_shard(tmp_path, level=3, node_ids=(100, 200))
         manifest_path = write_manifest(
-            tmp_path, max_level=5, shard_entries=[e1, e2]
+            tmp_path, max_level=5, shard_entries=[e1, e2], mag_limit=DEFAULT_MAG_VIS
         )
         data = json.loads(manifest_path.read_text())
         assert len(data["levels"]) == 2
@@ -88,27 +92,33 @@ class TestWriteManifest:
 
     def test_empty_entries_produces_empty_levels(self, tmp_path):
         manifest_path = write_manifest(
-            tmp_path, max_level=13, shard_entries=[]
+            tmp_path, max_level=13, shard_entries=[], mag_limit=DEFAULT_MAG_VIS
         )
         data = json.loads(manifest_path.read_text())
         assert data["levels"] == []
 
     def test_world_geometry_in_manifest(self, tmp_path):
         entry = _write_test_shard(tmp_path)
-        manifest_path = write_manifest(tmp_path, max_level=13, shard_entries=[entry])
+        manifest_path = write_manifest(
+            tmp_path, max_level=13, shard_entries=[entry], mag_limit=DEFAULT_MAG_VIS
+        )
         data = json.loads(manifest_path.read_text())
         assert data["world_center"] == [0.0, 0.0, 0.0]
         assert data["world_half_size_pc"] == 200_000.0
 
     def test_struct_formats_in_manifest(self, tmp_path):
         entry = _write_test_shard(tmp_path)
-        manifest_path = write_manifest(tmp_path, max_level=13, shard_entries=[entry])
+        manifest_path = write_manifest(
+            tmp_path, max_level=13, shard_entries=[entry], mag_limit=DEFAULT_MAG_VIS
+        )
         data = json.loads(manifest_path.read_text())
         assert data["index_header_struct"] == "<4sHHBBHIQQ"
         assert data["index_record_struct"] == "<QQII"
 
     def test_atomic_publish(self, tmp_path):
         entry = _write_test_shard(tmp_path)
-        write_manifest(tmp_path, max_level=13, shard_entries=[entry])
+        write_manifest(
+            tmp_path, max_level=13, shard_entries=[entry], mag_limit=DEFAULT_MAG_VIS
+        )
         assert (tmp_path / "manifest.json").exists()
         assert not (tmp_path / ".manifest.json.tmp").exists()

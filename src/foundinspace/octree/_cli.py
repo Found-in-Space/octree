@@ -137,12 +137,14 @@ def stage_01(
     from foundinspace.octree.assembly import BuildPlan, build_intermediates
 
     ml = DEFAULT_MAX_LEVEL if max_level is None else max_level
+    vm = DEFAULT_MAG_VIS if v_mag is None else v_mag
 
     plan = BuildPlan(
         max_level=ml,
         deep_shard_from_level=deep_shard_from_level,
         deep_prefix_bits=deep_prefix_bits,
         batch_size=batch_size,
+        mag_limit=vm,
     )
 
     manifest_path = build_intermediates(input_glob, out_dir, plan=plan)

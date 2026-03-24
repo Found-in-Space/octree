@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 
@@ -62,6 +63,13 @@ def build_intermediates(
                 "Existing manifest max_level does not match build plan: "
                 f"{existing_max_level} != {plan.max_level}"
             )
+        if "mag_limit" in existing_manifest:
+            existing_mag = float(existing_manifest["mag_limit"])
+            if not math.isclose(existing_mag, plan.mag_limit, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError(
+                    "Existing manifest mag_limit does not match build plan: "
+                    f"{existing_mag} != {plan.mag_limit}"
+                )
         manifest_entries_list = manifest_entries(existing_manifest)
         for entry in manifest_entries_list:
             validate_shard(out_dir, entry)
@@ -127,7 +135,12 @@ def build_intermediates(
                     completed_shards.add(shard_key_id)
                     shard_non_empty += 1
                     # Checkpoint manifest after every completed non-empty shard.
-                    write_manifest(out_dir, plan.max_level, manifest_entries_list)
+                    write_manifest(
+                        out_dir,
+                        plan.max_level,
+                        manifest_entries_list,
+                        mag_limit=plan.mag_limit,
+                    )
                     print(
                         f"Stage 01: shard complete ({shard_cells} cell(s), "
                         f"{shard_manifest['record_count']} record(s)).",
@@ -143,7 +156,9 @@ def build_intermediates(
         f"Stage 01: writing manifest ({len(manifest_entries_list)} non-empty shard(s))...",
         flush=True,
     )
-    manifest_path = write_manifest(out_dir, plan.max_level, manifest_entries_list)
+    manifest_path = write_manifest(
+        out_dir, plan.max_level, manifest_entries_list, mag_limit=plan.mag_limit
+    )
     elapsed = time.perf_counter() - start_t
     print(
         f"Stage 01: done in {elapsed:.1f}s "
