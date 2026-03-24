@@ -367,6 +367,362 @@ Both lookups must be implemented over fixed-record disk-backed files using binar
 
 ## Final shard layout requirements
 
+## Detailed final shard-index format
+
+The final index is a sequence of shard records written after the payload section.
+
+Each shard contains:
+
+1. a fixed-size shard header
+2. a contiguous node table
+3. a contiguous frontier-reference table
+
+There is no separate global node table. Nodes are addressed relative to their containing shard.
+
+### Conceptual model
+
+A shard represents a 5-level block of the octree.
+
+* `LEVELS_PER_SHARD = 5`
+* every shard has an **implicit parent**
+* the first explicit nodes in a shard are the children of that implicit parent
+* therefore, the shard does **not** store a record for its implicit parent
+
+This applies both to the root shard and to continuation shards.
+
+### Shard-local node addressing
+
+Node indices inside a shard are **1-based**.
+
+* `0` means “no node” or “null reference”
+* `1..node_count` index records in the shard-local node table
+
+All child references that stay within the shard are shard-local node indices.
+
+### Deterministic node ordering inside a shard
+
+Nodes inside a shard are stored in deterministic DFS/preorder order over the shard-local subtree.
+
+The ordering rule is:
+
+* primary key: `local_depth`
+* within a shared ancestor path, children appear in octant order `0..7`
+* operationally, this is the existing packed sort-path ordering used to produce stable DFS order inside a shard
+
+This ordering guarantees that a node’s descendants, if present in the same shard, occur later in the table than the node itself.
+
+### Shard header
+
+The shard header must include at least the following fields.
+
+* `magic`
+
+  * shard-format magic
+* `version`
+
+  * shard-format version
+* `levels_in_shard`
+
+  * fixed value `5`
+* `flags`
+
+  * reserved for future shard-level flags
+* `shard_id`
+
+  * deterministic 1-based shard identifier in final write order
+* `parent_shard_id`
+
+  * `0` for root shard, otherwise the shard id of the parent shard
+* `parent_node_index`
+
+  * shard-local node index in `parent_shard_id` that acts as the frontier/attachment point for this shard
+  * `0` for the root shard
+* `node_count`
+
+  * number of node records in the node table
+* `reserved`
+
+  * reserved/padding as required by the binary layout
+* `parent_global_depth`
+
+  * global depth of the implicit parent of this shard
+  * root shard uses sentinel `-1`
+* `parent_grid_x`, `parent_grid_y`, `parent_grid_z`
+
+  * grid coordinates of the shard’s implicit parent node
+* `entry_nodes[8]`
+
+  * for each octant `0..7`, the shard-local node index of that entry node, or `0` if absent
+* `first_frontier_index`
+
+  * shard-local index of the first frontier node in the node table, or `0` if there are none
+* `node_table_offset`
+
+  * absolute file offset of this shard’s node table
+* `frontier_table_offset`
+
+  * absolute file offset of this shard’s frontier-reference table
+* `payload_base_offset`
+
+  * retained only if required by the binary format; not used as a substitute for per-node payload offsets
+
+#### Meaning of `entry_nodes[8]`
+
+`entry_nodes` provides the shard’s top-level addressing.
+
+For any explicit node in the shard with `local_depth = 1`, its `local_path` is exactly one octant `0..7`. That node’s shard-local index is written into `entry_nodes[octant]`.
+
+If a top-level octant has no explicit node in this shard, its entry is `0`.
+
+A reader enters a shard by selecting one of these entry-node pointers.
+
+### Node record
+
+Each node-table entry must include at least the following fields.
+
+* `first_child`
+
+  * shard-local node index of the first child present **within the same shard**
+  * `0` if the node has no in-shard children
+* `local_path`
+
+  * packed path from the shard’s implicit parent to this node
+  * encoded using 3 bits per step
+  * for a node at `local_depth = d`, `local_path` contains exactly `d` octants
+* `child_mask`
+
+  * 8-bit mask over octants `0..7`
+  * bit `o` set means the node has a child in octant `o` in the **logical tree**
+* `local_depth`
+
+  * depth of this node relative to the shard’s implicit parent
+  * valid range `1..LEVELS_PER_SHARD`
+* `flags`
+
+  * per-node flags described below
+* `reserved`
+
+  * reserved/padding as required by the binary layout
+* `payload_offset`
+
+  * absolute file offset of the payload blob for this node, or `0` if no payload
+* `payload_length`
+
+  * payload length in bytes, or `0` if no payload
+
+### Node flags
+
+The following node flags are required.
+
+* `HAS_PAYLOAD`
+
+  * node has a payload blob in the payload section
+* `HAS_CHILDREN`
+
+  * node has at least one child in the logical tree, equivalent to `child_mask != 0`
+* `IS_FRONTIER`
+
+  * node is at `local_depth = LEVELS_PER_SHARD`, so descendants, if any, continue into child shards
+
+No separate `HAS_FRONTIER_REF` flag is needed if frontier nodes are guaranteed to occupy the suffix of the node table and are covered by the frontier-reference table.
+
+### Meaning of `local_path`
+
+`local_path` is the path from the shard’s implicit parent to the node, encoded in octants.
+
+Examples:
+
+* a node at local depth 1 in octant 3 has `local_path = 3`
+* a node at local depth 2 reached by octants `3 -> 5` has `local_path` encoding `[3, 5]`
+
+`local_path` is a stable identity inside the shard and is used for:
+
+* deterministic node sorting
+* reconstructing child relationships
+* patching parent-node references for continuation shards
+
+### Child representation and the “next nodes” pointer model
+
+The index does **not** store eight explicit child pointers per node.
+
+Instead, child linkage is represented by the pair:
+
+* `child_mask`
+* `first_child`
+
+This is the complete definition of how “next nodes” work.
+
+#### `child_mask`
+
+`child_mask` tells the reader **which octant children exist logically**.
+
+Example:
+
+* `child_mask = 0b00101001`
+* children exist in octants `0`, `3`, and `5`
+
+#### `first_child`
+
+`first_child` points to the shard-local node index of the **first in-shard child** of the node.
+
+Children present in the same shard are stored contiguously in octant order.
+
+Therefore, given `first_child` and `child_mask`, a reader can enumerate the node’s in-shard children without storing eight separate pointers.
+
+#### Enumeration rule for in-shard children
+
+Let:
+
+* `m = child_mask`
+* `i = first_child`
+
+If the node is **not** a frontier node:
+
+* all children represented by bits set in `child_mask` that are in the same shard are stored contiguously beginning at node index `i`
+* the child for the lowest present octant is at `i`
+* the child for the next present octant is at `i + 1`
+* and so on in increasing octant order
+
+Formally, for octant `o`, if bit `o` is set and the child is in-shard, then its node-table index is:
+
+* `first_child + popcount(child_mask & ((1 << o) - 1))`
+
+This is the full meaning of the “next nodes” model.
+
+There is no linked list and no separate sibling pointer chain. The node table order plus contiguity is the mechanism.
+
+#### Constraint required for correctness
+
+For every non-frontier node with in-shard children, the node table must satisfy:
+
+* all in-shard children appear contiguously
+* they appear in octant order
+* `first_child` points to the first such child
+
+The writer must guarantee this invariant.
+
+### Frontier-node behavior
+
+A frontier node is any node with:
+
+* `local_depth = LEVELS_PER_SHARD`
+* `IS_FRONTIER` flag set
+
+A frontier node may still have `child_mask != 0`, indicating logical children exist.
+
+However, those children are **not stored in the current shard’s node table**.
+
+Instead:
+
+* `first_child = 0`
+* continuation is resolved through the frontier-reference table
+
+This is a critical invariant.
+
+### Frontier-reference table
+
+The frontier-reference table contains one record for each frontier node in node-table order.
+
+Its records correspond positionally to frontier nodes beginning at `first_frontier_index`.
+
+If there are `frontier_count` frontier nodes, then:
+
+* node `first_frontier_index` uses frontier-ref record `0`
+* node `first_frontier_index + 1` uses frontier-ref record `1`
+* and so on
+
+Each frontier-ref record stores:
+
+* absolute file offset of the continuation shard for that frontier node
+
+If a frontier node has `child_mask = 0`, its frontier reference may be `0` or omitted by convention, but the preferred invariant is:
+
+* only frontier nodes with actual continuation children are written into the frontier-reference table
+* if the format requires positional alignment for all frontier nodes, a frontier node with no continuation uses a `0` reference
+
+The implementation must choose one rule and apply it consistently. The preferred rule for simplicity is positional alignment for **all** frontier nodes.
+
+### How a reader follows children
+
+#### Case 1: ordinary node with in-shard children
+
+Reader steps:
+
+1. read `child_mask`
+2. if `child_mask == 0`, stop
+3. read `first_child`
+4. enumerate set bits of `child_mask` in octant order
+5. map each in-shard child octant to node-table indices using the contiguous-child formula above
+
+#### Case 2: frontier node
+
+Reader steps:
+
+1. read `child_mask`
+2. if `child_mask == 0`, stop
+3. observe `IS_FRONTIER`
+4. compute the frontier-ref table row from node index and `first_frontier_index`
+5. read the continuation-shard offset
+6. open that shard and use its `entry_nodes[8]` to resolve the children indicated by `child_mask`
+
+The frontier node’s logical children are therefore obtained from the child shard’s top-level entry nodes, not from the current node table.
+
+### Relationship between parent and continuation shard
+
+Every non-root shard stores:
+
+* `parent_shard_id`
+* `parent_node_index`
+
+`parent_node_index` identifies the frontier node in the parent shard whose continuation this shard represents.
+
+The child shard’s implicit parent is exactly that frontier node.
+
+This means:
+
+* the child shard’s `entry_nodes[octant]` correspond to that frontier node’s octant children
+* octants absent from the frontier node’s `child_mask` must have `entry_nodes[octant] = 0`
+
+### Payload fields per node
+
+For each node:
+
+* `payload_offset != 0` and `payload_length > 0` iff `HAS_PAYLOAD` is set
+* otherwise both are `0`
+
+Payload offsets are absolute file offsets into the final payload section. Readers do not need `payload_base_offset` to resolve individual node payloads.
+
+### Required invariants
+
+The writer must guarantee all of the following.
+
+1. Node table indices are 1-based.
+2. `entry_nodes` point only to nodes with `local_depth = 1`.
+3. Node table order is deterministic.
+4. For non-frontier nodes, in-shard children are contiguous and ordered by octant.
+5. `first_child = 0` iff there are no in-shard children.
+6. `child_mask = 0` iff the node has no logical children.
+7. `HAS_CHILDREN` iff `child_mask != 0`.
+8. `IS_FRONTIER` iff `local_depth = LEVELS_PER_SHARD`.
+9. Frontier nodes never use `first_child` for continuation; continuation is via frontier refs only.
+10. `parent_node_index` of a continuation shard points to a frontier node in the parent shard.
+11. Payload fields are consistent with `HAS_PAYLOAD`.
+12. All offsets written into headers, node records, and frontier refs are absolute file offsets.
+
+### Notes on implementation
+
+The existing implementation approach of sorting shard nodes by packed sort-path and then deriving:
+
+* `entry_nodes`
+* `child_mask`
+* `first_child`
+* frontier node suffix
+* frontier-ref positional alignment
+
+is consistent with this specification, provided the contiguity invariants above are enforced and documented.
+
+## Final shard layout requirements
+
 The final `.octree` shard index must match the chosen final file format exactly.
 
 At minimum, each shard must encode:
