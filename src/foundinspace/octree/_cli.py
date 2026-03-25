@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import click
+from rich.console import Console
+from rich.table import Table
 
 from foundinspace.octree.config import (
     DEFAULT_MAG_VIS,
@@ -11,6 +14,8 @@ from foundinspace.octree.config import (
     WORLD_HALF_SIZE_PC,
 )
 from foundinspace.octree.mag_levels import MagLevelConfig
+from foundinspace.octree.reader import Point
+from foundinspace.octree.reader.stats import StatsReport, collect_stats
 from foundinspace.octree.sources.add_shard_columns import run_add_shard_columns
 from foundinspace.octree.sources.sort_shards import run_sort_shards
 
@@ -184,3 +189,156 @@ def stage_02(
     )
     combine_octree(manifest_path, output_path, plan=plan)
     click.echo(f"Wrote {output_path}")
+
+
+def _parse_point(value: str) -> Point:
+    try:
+        parts = [p.strip() for p in value.split(",")]
+        if len(parts) != 3:
+            raise ValueError("expected exactly 3 comma-separated values")
+        x, y, z = (float(parts[0]), float(parts[1]), float(parts[2]))
+        return Point(x=x, y=y, z=z)
+    except Exception as exc:
+        raise click.BadParameter(
+            f"Invalid --point '{value}', expected X,Y,Z"
+        ) from exc
+
+
+def _format_kb(value: int) -> str:
+    return f"{value / 1024.0:,.0f} KB"
+
+
+def _format_compact_mb(value: int) -> str:
+    mb = value / (1024.0 * 1024.0)
+    return f"{mb:.1f} MB"
+
+
+def _format_teff(teff: float) -> str:
+    if math.isnan(teff):
+        return "n/a"
+    return f"{teff:,.0f} K"
+
+
+def _render_stats(console: Console, report: StatsReport, nearest_n: int) -> None:
+    shell_table = Table(title="By level (shell set at Sun)")
+    shell_table.add_column("Level", justify="right")
+    shell_table.add_column("Nodes", justify="right")
+    shell_table.add_column("Stars loaded", justify="right")
+    shell_table.add_column("Stars rendered", justify="right")
+    shell_table.add_column("Payload size", justify="right")
+
+    for row in report.by_level:
+        shell_table.add_row(
+            f"{row.level}",
+            f"{row.nodes:,}",
+            f"{row.stars_loaded:,}",
+            f"{row.stars_rendered:,}",
+            _format_kb(row.payload_bytes),
+        )
+    shell_table.add_section()
+    shell_table.add_row(
+        "Total",
+        f"{report.totals.nodes:,}",
+        f"{report.totals.stars_loaded:,}",
+        f"{report.totals.stars_rendered:,}",
+        _format_kb(report.totals.payload_bytes),
+    )
+    console.print(shell_table)
+    console.print(
+        f"Coalesced {report.coalesced.output_batches:,} batches "
+        f"from {report.coalesced.input_ranges:,}"
+    )
+    console.print(
+        f"Total span bytes: {_format_compact_mb(report.coalesced.total_span_bytes)} "
+        f"from {_format_compact_mb(report.coalesced.raw_payload_bytes)}"
+    )
+    console.print(
+        f"Largest batch: {_format_compact_mb(report.coalesced.largest_batch_bytes)}"
+    )
+
+    nearest = Table(title=f"Nearest {nearest_n} stars")
+    nearest.add_column("Star", justify="right")
+    nearest.add_column("Distance", justify="right")
+    nearest.add_column("Magnitude", justify="right")
+    nearest.add_column("Apparent magnitude", justify="right")
+    nearest.add_column("Teff", justify="right")
+    for row in report.nearest:
+        nearest.add_row(
+            f"{row.star_id:,}",
+            f"{row.distance_pc:.1f} pc",
+            f"{row.magnitude:.1f}",
+            f"{row.apparent_magnitude:.1f}",
+            _format_teff(row.teff),
+        )
+    console.print(nearest)
+
+
+@cli.command("stats")
+@click.argument(
+    "octree_path",
+    type=click.Path(exists=False, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--point",
+    type=str,
+    default="0,0,0",
+    show_default=True,
+    help="Query origin in parsecs as X,Y,Z.",
+)
+@click.option(
+    "--magnitude",
+    type=float,
+    default=6.5,
+    show_default=True,
+    help="Limiting apparent magnitude for shell visibility query.",
+)
+@click.option(
+    "--radius",
+    type=float,
+    default=10.0,
+    show_default=True,
+    help="Distance radius in parsecs for nearest query.",
+)
+@click.option(
+    "--nearest",
+    "-n",
+    type=int,
+    default=10,
+    show_default=True,
+    help="Number of nearest stars to print.",
+)
+def stats(
+    octree_path: Path,
+    point: str,
+    magnitude: float,
+    radius: float,
+    nearest: int,
+) -> None:
+    """Read a stage-02 octree and print bounded query stats."""
+    if not octree_path.exists():
+        raise FileNotFoundError(
+            f"Octree file not found: {octree_path}. Run stage-02 first."
+        )
+    if radius < 0:
+        raise click.BadParameter("--radius must be >= 0")
+    if nearest <= 0:
+        raise click.BadParameter("--nearest must be > 0")
+
+    query_point = _parse_point(point)
+    report = collect_stats(
+        octree_path,
+        point=query_point,
+        limiting_magnitude=magnitude,
+        radius_pc=radius,
+        nearest_n=nearest,
+    )
+    console = Console()
+    console.print(
+        (
+            f"File: {octree_path} | center={report.header.world_center} "
+            f"| half_size={report.header.world_half_size:.1f} pc "
+            f"| max_level={report.header.max_level} "
+            f"| mag_limit={report.header.mag_limit:.2f}"
+        )
+    )
+    _render_stats(console, report, nearest)

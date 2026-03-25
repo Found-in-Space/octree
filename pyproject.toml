@@ -16,6 +16,7 @@ dependencies = [
     "pandas>=3.0.1",
     "pyarrow>=23.0.1",
     "python-decouple>=3.8",
+    "rich>=14.3.3",
     "votpipe>=0.1.0",
 ]
 
