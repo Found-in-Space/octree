@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import time
 from typing import BinaryIO
 
 from .dfs import iter_cells_dfs
@@ -71,6 +72,18 @@ class _ShardBuildResult:
 DEFAULT_COMBINE_PLAN = CombinePlan()
 
 
+def _format_bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    units = ("KiB", "MiB", "GiB", "TiB")
+    value = float(n)
+    for unit in units:
+        value /= 1024.0
+        if value < 1024.0:
+            return f"{value:.1f} {unit}"
+    return f"{value:.1f} PiB"
+
+
 class _RelocAppender:
     def __init__(self, path: Path, *, level: int, prefix_bits: int, prefix: int):
         self.path = path
@@ -134,11 +147,21 @@ def combine_octree(
     *,
     plan: CombinePlan = DEFAULT_COMBINE_PLAN,
 ) -> None:
+    t0 = time.perf_counter()
     plan.validate()
     manifest = read_combine_manifest(manifest_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    print(
+        (
+            f"Combine: starting ({len(manifest.shards)} shard(s), "
+            f"max_level={manifest.max_level}) -> {output_path}"
+        ),
+        flush=True,
+    )
 
     with open(output_path, "wb") as out_fp:
+        phase_a_start = time.perf_counter()
+        print("Combine: Phase A (payload relocation) started.", flush=True)
         out_fp.write(
             pack_top_level_header(
                 PackedHeaderFields(
@@ -150,13 +173,35 @@ def combine_octree(
             )
         )
         payload_result = relocate_payloads_dfs(manifest_path, out_fp, plan=plan)
+        print(
+            (
+                "Combine: Phase A complete "
+                f"({len(payload_result.relocation_files)} relocation file(s), "
+                f"payload_end_offset={payload_result.payload_end_offset}, "
+                f"elapsed={time.perf_counter() - phase_a_start:.1f}s)."
+            ),
+            flush=True,
+        )
+        phase_b_start = time.perf_counter()
+        print("Combine: Phase B (index write) started.", flush=True)
         index_result = write_final_shard_index(
             manifest_path,
             payload_result.relocation_files,
             out_fp,
             plan=plan,
         )
+        print(
+            (
+                "Combine: Phase B complete "
+                f"(index_offset={index_result.index_offset}, "
+                f"index_length={index_result.index_length}, "
+                f"elapsed={time.perf_counter() - phase_b_start:.1f}s)."
+            ),
+            flush=True,
+        )
 
+    phase_c_start = time.perf_counter()
+    print("Combine: Phase C (header finalize + cleanup) started.", flush=True)
     finalize_octree_header(
         output_path,
         index_offset=index_result.index_offset,
@@ -164,10 +209,25 @@ def combine_octree(
         world_center=manifest.world_center,
         world_half_size_pc=manifest.world_half_size_pc,
     )
+    print(
+        f"Combine: header patched in {time.perf_counter() - phase_c_start:.1f}s.",
+        flush=True,
+    )
 
     if not plan.retain_relocation_files:
         for p in payload_result.relocation_files:
             p.unlink(missing_ok=True)
+        print(
+            f"Combine: removed {len(payload_result.relocation_files)} relocation file(s).",
+            flush=True,
+        )
+    else:
+        print("Combine: retained relocation files (--retain-relocation-files).", flush=True)
+
+    print(
+        f"Combine: done in {time.perf_counter() - t0:.1f}s.",
+        flush=True,
+    )
 
 
 def relocate_payloads_dfs(
@@ -181,6 +241,12 @@ def relocate_payloads_dfs(
         (s.key.level, s.key.prefix_bits, s.key.prefix): s for s in manifest.shards
     }
     reloc_by_key: dict[tuple[int, int, int], _RelocAppender] = {}
+    copied_cells = 0
+    copied_bytes = 0
+    progress_every_cells = 250_000
+    progress_every_seconds = 2.0
+    next_report_cell = progress_every_cells
+    last_report_t = time.perf_counter()
 
     for cell in iter_cells_dfs(manifest_path, max_open_files=plan.max_open_files):
         key = (cell.shard.level, cell.shard.prefix_bits, cell.shard.prefix)
@@ -198,6 +264,22 @@ def relocate_payloads_dfs(
                     )
                 output_fp.write(chunk)
                 remaining -= len(chunk)
+        copied_cells += 1
+        copied_bytes += int(cell.payload_length)
+        now = time.perf_counter()
+        if copied_cells >= next_report_cell or now - last_report_t >= progress_every_seconds:
+            print(
+                (
+                    "Combine: Phase A progress "
+                    f"cells={copied_cells:,}, "
+                    f"bytes={_format_bytes(copied_bytes)}, "
+                    f"out_offset={output_fp.tell():,}"
+                ),
+                flush=True,
+            )
+            while copied_cells >= next_report_cell:
+                next_report_cell += progress_every_cells
+            last_report_t = now
 
         reloc = reloc_by_key.get(key)
         if reloc is None:
@@ -222,6 +304,16 @@ def relocate_payloads_dfs(
         app = reloc_by_key[key]
         app.finalize()
         relocation_files.append(app.path)
+
+    print(
+        (
+            "Combine: Phase A final "
+            f"cells={copied_cells:,}, "
+            f"bytes={_format_bytes(copied_bytes)}, "
+            f"out_offset={output_fp.tell():,}"
+        ),
+        flush=True,
+    )
 
     return PayloadPassResult(
         payload_end_offset=output_fp.tell(),
