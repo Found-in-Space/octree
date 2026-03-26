@@ -113,6 +113,8 @@ These two fields are written for **every** star and are **not** optional.
 
 **Enrichment fields** (optional) come from the identifiers map (`identifiers_map.parquet`), looked up by the same `(source, source_id)` key. Enrichment fields are never null — absent means not applicable.
 
+Field semantics and provenance for `identifiers_map.parquet` are defined by the producer of that file. This document specifies only how those fields are serialized into octree metadata payloads.
+
 | Field | Type | Source | Description |
 |---|---|---|---|
 | `gaia_source_id` | integer | identifiers map | Gaia DR3 source identifier |

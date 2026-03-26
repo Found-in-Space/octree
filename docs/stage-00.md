@@ -1,4 +1,4 @@
-# Pipeline Stage 00: Per-Pixel Streaming Enrichment
+# Stage 00: Per-Pixel Streaming Enrichment
 
 ## Purpose
 
@@ -17,6 +17,12 @@ Stage 00 processes one pixel directory at a time and writes enriched parquet to:
 - `.../octree/stage00/{pixel}/*.parquet`
 
 Each output parquet part is sorted by `morton_code, mag_abs`.
+
+## Stage boundary
+
+Stage 00 starts from already merged, HEALPix-sharded parquet input.
+
+It does not perform catalog reconciliation tasks such as duplicate resolution, crossmatch decisions, or override policy. Its scope starts at per-row octree enrichment (`morton_code`, `render`, `level`) and file-local ordering for Stage 01.
 
 ## Why this design
 
@@ -60,6 +66,11 @@ Options:
 
 - `x_icrs_pc`, `y_icrs_pc`, `z_icrs_pc`
 - `mag_abs`
+
+For downstream sidecars and stable ordering, merged input should also include:
+
+- `source`
+- `source_id`
 
 Optional:
 

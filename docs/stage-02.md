@@ -1,4 +1,4 @@
-# Pipeline 2: `combine` — Detailed Specification
+# Stage 02: `combine` — Detailed Specification
 
 ## Purpose
 
@@ -1361,7 +1361,7 @@ foundinspace/octree/combine/manifest.py
 
 ## Summary
 
-Pipeline 2 `combine` is a bounded-memory assembly pipeline, not an in-memory transform.
+Stage 02 `combine` is a bounded-memory assembly step, not an in-memory transform.
 
 Its central design principles are:
 

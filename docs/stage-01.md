@@ -1,8 +1,8 @@
-# Pipeline stage 01: Build intermediates
+# Stage 01: Build intermediates
 
 ## Prerequisites
 
-Input parquet for this stage must be prepared by **pipeline stage 00** (see [pipeline-stage-00.md](pipeline-stage-00.md)). Stage 00 enriches each file with `morton_code`, precomputed `render` bytes, and `level`, and writes locally sorted parquet. Stage 01 requires all four columns (`morton_code`, `render`, `level`, `mag_abs`) to be present.
+Input parquet for this stage must be prepared by **Stage 00** (see [stage-00.md](stage-00.md)). Stage 00 enriches each file with `morton_code`, precomputed `render` bytes, and `level`, and writes locally sorted parquet. Stage 01 requires all four columns (`morton_code`, `render`, `level`, `mag_abs`) to be present.
 
 ## Purpose
 
@@ -19,7 +19,7 @@ Stage 01 is a **bounded-memory writer**. It must never materialize the full data
 * a bounded set of open writers / file handles
 * small codec scratch buffers
 
-The output of Stage 01 is designed so that Pipeline 2 can later:
+The output of Stage 01 is designed so that Stage 02 can later:
 
 * traverse cells in DFS order
 * relocate payloads directly into the final `stars.octree`
@@ -569,7 +569,7 @@ The memory footprint should scale with the largest single cell, not with the num
 
 ### 4. Fixed-record index files
 
-Index files must remain suitable for memory-mapped or binary-search access by Pipeline 2.
+Index files must remain suitable for memory-mapped or binary-search access by Stage 02.
 
 ---
 
@@ -804,5 +804,5 @@ Stage 01 is complete when all of the following are true:
 * every written payload blob has exactly one matching index record
 * every index file is fixed-record and sorted by `node_id`
 * the manifest fully describes the intermediate directory
-* Pipeline 2 can reopen the intermediates using only the manifest and the binary file layouts defined here
+* Stage 02 can reopen the intermediates using only the manifest and the binary file layouts defined here
 * the implementation uses only bounded caches and current-cell state in memory
