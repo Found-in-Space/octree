@@ -17,12 +17,12 @@ class TestStage01CLI:
         assert "--deep-prefix-bits" in result.output
         assert "--batch-size" in result.output
 
-    def test_missing_required_deep_shard_from_level(self):
+    def test_help_shows_default_deep_shard_level(self):
         runner = CliRunner()
-        result = runner.invoke(cli, ["stage-01", "*.parquet", "/tmp/out"])
-        assert result.exit_code != 0
-        assert "deep-shard-from-level" in result.output.lower() or \
-               "deep-shard-from-level" in (result.output + str(result.exception)).lower()
+        result = runner.invoke(cli, ["stage-01", "--help"])
+        assert result.exit_code == 0
+        assert "--deep-shard-from-level" in result.output
+        assert "99" in result.output
 
     def test_non_empty_output_dir(self, tmp_path):
         (tmp_path / "existing.txt").write_text("occupied")

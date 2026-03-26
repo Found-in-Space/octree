@@ -8,16 +8,34 @@ from rich.console import Console
 from rich.table import Table
 
 from foundinspace.octree.config import (
+    DEFAULT_DEEP_SHARD_FROM_LEVEL,
     DEFAULT_MAG_VIS,
     DEFAULT_MAX_LEVEL,
     LEVEL_CONFIG,
     WORLD_HALF_SIZE_PC,
 )
 from foundinspace.octree.mag_levels import MagLevelConfig
+from foundinspace.octree.paths import (
+    MERGED_HEALPIX_DIR,
+    STAGE00_OUTPUT_DIR,
+    STAGE00_PARQUET_GLOB,
+    STAGE01_DIR,
+)
 from foundinspace.octree.reader import Point
 from foundinspace.octree.reader.stats import StatsReport, collect_stats
-from foundinspace.octree.sources.add_shard_columns import run_add_shard_columns
-from foundinspace.octree.sources.sort_shards import run_sort_shards
+from foundinspace.octree.sources.add_shard_columns import run_enrich_healpix
+
+
+def _default_stage02_manifest(*_args: object) -> Path:
+    import foundinspace.octree.paths as _paths
+
+    return _paths.STAGE01_MANIFEST_PATH
+
+
+def _default_stage02_output(*_args: object) -> Path:
+    import foundinspace.octree.paths as _paths
+
+    return _paths.STAGE02_OUTPUT
 
 
 def _resolve_mag_config(
@@ -43,13 +61,27 @@ def cli() -> None:
 @cli.command("stage-00")
 @click.argument(
     "input_dir",
+    required=False,
     type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=MERGED_HEALPIX_DIR,
 )
-@click.argument("output_dir", type=click.Path(path_type=Path))
+@click.argument(
+    "output_dir",
+    required=False,
+    type=click.Path(path_type=Path),
+    default=STAGE00_OUTPUT_DIR,
+)
 @click.option(
     "--force",
     is_flag=True,
-    help="Recompute morton_code, render, and level even if already present.",
+    help="Recompute output for pixel directories that already exist.",
+)
+@click.option(
+    "--batch-size",
+    type=int,
+    default=1_000_000,
+    show_default=True,
+    help="Rows per streaming enrichment batch.",
 )
 @click.option(
     "--v-mag",
@@ -63,42 +95,44 @@ def cli() -> None:
     default=None,
     help=f"Max octree level (default: {DEFAULT_MAX_LEVEL}).",
 )
-@click.option(
-    "--no-clear-output",
-    is_flag=True,
-    help="Do not delete OUTPUT_DIR before writing sorted bands.",
-)
 def stage_00(
     input_dir: Path,
     output_dir: Path,
     force: bool,
+    batch_size: int,
     v_mag: float | None,
     max_level: int | None,
-    no_clear_output: bool,
 ) -> None:
-    """Enrich all parquet under INPUT_DIR in-place, then sort into bands under OUTPUT_DIR."""
+    """Stream-enrich HEALPix parquet into Stage 00 outputs without mutating input."""
     mag_config = _resolve_mag_config(v_mag, max_level)
 
-    click.echo(f"Stage 00 — add_shard_columns (in-place): {input_dir}")
-    run_add_shard_columns(
-        input_dir,
+    click.echo(f"Stage 00 — per-pixel enrichment: {input_dir} -> {output_dir}")
+    processed, skipped = run_enrich_healpix(
+        src_root=input_dir,
+        output_root=output_dir,
         mag_config=mag_config,
         force=force,
+        batch_size=batch_size,
         verbose=True,
     )
-    click.echo(f"Stage 00 — sort_shards: {input_dir} -> {output_dir}")
-    run_sort_shards(
-        input_dir,
-        output_dir,
-        mag_config=mag_config,
-        clear_dst=not no_clear_output,
-        verbose=True,
+    click.echo(
+        "Stage 00 summary: "
+        f"processed_pixels={processed}, skipped_pixels={skipped}"
     )
 
 
 @cli.command("stage-01")
-@click.argument("input_glob", type=str)
-@click.argument("out_dir", type=click.Path(path_type=Path))
+@click.argument(
+    "input_glob",
+    required=False,
+    default=STAGE00_PARQUET_GLOB,
+)
+@click.argument(
+    "out_dir",
+    required=False,
+    type=click.Path(path_type=Path),
+    default=STAGE01_DIR,
+)
 @click.option(
     "--max-level",
     type=int,
@@ -108,8 +142,12 @@ def stage_00(
 @click.option(
     "--deep-shard-from-level",
     type=int,
-    required=True,
-    help="First level to use prefix sharding.",
+    default=DEFAULT_DEEP_SHARD_FROM_LEVEL,
+    show_default=True,
+    help=(
+        "First level to use prefix sharding "
+        f"(default: {DEFAULT_DEEP_SHARD_FROM_LEVEL}, above typical max_level so one shard per level)."
+    ),
 )
 @click.option(
     "--deep-prefix-bits",
@@ -159,9 +197,16 @@ def stage_01(
 @cli.command("stage-02")
 @click.argument(
     "manifest_path",
+    required=False,
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=_default_stage02_manifest,
 )
-@click.argument("output_path", type=click.Path(path_type=Path))
+@click.argument(
+    "output_path",
+    required=False,
+    type=click.Path(path_type=Path),
+    default=_default_stage02_output,
+)
 @click.option(
     "--max-open-files",
     type=int,
@@ -180,7 +225,14 @@ def stage_02(
     max_open_files: int,
     retain_relocation_files: bool,
 ) -> None:
-    """Combine intermediates into final stars.octree output."""
+    """Combine intermediates into final stars.octree output.
+
+    With no positional arguments, defaults match Stage 01 output and a repo-standard
+    final path (see ``foundinspace.octree.paths`` and ``FIS_OCTREE_DIR``):
+
+    - Manifest: ``<octree>/stage01/manifest.json`` (default ``data/octree/...``)
+    - Output: ``<octree>/stars.octree``
+    """
     from foundinspace.octree.combine import CombinePlan, combine_octree
 
     plan = CombinePlan(
@@ -334,11 +386,11 @@ def stats(
     )
     console = Console()
     console.print(
-        (
+
             f"File: {octree_path} | center={report.header.world_center} "
             f"| half_size={report.header.world_half_size:.1f} pc "
             f"| max_level={report.header.max_level} "
             f"| mag_limit={report.header.mag_limit:.2f}"
-        )
+
     )
     _render_stats(console, report, nearest)

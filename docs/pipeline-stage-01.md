@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-Input parquet for this stage must be prepared by **pipeline stage 00** (see [pipeline-stage-00.md](pipeline-stage-00.md)). Stage 00 enriches each file with `morton_code`, precomputed `render` bytes, and `level`, then sorts and splits into magnitude bands. Stage 01 requires all four columns (`morton_code`, `render`, `level`, `mag_abs`) to be present.
+Input parquet for this stage must be prepared by **pipeline stage 00** (see [pipeline-stage-00.md](pipeline-stage-00.md)). Stage 00 enriches each file with `morton_code`, precomputed `render` bytes, and `level`, and writes locally sorted parquet. Stage 01 requires all four columns (`morton_code`, `render`, `level`, `mag_abs`) to be present.
 
 ## Purpose
 
@@ -671,7 +671,7 @@ For each `(level, prefix_bits, prefix)` shard, the row source must ensure:
 
 Level semantics are defined by `MagLevelConfig` (see `src/foundinspace/octree/mag_levels.py`) and materialized by Stage 00 in the `level` column. Stage 01 must use `WHERE level = :level` as the correctness contract for level selection. Null `mag_abs` rows must be excluded.
 
-The Stage 00 bright/medium/faint band split is a performance optimization and may be used to prune scanned files, but it must not alter correctness.
+Stage 00 may use any file layout strategy (including no band split). Stage 01 correctness is defined by `WHERE level = :level`, independent of Stage 00 directory naming.
 
 ### Documentation requirement
 
@@ -764,18 +764,18 @@ The outputs must satisfy all of the following:
 ## CLI contract
 
 ```
-uv run fis-octree stage-01 INPUT_GLOB OUT_DIR [options]
+uv run fis-octree stage-01 [INPUT_GLOB] [OUT_DIR] [options]
 ```
 
-### Required arguments
+### Arguments (optional; defaults from `foundinspace.octree.paths` / `.env`)
 
-* **`INPUT_GLOB`** — glob pattern for Stage 00 output parquet (e.g. `sorted/*.parquet`)
-* **`OUT_DIR`** — directory for intermediate shard files and `manifest.json`
+* **`INPUT_GLOB`** — glob for Stage 00 parquet (default: `{FIS_OCTREE_DIR}/stage00/**/*.parquet`)
+* **`OUT_DIR`** — directory for intermediate shard files and `manifest.json` (default: `{FIS_OCTREE_DIR}/stage01`)
 
 ### Options
 
 * `--max-level N` — maximum octree level (default: `DEFAULT_MAX_LEVEL`)
-* `--deep-shard-from-level N` — first level to use prefix sharding
+* `--deep-shard-from-level N` — first level to use prefix sharding (default: `99`, above typical `max_level`, so one shard per level)
 * `--deep-prefix-bits N` — prefix width for deep sharding (default: `3`)
 * `--batch-size N` — row batch size for streaming (default: `100000`)
 * `--v-mag F` — indexing magnitude (default: `DEFAULT_MAG_VIS`)

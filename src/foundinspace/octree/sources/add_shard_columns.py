@@ -1,41 +1,37 @@
 #!/usr/bin/env python3
-"""Add morton_code, render (16-byte fixed), and level (int32) to parquet files in-place.
+"""Enrich HEALPix parquet with morton_code/render/level in a streaming, non-destructive flow.
 
-Computes morton_code from x_icrs_pc, y_icrs_pc, z_icrs_pc using world geometry in
-foundinspace.octree.config and foundinspace.octree.encoding.morton (no upstream morton).
+Stage 00 processes one HEALPix pixel directory at a time:
+1. Stream source rows in batches.
+2. Compute morton_code, render, and level columns.
+3. Sort each batch by morton_code/mag_abs and write temporary run files.
+4. DuckDB merge-sort runs into size-limited parquet outputs for that pixel.
 
-Derives level from mag_abs via MagLevelConfig; gets cell (gx, gy, gz) from
-morton_code >> (3 * (MORTON_BITS - level)), then cell-relative quantized render bytes.
-
-Writes to a temp file and renames to replace the original. Skip files that already have
-morton_code, render, and level unless ``force`` is True.
-
-Run before ``run_sort_shards`` (stage 00) when input lacks morton_code; see docs/pipeline-stage-00.md.
-
-Invoked from ``foundinspace.octree._cli``; use ``uv run fis-octree stage-00 ...``.
+Input files are never modified in place.
 """
 from __future__ import annotations
 
-import os
-import time
+import shutil
 from pathlib import Path
 
+import duckdb
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-
-from foundinspace.octree.mag_levels import MagLevelConfig
 from foundinspace.octree.config import (
-    DEFAULT_MAX_LEVEL,
     DEFAULT_MAG_VIS,
+    DEFAULT_MAX_LEVEL,
     LEVEL_CONFIG,
     MORTON_BITS,
     WORLD_CENTER,
     WORLD_HALF_SIZE_PC,
 )
+from foundinspace.octree.duckdb_util import configure_connection
 from foundinspace.octree.encoding.morton import morton3d_u64_from_xyz_arrays
 from foundinspace.octree.encoding.teff import encode_teff
+from foundinspace.octree.mag_levels import MagLevelConfig
 
 # Numpy dtypes for vectorized pack/unpack (16-byte render, 10-byte meta)
 _RENDER_DT = np.dtype([
@@ -63,21 +59,21 @@ def _compute_render_and_level(
     teff = np.where(np.isfinite(teff), teff.astype(np.float64), 5800.0)
     level_arr = mag_config.assign_level_array(mag_abs)
 
-    max_L = int(level_arr.max()) if n > 0 else 0
-    if max_L > 13:
+    max_level = int(level_arr.max()) if n > 0 else 0
+    if max_level > 13:
         raise NotImplementedError(
-            f"Max level {max_L} exceeds 13. This script is currently limited to level ≤ 13. "
+            f"Max level {max_level} exceeds 13. This script is currently limited to level ≤ 13. "
             f"Higher levels require uint64 for node_id handling — extend and re-enable if needed."
         )
 
     teff_log8 = encode_teff(teff)
     render_out = np.zeros(n, dtype=_RENDER_DT)
 
-    for L in np.unique(level_arr):
-        L = int(L)
-        indices_L = np.where(level_arr == L)[0]
-        shift = 3 * (MORTON_BITS - L)
-        node_ids = np.asarray(morton_code[indices_L], dtype=np.uint64) >> shift
+    for level in np.unique(level_arr):
+        level = int(level)
+        indices_level = np.where(level_arr == level)[0]
+        shift = 3 * (MORTON_BITS - level)
+        node_ids = np.asarray(morton_code[indices_level], dtype=np.uint64) >> shift
 
         # De-interleave only unique node_ids (num_cells << N)
         unq_nodes, inv = np.unique(node_ids, return_inverse=True)
@@ -85,13 +81,13 @@ def _compute_render_and_level(
         gx_u = np.zeros(m, dtype=np.uint32)
         gy_u = np.zeros(m, dtype=np.uint32)
         gz_u = np.zeros(m, dtype=np.uint32)
-        for b in range(L):
+        for b in range(level):
             gx_u |= ((unq_nodes >> (3 * b)) & 1).astype(np.uint32) << b
             gy_u |= ((unq_nodes >> (3 * b + 1)) & 1).astype(np.uint32) << b
             gz_u |= ((unq_nodes >> (3 * b + 2)) & 1).astype(np.uint32) << b
 
         # Vectorized cell centers for all unique cells, then expand per-star via inv
-        hs = max(half_size / (2**L), 1e-20)
+        hs = max(half_size / (2**level), 1e-20)
         cell_size = 2.0 * hs
         cx_u = center[0] + (gx_u.astype(np.float64) + 0.5) * cell_size - half_size
         cy_u = center[1] + (gy_u.astype(np.float64) + 0.5) * cell_size - half_size
@@ -101,14 +97,14 @@ def _compute_render_and_level(
         cy_s = cy_u[inv]
         cz_s = cz_u[inv]
 
-        pos_band = positions[indices_L]
-        rec = render_out[indices_L]
+        pos_band = positions[indices_level]
+        rec = render_out[indices_level]
         rec["x"] = np.clip((pos_band[:, 0] - cx_s) / hs, -1.0, 1.0)
         rec["y"] = np.clip((pos_band[:, 1] - cy_s) / hs, -1.0, 1.0)
         rec["z"] = np.clip((pos_band[:, 2] - cz_s) / hs, -1.0, 1.0)
-        rec["mag"] = np.clip(np.round(mag_abs[indices_L] * 100.0), -32768, 32767)
-        rec["teff"] = teff_log8[indices_L]
-        render_out[indices_L] = rec
+        rec["mag"] = np.clip(np.round(mag_abs[indices_level] * 100.0), -32768, 32767)
+        rec["teff"] = teff_log8[indices_level]
+        render_out[indices_level] = rec
 
     render_bytes = np.ascontiguousarray(render_out.view(np.uint8).reshape(n, 16))
     assert render_bytes.flags["C_CONTIGUOUS"], "render buffer must be C-contiguous for pa.py_buffer"
@@ -137,39 +133,92 @@ def _compression_from_metadata(file_meta) -> str:
     return str(codec).lower()
 
 
-def process_file(
-    path: Path,
+def _resolve_mag_config(
+    mag_config: MagLevelConfig | None,
+    *,
+    v_mag: float | None,
+    max_level: int | None,
+) -> MagLevelConfig:
+    if mag_config is not None:
+        return mag_config
+    vm = DEFAULT_MAG_VIS if v_mag is None else v_mag
+    ml = DEFAULT_MAX_LEVEL if max_level is None else max_level
+    if vm == DEFAULT_MAG_VIS and ml == DEFAULT_MAX_LEVEL:
+        return LEVEL_CONFIG
+    return MagLevelConfig(
+        v_mag=vm,
+        world_half_size=WORLD_HALF_SIZE_PC,
+        max_level=ml,
+    )
+
+
+def _is_pixel_complete(pixel_output_dir: Path) -> bool:
+    return (pixel_output_dir / ".complete").exists() or any(pixel_output_dir.glob("*.parquet"))
+
+
+def _pixel_dirs(src_root: Path) -> list[Path]:
+    return sorted(
+        p for p in src_root.iterdir() if p.is_dir() and any(p.glob("*.parquet"))
+    )
+
+
+def _sort_and_write_pixel_runs(
+    pixel_tmp_dir: Path,
+    pixel_output_dir: Path,
+    *,
+    verbose: bool,
+) -> int:
+    run_glob = (pixel_tmp_dir / "*.parquet").as_posix().replace("'", "''")
+    tmp_output_dir = pixel_output_dir.parent / f".tmp-merge-{pixel_output_dir.name}"
+    if tmp_output_dir.exists():
+        shutil.rmtree(tmp_output_dir)
+    if pixel_output_dir.exists():
+        shutil.rmtree(pixel_output_dir)
+
+    con = duckdb.connect()
+    configure_connection(con)
+    try:
+        con.execute(
+            f"""
+            COPY (
+                SELECT *
+                FROM read_parquet('{run_glob}', union_by_name = true)
+                ORDER BY morton_code, mag_abs
+            )
+            TO '{tmp_output_dir.as_posix()}'
+            (
+                FORMAT parquet,
+                CODEC zstd,
+                ROW_GROUP_SIZE 122880,
+                PER_THREAD_OUTPUT false,
+                FILE_SIZE_BYTES '1GB'
+            );
+            """
+        )
+    finally:
+        con.close()
+
+    tmp_output_dir.rename(pixel_output_dir)
+    out_files = len(list(pixel_output_dir.glob("*.parquet")))
+    if verbose:
+        print(f"  merged {len(list(pixel_tmp_dir.glob('*.parquet')))} runs -> {out_files} shard(s)")
+    return out_files
+
+
+def _enrich_table(
+    table: pa.Table,
+    *,
     mag_config: MagLevelConfig,
-    force: bool,
     center: np.ndarray,
     half_size: float,
-) -> tuple[bool, int, float]:
-    """Process one parquet file: add morton_code, render, and level; write in-place.
-    Returns (written, n_stars, elapsed_sec); if skipped, (False, 0, 0.0)."""
-    file_meta = pq.read_metadata(path)
-    schema = file_meta.schema.to_arrow_schema()
-    names = set(schema.names)
-    if (
-        "render" in names
-        and "level" in names
-        and "morton_code" in names
-        and not force
-    ):
-        return (False, 0, 0.0)
-    required = {"x_icrs_pc", "y_icrs_pc", "z_icrs_pc", "mag_abs"}
-    missing = required - names
-    if missing:
-        raise ValueError(f"{path}: missing columns {missing}")
-
-    compression = _compression_from_metadata(file_meta)
-    t0 = time.perf_counter()
-    table = pq.read_table(path)
-
+) -> pa.Table:
+    names = set(table.schema.names)
     if "teff" not in names:
         table = table.append_column(
             "teff",
             pa.array(np.full(len(table), 5800.0, dtype=np.float64)),
         )
+        names = set(table.schema.names)
 
     x = np.asarray(table.column("x_icrs_pc"), dtype=np.float64)
     y = np.asarray(table.column("y_icrs_pc"), dtype=np.float64)
@@ -178,85 +227,133 @@ def process_file(
     positions = np.column_stack([x, y, z])
     mag_abs = np.asarray(table.column("mag_abs"), dtype=np.float64)
     teff = np.asarray(table.column("teff"), dtype=np.float64)
-
     render, level = _compute_render_and_level(
         morton_code, positions, mag_abs, teff, center, half_size, mag_config
     )
-    n_stars = len(render)
+
     for col in ("morton_code", "render", "level"):
         if col in names:
             table = table.drop([col])
-    morton_col = pa.array(morton_code, type=pa.uint64())
-    render_col = _make_fixed_size_binary_column(render)
-    level_col = pa.array(level, type=pa.int32())
     table = (
-        table.append_column("morton_code", morton_col)
-        .append_column("render", render_col)
-        .append_column("level", level_col)
+        table.append_column("morton_code", pa.array(morton_code, type=pa.uint64()))
+        .append_column("render", _make_fixed_size_binary_column(render))
+        .append_column("level", pa.array(level, type=pa.int32()))
     )
+    sort_idx = pc.sort_indices(
+        table,
+        sort_keys=[("morton_code", "ascending"), ("mag_abs", "ascending")],
+    )
+    return table.take(sort_idx)
 
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    pq.write_table(table, tmp, compression=compression)
-    os.replace(tmp, path)
-    elapsed = time.perf_counter() - t0
-    return (True, n_stars, elapsed)
 
-
-def run_add_shard_columns(
-    data_dir: Path,
+def run_enrich_healpix(
+    src_root: Path,
+    output_root: Path,
     *,
     mag_config: MagLevelConfig | None = None,
     force: bool = False,
+    batch_size: int = 1_000_000,
     v_mag: float | None = None,
     max_level: int | None = None,
     verbose: bool = True,
 ) -> tuple[int, int]:
     """
-    Walk ``data_dir`` recursively for ``*.parquet`` and add morton_code, render, level in-place.
+    Enrich HEALPix-sharded parquet from ``src_root`` to ``output_root``.
 
-    If ``mag_config`` is given, it is used for level assignment. Otherwise ``v_mag`` / ``max_level``
-    (defaulting to config defaults) determine a ``MagLevelConfig``.
-
-    Returns ``(written_count, skipped_count)``.
+    Each HEALPix pixel directory is processed independently in bounded-memory batches.
+    Returns ``(processed_pixels, skipped_pixels)``.
     """
-    if not data_dir.is_dir():
-        raise NotADirectoryError(f"Not a directory: {data_dir}")
+    if not src_root.is_dir():
+        raise NotADirectoryError(f"Not a directory: {src_root}")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
 
-    if mag_config is None:
-        vm = DEFAULT_MAG_VIS if v_mag is None else v_mag
-        ml = DEFAULT_MAX_LEVEL if max_level is None else max_level
-        if vm == DEFAULT_MAG_VIS and ml == DEFAULT_MAX_LEVEL:
-            mag_config = LEVEL_CONFIG
-        else:
-            mag_config = MagLevelConfig(
-                v_mag=vm,
-                world_half_size=WORLD_HALF_SIZE_PC,
-                max_level=ml,
-            )
+    mag_config = _resolve_mag_config(
+        mag_config,
+        v_mag=v_mag,
+        max_level=max_level,
+    )
     center = WORLD_CENTER.copy()
     half_size = WORLD_HALF_SIZE_PC
+    output_root.mkdir(parents=True, exist_ok=True)
 
-    paths = sorted(data_dir.rglob("*.parquet"))
-    if not paths:
+    pixels = _pixel_dirs(src_root)
+    if not pixels:
         if verbose:
-            print(f"No .parquet files under {data_dir}")
+            print(f"No HEALPix pixel directories with parquet files under {src_root}")
         return (0, 0)
 
-    written = 0
+    processed = 0
     skipped = 0
-    for p in paths:
-        if verbose:
-            label = p.relative_to(data_dir)
-            print(f"Processing {label}....", end="", flush=True)
-        ok, n_stars, elapsed = process_file(p, mag_config, force, center, half_size)
-        if ok:
-            if verbose:
-                print(f" Wrote {n_stars:,} stars in {elapsed:.1f}s")
-            written += 1
-        else:
-            if verbose:
-                print(" Skipped (already has morton_code+render+level).")
+    for pixel_dir in pixels:
+        pixel_name = pixel_dir.name
+        out_pixel_dir = output_root / pixel_name
+        pixel_tmp_dir = output_root / f".tmp-pixel-{pixel_name}"
+        if force and out_pixel_dir.exists():
+            shutil.rmtree(out_pixel_dir)
+        if not force and _is_pixel_complete(out_pixel_dir):
             skipped += 1
+            if verbose:
+                print(f"Skipping pixel {pixel_name} (already complete)")
+            continue
+
+        if pixel_tmp_dir.exists():
+            shutil.rmtree(pixel_tmp_dir)
+        pixel_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        run_count = 0
+        row_count = 0
+        if verbose:
+            print(f"Processing pixel {pixel_name}...")
+
+        try:
+            for src_file in sorted(pixel_dir.glob("*.parquet")):
+                file_meta = pq.read_metadata(src_file)
+                schema = file_meta.schema.to_arrow_schema()
+                names = set(schema.names)
+                required = {"x_icrs_pc", "y_icrs_pc", "z_icrs_pc", "mag_abs"}
+                missing = required - names
+                if missing:
+                    raise ValueError(f"{src_file}: missing columns {sorted(missing)}")
+
+                compression = _compression_from_metadata(file_meta)
+                parquet_file = pq.ParquetFile(src_file)
+                for batch in parquet_file.iter_batches(batch_size=batch_size):
+                    table = pa.Table.from_batches([batch])
+                    if len(table) == 0:
+                        continue
+                    enriched = _enrich_table(
+                        table,
+                        mag_config=mag_config,
+                        center=center,
+                        half_size=half_size,
+                    )
+                    run_path = pixel_tmp_dir / f"{run_count:08d}.parquet"
+                    pq.write_table(enriched, run_path, compression=compression)
+                    run_count += 1
+                    row_count += len(enriched)
+
+            if run_count == 0:
+                out_pixel_dir.mkdir(parents=True, exist_ok=True)
+                (out_pixel_dir / ".complete").write_text("empty\n", encoding="utf-8")
+                if verbose:
+                    print(f"  no rows for pixel {pixel_name}; wrote completion marker")
+            else:
+                out_count = _sort_and_write_pixel_runs(
+                    pixel_tmp_dir,
+                    out_pixel_dir,
+                    verbose=verbose,
+                )
+                (out_pixel_dir / ".complete").write_text("ok\n", encoding="utf-8")
+                if verbose:
+                    print(
+                        f"  wrote pixel {pixel_name}: {row_count:,} rows across {out_count} file(s)"
+                    )
+            processed += 1
+        finally:
+            if pixel_tmp_dir.exists():
+                shutil.rmtree(pixel_tmp_dir)
+
     if verbose:
-        print(f"Done: {written} written, {skipped} skipped.")
-    return (written, skipped)
+        print(f"Done: {processed} processed, {skipped} skipped.")
+    return (processed, skipped)
