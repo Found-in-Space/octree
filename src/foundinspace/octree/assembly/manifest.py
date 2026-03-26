@@ -12,6 +12,7 @@ from .formats import (
     INDEX_RECORD,
     INDEX_VERSION,
     MANIFEST_FORMAT,
+    META_INDEX_MAGIC,
     PAYLOAD_CODEC,
 )
 
@@ -20,35 +21,15 @@ def manifest_path(out_dir: Path) -> Path:
     return out_dir / "manifest.json"
 
 
-def manifest_entries(manifest: dict) -> list[dict]:
-    entries: list[dict] = []
-    for level_entry in manifest.get("levels", []):
-        level = int(level_entry["level"])
-        for shard in level_entry.get("shards", []):
-            entries.append(
-                {
-                    "level": level,
-                    "prefix_bits": int(shard["prefix_bits"]),
-                    "prefix": int(shard["prefix"]),
-                    "index_path": shard["index_path"],
-                    "payload_path": shard["payload_path"],
-                    "record_count": int(shard["record_count"]),
-                }
-            )
-    return entries
-
-
-def read_manifest(out_dir: Path) -> dict | None:
-    path = manifest_path(out_dir)
-    if not path.exists():
-        return None
-    return json.loads(path.read_text())
-
-
-def validate_shard(out_dir: Path, entry: dict) -> None:
-    """Structural validation of a completed shard file pair."""
-    index_path = out_dir / entry["index_path"]
-    payload_path = out_dir / entry["payload_path"]
+def _validate_index_payload_pair(
+    out_dir: Path,
+    index_rel: str,
+    payload_rel: str,
+    *,
+    expected_magic: bytes,
+) -> None:
+    index_path = out_dir / index_rel
+    payload_path = out_dir / payload_rel
 
     if not index_path.exists():
         raise ValueError(f"Index file missing: {index_path}")
@@ -74,7 +55,7 @@ def validate_shard(out_dir: Path, entry: dict) -> None:
             record_count,
         ) = INDEX_FILE_HDR.unpack(hdr_data)
 
-        if magic != INDEX_MAGIC:
+        if magic != expected_magic:
             raise ValueError(f"Bad magic in {index_path}: {magic!r}")
         if version != INDEX_VERSION:
             raise ValueError(f"Bad version in {index_path}: {version}")
@@ -95,9 +76,7 @@ def validate_shard(out_dir: Path, entry: dict) -> None:
         prev_node_id: int | None = None
         for i in range(record_count):
             rec_data = f.read(INDEX_RECORD.size)
-            node_id, pay_off, pay_len, _star_count = INDEX_RECORD.unpack(
-                rec_data
-            )
+            node_id, pay_off, pay_len, _star_count = INDEX_RECORD.unpack(rec_data)
 
             if prev_node_id is not None and node_id <= prev_node_id:
                 raise ValueError(
@@ -111,6 +90,50 @@ def validate_shard(out_dir: Path, entry: dict) -> None:
                     f"file size {payload_size}"
                 )
             prev_node_id = node_id
+
+
+def manifest_entries(manifest: dict) -> list[dict]:
+    entries: list[dict] = []
+    for level_entry in manifest.get("levels", []):
+        level = int(level_entry["level"])
+        for shard in level_entry.get("shards", []):
+            entry: dict = {
+                "level": level,
+                "prefix_bits": int(shard["prefix_bits"]),
+                "prefix": int(shard["prefix"]),
+                "index_path": shard["index_path"],
+                "payload_path": shard["payload_path"],
+                "record_count": int(shard["record_count"]),
+            }
+            if "meta_index_path" in shard:
+                entry["meta_index_path"] = str(shard["meta_index_path"])
+                entry["meta_payload_path"] = str(shard["meta_payload_path"])
+            entries.append(entry)
+    return entries
+
+
+def read_manifest(out_dir: Path) -> dict | None:
+    path = manifest_path(out_dir)
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())
+
+
+def validate_shard(out_dir: Path, entry: dict) -> None:
+    """Structural validation of render shard pair and optional meta pair."""
+    _validate_index_payload_pair(
+        out_dir,
+        str(entry["index_path"]),
+        str(entry["payload_path"]),
+        expected_magic=INDEX_MAGIC,
+    )
+    if "meta_index_path" in entry:
+        _validate_index_payload_pair(
+            out_dir,
+            str(entry["meta_index_path"]),
+            str(entry["meta_payload_path"]),
+            expected_magic=META_INDEX_MAGIC,
+        )
 
 
 def write_manifest(
@@ -134,19 +157,23 @@ def write_manifest(
     levels = []
     for lvl in sorted(levels_map):
         shards = sorted(levels_map[lvl], key=lambda e: e["prefix"])
+        level_shards = []
+        for s in shards:
+            d: dict = {
+                "prefix_bits": s["prefix_bits"],
+                "prefix": s["prefix"],
+                "index_path": s["index_path"],
+                "payload_path": s["payload_path"],
+                "record_count": s["record_count"],
+            }
+            if "meta_index_path" in s:
+                d["meta_index_path"] = s["meta_index_path"]
+                d["meta_payload_path"] = s["meta_payload_path"]
+            level_shards.append(d)
         levels.append(
             {
                 "level": lvl,
-                "shards": [
-                    {
-                        "prefix_bits": s["prefix_bits"],
-                        "prefix": s["prefix"],
-                        "index_path": s["index_path"],
-                        "payload_path": s["payload_path"],
-                        "record_count": s["record_count"],
-                    }
-                    for s in shards
-                ],
+                "shards": level_shards,
             }
         )
 

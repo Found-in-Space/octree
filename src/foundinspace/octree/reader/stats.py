@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import gzip
+import json
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from typing import BinaryIO
+from typing import Iterator
 
 from .header import OctreeHeader, read_header
 from .index import IndexNavigator, NodeEntry, Point
@@ -34,6 +39,7 @@ class NearestStar:
     magnitude: float
     apparent_magnitude: float
     teff: float
+    identifiers: tuple[tuple[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,17 +59,28 @@ class _MutableLevelStats:
     payload_bytes: int = 0
 
 
+@dataclass(slots=True)
+class _MetaReader:
+    nav: IndexNavigator
+    fp: BinaryIO
+
+
 def collect_stats(
     path: Path,
     *,
     point: Point,
     limiting_magnitude: float,
     radius_pc: float,
+    metadata_path: Path | None = None,
     nearest_n: int = 10,
     coalesce_gap_bytes: int = 64 * 1024,
 ) -> StatsReport:
     header = read_header(path)
-    with IndexNavigator(path, header) as nav, open(path, "rb") as payload_fp:
+    with (
+        IndexNavigator(path, header) as nav,
+        open(path, "rb") as payload_fp,
+        _open_meta_reader(metadata_path, expected_header=header) as meta_reader,
+    ):
         by_level, touched_ranges = _collect_shell_level_stats(
             nav,
             payload_fp,
@@ -78,6 +95,8 @@ def collect_stats(
             point=point,
             radius_pc=radius_pc,
             nearest_n=nearest_n,
+            meta_nav=meta_reader.nav if meta_reader is not None else None,
+            meta_payload_fp=meta_reader.fp if meta_reader is not None else None,
         )
 
     level_rows = tuple(
@@ -190,6 +209,8 @@ def _collect_nearest(
     point: Point,
     radius_pc: float,
     nearest_n: int,
+    meta_nav: IndexNavigator | None = None,
+    meta_payload_fp: BinaryIO | None = None,
 ) -> list[NearestStar]:
     if radius_pc < 0:
         raise ValueError(f"radius_pc must be >= 0, got {radius_pc}")
@@ -197,7 +218,7 @@ def _collect_nearest(
         return []
 
     stack = list(nav.root_entries())
-    nearest: list[NearestStar] = []
+    nearest: list[tuple[NearestStar, NodeEntry, int]] = []
     star_id = 0
     while stack:
         node = stack.pop()
@@ -205,24 +226,122 @@ def _collect_nearest(
             continue
         if node.has_payload:
             stars = decode_payload(payload_fp, node, header.payload_record_size)
-            for star in stars:
+            for ordinal, star in enumerate(stars):
                 distance_pc = star.position.distance_to(point)
                 this_id = star_id
                 star_id += 1
                 if distance_pc > radius_pc:
                     continue
                 nearest.append(
-                    NearestStar(
-                        star_id=this_id,
-                        distance_pc=distance_pc,
-                        magnitude=star.magnitude,
-                        apparent_magnitude=star.apparent_magnitude_at(point),
-                        teff=star.teff,
+                    (
+                        NearestStar(
+                            star_id=this_id,
+                            distance_pc=distance_pc,
+                            magnitude=star.magnitude,
+                            apparent_magnitude=star.apparent_magnitude_at(point),
+                            teff=star.teff,
+                        ),
+                        node,
+                        ordinal,
                     )
                 )
         _push_children(nav, stack, node)
-    nearest.sort(key=lambda s: s.distance_pc)
-    return nearest[:nearest_n]
+    nearest.sort(key=lambda item: item[0].distance_pc)
+    nearest = nearest[:nearest_n]
+    if meta_nav is None or meta_payload_fp is None or not nearest:
+        return [item[0] for item in nearest]
+
+    meta_cache: dict[tuple[int, int, int, int], list[dict[str, Any]]] = {}
+    enriched: list[NearestStar] = []
+    for base, render_node, ordinal in nearest:
+        cache_key = (
+            render_node.level,
+            render_node.grid.x,
+            render_node.grid.y,
+            render_node.grid.z,
+        )
+        entries = meta_cache.get(cache_key)
+        if entries is None:
+            meta_node = meta_nav.find_node_at(
+                point=render_node.center,
+                level=render_node.level,
+            )
+            entries = _decode_meta_entries(
+                meta_payload_fp=meta_payload_fp,
+                node=meta_node,
+            )
+            meta_cache[cache_key] = entries
+        identifiers: tuple[tuple[str, Any], ...] = ()
+        if ordinal < len(entries):
+            identifiers = tuple(entries[ordinal].items())
+        enriched.append(
+            NearestStar(
+                star_id=base.star_id,
+                distance_pc=base.distance_pc,
+                magnitude=base.magnitude,
+                apparent_magnitude=base.apparent_magnitude,
+                teff=base.teff,
+                identifiers=identifiers,
+            )
+        )
+    return enriched
+
+
+@contextmanager
+def _open_meta_reader(
+    metadata_path: Path | None,
+    *,
+    expected_header: OctreeHeader,
+) -> Iterator[_MetaReader | None]:
+    if metadata_path is None:
+        yield None
+        return
+
+    meta_header = read_header(metadata_path)
+    if (
+        meta_header.max_level != expected_header.max_level
+        or meta_header.world_center != expected_header.world_center
+        or meta_header.world_half_size != expected_header.world_half_size
+    ):
+        raise ValueError(
+            "Metadata octree is not compatible with render octree header "
+            f"({metadata_path})"
+        )
+
+    with IndexNavigator(metadata_path, meta_header) as nav, open(
+        metadata_path, "rb"
+    ) as fp:
+        yield _MetaReader(nav=nav, fp=fp)
+
+
+def _decode_meta_entries(
+    *,
+    meta_payload_fp: BinaryIO,
+    node: NodeEntry | None,
+) -> list[dict[str, Any]]:
+    if node is None or not node.has_payload:
+        return []
+
+    meta_payload_fp.seek(node.payload_offset)
+    compressed = meta_payload_fp.read(node.payload_length)
+    if len(compressed) != node.payload_length:
+        return []
+
+    try:
+        raw = gzip.decompress(compressed)
+        parsed = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return []
+
+    if not isinstance(parsed, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for entry in parsed:
+        if isinstance(entry, dict):
+            out.append({str(k): v for k, v in entry.items()})
+        else:
+            out.append({})
+    return out
 
 
 def _push_children(nav: IndexNavigator, stack: list[NodeEntry], node: NodeEntry) -> None:

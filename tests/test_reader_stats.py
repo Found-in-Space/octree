@@ -60,6 +60,47 @@ def _build_small_octree(tmp_path: Path) -> Path:
     return output
 
 
+def _build_small_octree_with_meta(tmp_path: Path) -> tuple[Path, Path]:
+    payload = b"".join(
+        [
+            _encode_star(x_rel=0.0, y_rel=0.0, z_rel=0.0, abs_mag=4.8, teff_log8=128),
+            _encode_star(
+                x_rel=1.0e-5, y_rel=0.0, z_rel=0.0, abs_mag=12.0, teff_log8=80
+            ),
+            _encode_star(x_rel=5.0e-5, y_rel=0.0, z_rel=0.0, abs_mag=5.0, teff_log8=255),
+        ]
+    )
+    manifest_path = build_intermediates(
+        tmp_path / "intermediates_meta",
+        [
+            PayloadNode(
+                level=0,
+                node_id=0,
+                star_count=3,
+                raw_payload=payload,
+                meta_entries=[
+                    {"proper_name": "Sun"},
+                    {"hip_id": 71683, "proper_name": "Rigil Kentaurus"},
+                    {},
+                ],
+            )
+        ],
+        max_level=0,
+        mag_limit=6.5,
+        with_meta=True,
+    )
+    render_output = tmp_path / "stars.octree"
+    meta_output = tmp_path / "stars.meta.octree"
+    combine_octree(manifest_path, render_output, plan=CombinePlan(max_open_files=2))
+    combine_octree(
+        manifest_path,
+        meta_output,
+        plan=CombinePlan(max_open_files=2),
+        payload_kind="meta",
+    )
+    return render_output, meta_output
+
+
 def test_read_header_roundtrip_with_shard_probe(tmp_path: Path) -> None:
     header = pack_top_level_header(
         PackedHeaderFields(
@@ -148,3 +189,22 @@ def test_collect_stats_level_totals_and_nearest(tmp_path: Path) -> None:
 
     assert len(report.nearest) == 2
     assert report.nearest[0].distance_pc <= report.nearest[1].distance_pc
+
+
+def test_collect_stats_includes_identifiers_from_meta_octree(tmp_path: Path) -> None:
+    octree_path, meta_path = _build_small_octree_with_meta(tmp_path)
+    report = collect_stats(
+        octree_path,
+        point=Point(0.0, 0.0, 0.0),
+        limiting_magnitude=6.5,
+        radius_pc=3.0,
+        metadata_path=meta_path,
+        nearest_n=2,
+    )
+
+    assert len(report.nearest) == 2
+    first = dict(report.nearest[0].identifiers)
+    second = dict(report.nearest[1].identifiers)
+    assert first.get("proper_name") == "Sun"
+    assert second.get("proper_name") == "Rigil Kentaurus"
+    assert second.get("hip_id") == 71683

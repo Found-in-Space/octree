@@ -16,6 +16,8 @@ class TestStage01CLI:
         assert "--max-level" in result.output
         assert "--deep-prefix-bits" in result.output
         assert "--batch-size" in result.output
+        assert "--identifiers-map" in result.output
+        assert "--sidecar-fields" in result.output
 
     def test_help_shows_default_deep_shard_level(self):
         runner = CliRunner()

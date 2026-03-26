@@ -5,6 +5,7 @@ from pathlib import Path
 import time
 from typing import BinaryIO
 
+from ..assembly.formats import INDEX_MAGIC, META_INDEX_MAGIC
 from .dfs import iter_cells_dfs
 from .lookup import IntermediateLookup, RelocationLookup
 from .manifest import read_combine_manifest
@@ -146,10 +147,11 @@ def combine_octree(
     output_path: Path,
     *,
     plan: CombinePlan = DEFAULT_COMBINE_PLAN,
+    payload_kind: str = "render",
 ) -> None:
     t0 = time.perf_counter()
     plan.validate()
-    manifest = read_combine_manifest(manifest_path)
+    manifest = read_combine_manifest(manifest_path, payload_kind=payload_kind)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     print(
         (
@@ -172,7 +174,9 @@ def combine_octree(
                 )
             )
         )
-        payload_result = relocate_payloads_dfs(manifest_path, out_fp, plan=plan)
+        payload_result = relocate_payloads_dfs(
+            manifest_path, out_fp, plan=plan, payload_kind=payload_kind
+        )
         print(
             (
                 "Combine: Phase A complete "
@@ -189,6 +193,7 @@ def combine_octree(
             payload_result.relocation_files,
             out_fp,
             plan=plan,
+            payload_kind=payload_kind,
         )
         print(
             (
@@ -235,8 +240,9 @@ def relocate_payloads_dfs(
     output_fp: BinaryIO,
     *,
     plan: CombinePlan,
+    payload_kind: str = "render",
 ) -> PayloadPassResult:
-    manifest = read_combine_manifest(manifest_path)
+    manifest = read_combine_manifest(manifest_path, payload_kind=payload_kind)
     shard_by_key = {
         (s.key.level, s.key.prefix_bits, s.key.prefix): s for s in manifest.shards
     }
@@ -248,7 +254,11 @@ def relocate_payloads_dfs(
     next_report_cell = progress_every_cells
     last_report_t = time.perf_counter()
 
-    for cell in iter_cells_dfs(manifest_path, max_open_files=plan.max_open_files):
+    for cell in iter_cells_dfs(
+        manifest_path,
+        max_open_files=plan.max_open_files,
+        payload_kind=payload_kind,
+    ):
         key = (cell.shard.level, cell.shard.prefix_bits, cell.shard.prefix)
         shard = shard_by_key[key]
         with open(shard.payload_path, "rb") as src_fp:
@@ -449,9 +459,13 @@ def write_final_shard_index(
     output_fp: BinaryIO,
     *,
     plan: CombinePlan,
+    payload_kind: str = "render",
 ) -> IndexPassResult:
-    manifest = read_combine_manifest(manifest_path)
-    existence = IntermediateLookup(manifest, max_open_files=plan.max_open_files)
+    manifest = read_combine_manifest(manifest_path, payload_kind=payload_kind)
+    index_magic = META_INDEX_MAGIC if payload_kind == "meta" else INDEX_MAGIC
+    existence = IntermediateLookup(
+        manifest, max_open_files=plan.max_open_files, index_magic=index_magic
+    )
     relocation = RelocationLookup(
         relocation_files, max_open_files=plan.max_open_files
     )

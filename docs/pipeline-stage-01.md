@@ -67,7 +67,7 @@ where `node_id` is the Morton prefix for that level.
 
 Rows arriving at the cell encoder for a given shard must already be ordered by:
 
-`(node_id, mag_abs[, stable_tiebreak])`
+`(node_id, mag_abs, source_id)`
 
 Stage 01 must not add any secondary re-sort unless explicitly required by the payload format contract.
 
@@ -198,13 +198,13 @@ Raw-coordinate mode is out of scope for Stage 01 in this version.
 
 For each logical shard stream, rows must arrive ordered by:
 
-`node_id, mag_abs[, stable_tiebreak]`
+`node_id, mag_abs, source_id`
 
 This ordering is part of the input contract. If the upstream query cannot guarantee it, it must be fixed upstream before rows reach the cell encoder.
 
 ### Determinism requirement
 
-If exact deterministic ordering is required for stars that share the same `node_id` and identical `mag_abs`, the upstream source must define a stable tiebreak key. Stage 01 must not invent one implicitly.
+Stars that share the same `node_id` and identical `mag_abs` are ordered by `source_id` (string), matching `docs/sidecars.md` R2 for metadata sidecar alignment.
 
 ### Input uniqueness assumption
 
@@ -596,7 +596,7 @@ Rows must arrive grouped by target cell so that Stage 01 can flush a cell when `
 
 This means the query layer must guarantee ordered rows by:
 
-`node_id, mag_abs[, stable_tiebreak]`
+`node_id, mag_abs, source_id`
 
 or an equivalent order that preserves the same grouping and same within-cell order contract.
 
@@ -616,8 +616,10 @@ Input parquet is expected to contain:
 * `level`
 * `morton_code`
 * `mag_abs`
+* `source`
+* `source_id`
 
-Stage 01 does not recompute per-star render bytes.
+Stage 01 does not recompute per-star render bytes. Identity columns are required for R2 ordering and optional metadata sidecars (`docs/sidecars.md`).
 
 ### Precomputed-render query semantics
 
@@ -635,17 +637,19 @@ The required logical query shape is:
 ```sql
 SELECT
     render,
+    source,
+    source_id,
     mag_abs,
     morton_code >> :shift AS node_id
 FROM read_parquet(:parquet_glob)
 WHERE level = :level
   AND mag_abs IS NOT NULL
-ORDER BY node_id, mag_abs
+ORDER BY node_id, mag_abs, source_id
 ```
 
 ### Ordering contract
 
-The required ordering is `node_id, mag_abs`. For v1, no explicit stable tiebreak beyond `mag_abs` is defined. Stage 01 does not add an extra reorder step; the DuckDB query layer must deliver rows in this order.
+The required ordering is `node_id, mag_abs, source_id`. The `source_id` tiebreak matches `docs/sidecars.md` R2 so render and metadata sidecar rows stay in lockstep when `mag_abs` ties within a cell. Stage 01 does not add an extra reorder step; the DuckDB query layer must deliver rows in this order.
 
 ### Deep-level prefix / octant sharding
 
@@ -664,7 +668,7 @@ The exact numeric shift must match the shard-membership rule used by the file la
 For each `(level, prefix_bits, prefix)` shard, the row source must ensure:
 
 * only rows belonging to that shard are produced
-* rows remain ordered by `node_id, mag_abs[, stable_tiebreak]`
+* rows remain ordered by `node_id, mag_abs, source_id`
 * no rows spill into adjacent shards
 
 ### Magnitude-band semantics
@@ -757,7 +761,7 @@ The outputs must satisfy all of the following:
 * input mode: precomputed-render only
 * restart policy: fail if `out_dir` is non-empty
 * manifest publish: atomic (write temp, rename)
-* ordering: `node_id, mag_abs` (no explicit tiebreak)
+* ordering: `node_id, mag_abs, source_id` (stable tiebreak for sidecar alignment; see `docs/sidecars.md`)
 
 ---
 
@@ -779,12 +783,15 @@ uv run fis-octree stage-01 [INPUT_GLOB] [OUT_DIR] [options]
 * `--deep-prefix-bits N` — prefix width for deep sharding (default: `3`)
 * `--batch-size N` — row batch size for streaming (default: `100000`)
 * `--v-mag F` — indexing magnitude (default: `DEFAULT_MAG_VIS`)
+* `--identifiers-map PATH` — `identifiers_map.parquet` for metadata sidecar; if omitted, uses `{FIS_PROCESSED_DIR}/identifiers_map.parquet` when that file exists (`docs/sidecars.md`)
+* `--sidecar-fields` — comma-separated subset of **enrichment** fields from `identifiers_map.parquet` (default: all allowed columns; see `docs/sidecars.md`). Canonical `source` / `source_id` are always written into each metadata JSON entry and are not controlled by this option.
 
 ### Error behavior
 
 * Fail immediately if `OUT_DIR` exists and is non-empty.
 * Fail immediately if shard plan parameters are invalid (see parameter guardrails).
-* Fail immediately if input parquet is missing required columns (`render`, `level`, `morton_code`, `mag_abs`).
+* Fail immediately if input parquet is missing required columns (`render`, `level`, `morton_code`, `mag_abs`, `source`, `source_id`).
+* If `--identifiers-map` is given and the path is not a readable file, fail immediately.
 
 ---
 

@@ -6,7 +6,7 @@ from pathlib import Path
 from click.testing import CliRunner
 
 from combine_helpers import PayloadNode, build_intermediates
-from foundinspace.octree._cli import cli
+from foundinspace.octree._cli import _format_identifiers, cli
 from foundinspace.octree.combine import CombinePlan, combine_octree
 
 STAR_RECORD_FMT = struct.Struct("<fffhBB")
@@ -51,6 +51,47 @@ def _build_small_octree(tmp_path: Path) -> Path:
     return output
 
 
+def _build_small_octree_with_meta(tmp_path: Path) -> Path:
+    payload = b"".join(
+        [
+            _encode_star(x_rel=0.0, y_rel=0.0, z_rel=0.0, abs_mag=4.8, teff_log8=128),
+            _encode_star(
+                x_rel=1.0e-5, y_rel=0.0, z_rel=0.0, abs_mag=12.0, teff_log8=80
+            ),
+            _encode_star(x_rel=5.0e-5, y_rel=0.0, z_rel=0.0, abs_mag=5.0, teff_log8=255),
+        ]
+    )
+    manifest_path = build_intermediates(
+        tmp_path / "intermediates_meta",
+        [
+            PayloadNode(
+                level=0,
+                node_id=0,
+                star_count=3,
+                raw_payload=payload,
+                meta_entries=[
+                    {"proper_name": "Sun"},
+                    {"hip_id": 71683},
+                    {},
+                ],
+            )
+        ],
+        max_level=0,
+        mag_limit=6.5,
+        with_meta=True,
+    )
+    output = tmp_path / "stars.octree"
+    meta_output = tmp_path / "stars.meta.octree"
+    combine_octree(manifest_path, output, plan=CombinePlan(max_open_files=2))
+    combine_octree(
+        manifest_path,
+        meta_output,
+        plan=CombinePlan(max_open_files=2),
+        payload_kind="meta",
+    )
+    return output
+
+
 def test_cli_stats_output_sections(tmp_path: Path) -> None:
     octree_path = _build_small_octree(tmp_path)
     runner = CliRunner()
@@ -75,3 +116,33 @@ def test_cli_stats_output_sections(tmp_path: Path) -> None:
     assert "Coalesced" in result.output
     assert "Total span bytes" in result.output
     assert "Nearest 2 stars" in result.output
+
+
+def test_cli_stats_uses_inferred_meta_and_stars_alias(tmp_path: Path) -> None:
+    octree_path = _build_small_octree_with_meta(tmp_path)
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "stats",
+            str(octree_path),
+            "--point",
+            "0,0,0",
+            "--magnitude",
+            "6.5",
+            "--radius",
+            "3.0",
+            "--stars",
+            "2",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Identifiers" in result.output
+    assert "Sun" in result.output
+    assert "HIP 71683" in result.output
+
+
+def test_format_identifiers_falls_back_to_primary_key() -> None:
+    assert _format_identifiers((("source", "gaia"), ("source_id", "123"))) == "Gaia 123"
+    assert _format_identifiers((("source", "hip"), ("source_id", "42"))) == "HIP 42"

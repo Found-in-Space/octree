@@ -16,6 +16,7 @@ from foundinspace.octree.config import (
 )
 from foundinspace.octree.mag_levels import MagLevelConfig
 from foundinspace.octree.paths import (
+    IDENTIFIERS_MAP_PATH,
     MERGED_HEALPIX_DIR,
     STAGE00_OUTPUT_DIR,
     STAGE00_PARQUET_GLOB,
@@ -116,8 +117,7 @@ def stage_00(
         verbose=True,
     )
     click.echo(
-        "Stage 00 summary: "
-        f"processed_pixels={processed}, skipped_pixels={skipped}"
+        f"Stage 00 summary: processed_pixels={processed}, skipped_pixels={skipped}"
     )
 
 
@@ -167,6 +167,25 @@ def stage_00(
     default=None,
     help=f"Indexing magnitude (default: {DEFAULT_MAG_VIS}).",
 )
+@click.option(
+    "--identifiers-map",
+    "identifiers_map_opt",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help=(
+        "Path to identifiers_map.parquet for metadata sidecar. "
+        f"If omitted, use {IDENTIFIERS_MAP_PATH} when that file exists."
+    ),
+)
+@click.option(
+    "--sidecar-fields",
+    type=str,
+    default=None,
+    help=(
+        "Comma-separated subset of sidecar identifier fields "
+        "(default: all). See docs/sidecars.md entry schema."
+    ),
+)
 def stage_01(
     input_glob: str,
     out_dir: Path,
@@ -175,6 +194,8 @@ def stage_01(
     deep_prefix_bits: int,
     batch_size: int,
     v_mag: float | None,
+    identifiers_map_opt: Path | None,
+    sidecar_fields: str | None,
 ) -> None:
     """Build intermediate shard files from Stage 00 parquet."""
     from foundinspace.octree.assembly import BuildPlan, build_intermediates
@@ -190,7 +211,26 @@ def stage_01(
         mag_limit=vm,
     )
 
-    manifest_path = build_intermediates(input_glob, out_dir, plan=plan)
+    if identifiers_map_opt is not None:
+        map_path = identifiers_map_opt.expanduser()
+        if not map_path.is_file():
+            raise click.ClickException(f"Identifiers map not found: {map_path}")
+    elif IDENTIFIERS_MAP_PATH.is_file():
+        map_path = IDENTIFIERS_MAP_PATH
+    else:
+        map_path = None
+
+    fields_list: list[str] | None = None
+    if sidecar_fields and sidecar_fields.strip():
+        fields_list = [p.strip() for p in sidecar_fields.split(",") if p.strip()]
+
+    manifest_path = build_intermediates(
+        input_glob,
+        out_dir,
+        plan=plan,
+        identifiers_map_path=map_path,
+        sidecar_fields=fields_list,
+    )
     click.echo(f"Manifest written to {manifest_path}")
 
 
@@ -219,11 +259,28 @@ def stage_01(
     is_flag=True,
     help="Keep intermediate relocation files created during combine.",
 )
+@click.option(
+    "--meta/--no-meta",
+    "meta_flag",
+    default=None,
+    help=(
+        "Combine metadata sidecar into a .meta.octree file. "
+        "Default: auto-detect from manifest."
+    ),
+)
+@click.option(
+    "--meta-output",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Output path for metadata octree (default: derived from OUTPUT_PATH).",
+)
 def stage_02(
     manifest_path: Path,
     output_path: Path,
     max_open_files: int,
     retain_relocation_files: bool,
+    meta_flag: bool | None,
+    meta_output: Path | None,
 ) -> None:
     """Combine intermediates into final stars.octree output.
 
@@ -232,8 +289,12 @@ def stage_02(
 
     - Manifest: ``<octree>/stage01/manifest.json`` (default ``data/octree/...``)
     - Output: ``<octree>/stars.octree``
+
+    When the manifest includes metadata sidecar shards, also writes ``<stem>.meta.octree``
+    next to the render output unless ``--no-meta`` is set.
     """
     from foundinspace.octree.combine import CombinePlan, combine_octree
+    from foundinspace.octree.combine.manifest import manifest_has_meta
 
     plan = CombinePlan(
         max_open_files=max_open_files,
@@ -241,6 +302,21 @@ def stage_02(
     )
     combine_octree(manifest_path, output_path, plan=plan)
     click.echo(f"Wrote {output_path}")
+
+    do_meta = meta_flag
+    if do_meta is None:
+        do_meta = manifest_has_meta(manifest_path)
+
+    if do_meta:
+        meta_out = meta_output
+        if meta_out is None:
+            meta_out = output_path.parent / f"{output_path.stem}.meta{output_path.suffix}"
+        combine_octree(
+            manifest_path, meta_out, plan=plan, payload_kind="meta"
+        )
+        click.echo(f"Wrote {meta_out}")
+    elif meta_flag is None:
+        click.echo("No metadata sidecar in manifest; skipping meta combine.")
 
 
 def _parse_point(value: str) -> Point:
@@ -251,9 +327,7 @@ def _parse_point(value: str) -> Point:
         x, y, z = (float(parts[0]), float(parts[1]), float(parts[2]))
         return Point(x=x, y=y, z=z)
     except Exception as exc:
-        raise click.BadParameter(
-            f"Invalid --point '{value}', expected X,Y,Z"
-        ) from exc
+        raise click.BadParameter(f"Invalid --point '{value}', expected X,Y,Z") from exc
 
 
 def _format_kb(value: int) -> str:
@@ -269,6 +343,65 @@ def _format_teff(teff: float) -> str:
     if math.isnan(teff):
         return "n/a"
     return f"{teff:,.0f} K"
+
+
+def _format_identifiers(identifiers: tuple[tuple[str, object], ...]) -> str:
+    if not identifiers:
+        return "-"
+    by_key = {k: v for k, v in identifiers}
+    parts: list[str] = []
+    proper_name = by_key.get("proper_name")
+    if isinstance(proper_name, str) and proper_name.strip():
+        parts.append(proper_name.strip())
+    for key in ("hip_id", "hd", "gaia_source_id"):
+        value = by_key.get(key)
+        if value is None:
+            continue
+        label = "HIP" if key == "hip_id" else ("HD" if key == "hd" else "Gaia")
+        parts.append(f"{label} {value}")
+    bayer = by_key.get("bayer")
+    constellation = by_key.get("constellation")
+    flamsteed = by_key.get("flamsteed")
+    if bayer is not None:
+        if constellation is not None:
+            parts.append(f"{bayer} {constellation}")
+        else:
+            parts.append(str(bayer))
+    elif flamsteed is not None and constellation is not None:
+        parts.append(f"{flamsteed} {constellation}")
+    elif flamsteed is not None:
+        parts.append(str(flamsteed))
+    elif constellation is not None:
+        parts.append(str(constellation))
+
+    if parts:
+        return " | ".join(parts)
+    source = by_key.get("source")
+    source_id = by_key.get("source_id")
+    if source is not None and source_id is not None:
+        source_s = str(source).strip().lower()
+        source_id_s = str(source_id).strip()
+        if source_s == "gaia":
+            return f"Gaia {source_id_s}"
+        if source_s == "hip":
+            return f"HIP {source_id_s}"
+        return f"{source_s}:{source_id_s}"
+    return ", ".join(f"{k}={v}" for k, v in identifiers)
+
+
+def _resolve_meta_octree_path(
+    octree_path: Path,
+    meta_octree_opt: Path | None,
+) -> Path | None:
+    if meta_octree_opt is not None:
+        meta_path = meta_octree_opt.expanduser()
+        if not meta_path.is_file():
+            raise click.ClickException(f"Metadata octree not found: {meta_path}")
+        return meta_path
+    inferred = octree_path.parent / f"{octree_path.stem}.meta{octree_path.suffix}"
+    if inferred.is_file():
+        return inferred
+    return None
 
 
 def _render_stats(console: Console, report: StatsReport, nearest_n: int) -> None:
@@ -314,6 +447,7 @@ def _render_stats(console: Console, report: StatsReport, nearest_n: int) -> None
     nearest.add_column("Magnitude", justify="right")
     nearest.add_column("Apparent magnitude", justify="right")
     nearest.add_column("Teff", justify="right")
+    nearest.add_column("Identifiers")
     for row in report.nearest:
         nearest.add_row(
             f"{row.star_id:,}",
@@ -321,6 +455,7 @@ def _render_stats(console: Console, report: StatsReport, nearest_n: int) -> None
             f"{row.magnitude:.1f}",
             f"{row.apparent_magnitude:.1f}",
             _format_teff(row.teff),
+            _format_identifiers(row.identifiers),
         )
     console.print(nearest)
 
@@ -353,11 +488,21 @@ def _render_stats(console: Console, report: StatsReport, nearest_n: int) -> None
 )
 @click.option(
     "--nearest",
+    "--stars",
     "-n",
     type=int,
     default=10,
     show_default=True,
     help="Number of nearest stars to print.",
+)
+@click.option(
+    "--meta-octree",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help=(
+        "Optional metadata octree path for nearest-star identifiers "
+        "(default: infer <octree_stem>.meta<suffix> when present)."
+    ),
 )
 def stats(
     octree_path: Path,
@@ -365,6 +510,7 @@ def stats(
     magnitude: float,
     radius: float,
     nearest: int,
+    meta_octree: Path | None,
 ) -> None:
     """Read a stage-02 octree and print bounded query stats."""
     if not octree_path.exists():
@@ -377,20 +523,20 @@ def stats(
         raise click.BadParameter("--nearest must be > 0")
 
     query_point = _parse_point(point)
+    meta_octree_path = _resolve_meta_octree_path(octree_path, meta_octree)
     report = collect_stats(
         octree_path,
         point=query_point,
         limiting_magnitude=magnitude,
         radius_pc=radius,
+        metadata_path=meta_octree_path,
         nearest_n=nearest,
     )
     console = Console()
     console.print(
-
-            f"File: {octree_path} | center={report.header.world_center} "
-            f"| half_size={report.header.world_half_size:.1f} pc "
-            f"| max_level={report.header.max_level} "
-            f"| mag_limit={report.header.mag_limit:.2f}"
-
+        f"File: {octree_path} | center={report.header.world_center} "
+        f"| half_size={report.header.world_half_size:.1f} pc "
+        f"| max_level={report.header.max_level} "
+        f"| mag_limit={report.header.mag_limit:.2f}"
     )
     _render_stats(console, report, nearest)

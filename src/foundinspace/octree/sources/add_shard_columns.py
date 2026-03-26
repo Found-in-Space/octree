@@ -182,7 +182,7 @@ def _sort_and_write_pixel_runs(
             f"""
             COPY (
                 SELECT *
-                FROM read_parquet('{run_glob}', union_by_name = true)
+                FROM read_parquet('{run_glob}')
                 ORDER BY morton_code, mag_abs
             )
             TO '{tmp_output_dir.as_posix()}'

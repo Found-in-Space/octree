@@ -15,6 +15,7 @@ PROCESSED_DIR = Path(config("FIS_PROCESSED_DIR", default="data/processed")).expa
 OCTREE_DIR = Path(config("FIS_OCTREE_DIR", default="data/octree")).expanduser()
 
 MERGED_HEALPIX_DIR = PROCESSED_DIR / "merged" / "healpix"
+IDENTIFIERS_MAP_PATH = PROCESSED_DIR / "identifiers_map.parquet"
 STAGE00_OUTPUT_DIR = OCTREE_DIR / "stage00"
 STAGE01_DIR = OCTREE_DIR / "stage01"
 STAGE01_MANIFEST_PATH = STAGE01_DIR / "manifest.json"

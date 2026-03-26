@@ -10,18 +10,18 @@ from foundinspace.octree.assembly.formats import (
     INDEX_MAGIC,
     INDEX_RECORD,
     INDEX_VERSION,
+    META_INDEX_MAGIC,
 )
 from foundinspace.octree.assembly.types import CellKey, EncodedCell, ShardKey
 from foundinspace.octree.assembly.writer import (
     IntermediateShardWriter,
     belongs_to_shard,
+    meta_shard_filenames,
     shard_filenames,
 )
 
 
-def _make_cell(
-    level: int, node_id: int, star_count: int = 1
-) -> EncodedCell:
+def _make_cell(level: int, node_id: int, star_count: int = 1) -> EncodedCell:
     raw = b"\x00" * (16 * star_count)
     payload = gzip.compress(raw)
     return EncodedCell(
@@ -48,6 +48,22 @@ class TestShardFilenames:
         assert shard_filenames(shard) == ("level-03.index", "level-03.payload")
 
 
+class TestMetaShardFilenames:
+    def test_unsharded(self):
+        shard = ShardKey(level=0, prefix_bits=0, prefix=0)
+        assert meta_shard_filenames(shard) == (
+            "level-00.meta-index",
+            "level-00.meta-payload",
+        )
+
+    def test_sharded(self):
+        shard = ShardKey(level=10, prefix_bits=3, prefix=5)
+        assert meta_shard_filenames(shard) == (
+            "level-10-p3-5.meta-index",
+            "level-10-p3-5.meta-payload",
+        )
+
+
 class TestBelongsToShard:
     def test_unsharded_always_belongs(self):
         shard = ShardKey(level=5, prefix_bits=0, prefix=0)
@@ -57,8 +73,8 @@ class TestBelongsToShard:
     def test_prefix_match(self):
         # level=2, prefix_bits=3 => node_id >> (6-3) = node_id >> 3
         shard = ShardKey(level=2, prefix_bits=3, prefix=5)
-        assert belongs_to_shard(40, shard)   # 40 >> 3 = 5
-        assert belongs_to_shard(47, shard)   # 47 >> 3 = 5
+        assert belongs_to_shard(40, shard)  # 40 >> 3 = 5
+        assert belongs_to_shard(47, shard)  # 47 >> 3 = 5
 
     def test_prefix_mismatch(self):
         shard = ShardKey(level=2, prefix_bits=3, prefix=5)
@@ -166,3 +182,24 @@ class TestIntermediateShardWriter:
         r2 = writer.close()
         assert r1 is not None
         assert r2 is None
+
+    def test_meta_writer_uses_meta_magic_and_paths(self, tmp_path):
+        shard = ShardKey(level=4, prefix_bits=0, prefix=0)
+        writer = IntermediateShardWriter(
+            shard,
+            tmp_path,
+            index_magic=META_INDEX_MAGIC,
+            filename_fn=meta_shard_filenames,
+            manifest_index_key="meta_index_path",
+            manifest_payload_key="meta_payload_path",
+        )
+        writer.write_cell(_make_cell(4, 99))
+        result = writer.close()
+        assert result is not None
+        assert result["meta_index_path"] == "level-04.meta-index"
+        assert result["meta_payload_path"] == "level-04.meta-payload"
+
+        index_path = tmp_path / result["meta_index_path"]
+        with open(index_path, "rb") as f:
+            hdr = INDEX_FILE_HDR.unpack(f.read(INDEX_FILE_HDR.size))
+            assert hdr[0] == META_INDEX_MAGIC

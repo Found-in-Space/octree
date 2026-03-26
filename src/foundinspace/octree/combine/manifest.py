@@ -40,7 +40,23 @@ def _parse_world_center(raw: object) -> tuple[float, float, float]:
     return (float(raw[0]), float(raw[1]), float(raw[2]))
 
 
-def read_combine_manifest(manifest_path: Path) -> CombineManifest:
+def manifest_has_meta(manifest_path: Path) -> bool:
+    """True only when the manifest has shards AND every shard has meta paths."""
+    raw = json.loads(manifest_path.read_text())
+    has_any = False
+    for level_entry in raw.get("levels", []):
+        for shard in level_entry.get("shards", []):
+            has_any = True
+            if "meta_index_path" not in shard:
+                return False
+    return has_any
+
+
+def read_combine_manifest(
+    manifest_path: Path,
+    *,
+    payload_kind: str = "render",
+) -> CombineManifest:
     raw = json.loads(manifest_path.read_text())
     got_format = str(raw.get("format", ""))
     if got_format != MANIFEST_FORMAT:
@@ -84,17 +100,31 @@ def read_combine_manifest(manifest_path: Path) -> CombineManifest:
                 "payload_path": str(shard["payload_path"]),
                 "record_count": int(shard["record_count"]),
             }
+            if "meta_index_path" in shard:
+                entry_dict["meta_index_path"] = str(shard["meta_index_path"])
+                entry_dict["meta_payload_path"] = str(shard["meta_payload_path"])
             validate_shard(root_dir, entry_dict)
             key = ShardKey(
                 level=level,
                 prefix_bits=entry_dict["prefix_bits"],
                 prefix=entry_dict["prefix"],
             )
+            if payload_kind == "meta":
+                if "meta_index_path" not in entry_dict:
+                    raise ValueError(
+                        f"Shard at level {level} prefix={shard['prefix']} "
+                        "missing meta paths for meta combine"
+                    )
+                idx_path = root_dir / entry_dict["meta_index_path"]
+                pay_path = root_dir / entry_dict["meta_payload_path"]
+            else:
+                idx_path = root_dir / entry_dict["index_path"]
+                pay_path = root_dir / entry_dict["payload_path"]
             shards.append(
                 ShardEntry(
                     key=key,
-                    index_path=root_dir / entry_dict["index_path"],
-                    payload_path=root_dir / entry_dict["payload_path"],
+                    index_path=idx_path,
+                    payload_path=pay_path,
                     record_count=entry_dict["record_count"],
                 )
             )

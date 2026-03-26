@@ -8,10 +8,13 @@ import duckdb
 
 from ..duckdb_util import configure_connection
 from .encoder import iter_encoded_cells
+from .formats import META_INDEX_MAGIC
 from .manifest import manifest_entries, read_manifest, validate_shard, write_manifest
+from .meta_encoder import IdentifiersMap, iter_encoded_cells_with_meta
 from .plan import BuildPlan
 from .row_source import iter_sorted_rows
-from .writer import IntermediateShardWriter
+from .types import EncodedCell
+from .writer import IntermediateShardWriter, meta_shard_filenames
 
 
 def _shard_id(level: int, prefix_bits: int, prefix: int) -> tuple[int, int, int]:
@@ -25,7 +28,7 @@ def _check_input_columns(parquet_glob: str) -> None:
     configure_connection(con)
     try:
         con.execute(
-            f"SELECT render, level, morton_code, mag_abs "
+            f"SELECT render, level, morton_code, mag_abs, source, source_id "
             f"FROM read_parquet('{escaped}') LIMIT 0"
         )
     finally:
@@ -37,8 +40,14 @@ def build_intermediates(
     out_dir: Path,
     *,
     plan: BuildPlan,
+    identifiers_map_path: Path | None = None,
+    sidecar_fields: list[str] | None = None,
 ) -> Path:
-    """Build intermediate shard files and return the path to manifest.json."""
+    """Build intermediate shard files and return the path to manifest.json.
+
+    When ``identifiers_map_path`` is set, writes ``.meta-index`` / ``.meta-payload``
+    alongside each render shard and adds ``meta_*`` paths to the manifest.
+    """
     start_t = time.perf_counter()
     plan.validate()
 
@@ -47,6 +56,17 @@ def build_intermediates(
     print("Stage 01: validating input columns...", flush=True)
     _check_input_columns(parquet_glob)
     print("Stage 01: input columns OK.", flush=True)
+
+    ident_map: IdentifiersMap | None = None
+    if identifiers_map_path is not None:
+        ident_map = IdentifiersMap(
+            identifiers_map_path,
+            fields=sidecar_fields,
+        )
+        print(
+            f"Stage 01: identifiers map loaded ({len(ident_map)} row(s)).",
+            flush=True,
+        )
 
     existing_manifest = read_manifest(out_dir)
     if existing_manifest is None and any(out_dir.iterdir()):
@@ -65,7 +85,9 @@ def build_intermediates(
             )
         if "mag_limit" in existing_manifest:
             existing_mag = float(existing_manifest["mag_limit"])
-            if not math.isclose(existing_mag, plan.mag_limit, rel_tol=0.0, abs_tol=1e-12):
+            if not math.isclose(
+                existing_mag, plan.mag_limit, rel_tol=0.0, abs_tol=1e-12
+            ):
                 raise ValueError(
                     "Existing manifest mag_limit does not match build plan: "
                     f"{existing_mag} != {plan.mag_limit}"
@@ -90,8 +112,7 @@ def build_intermediates(
     for level in range(plan.max_level + 1):
         shard_keys = plan.shard_keys_for_level(level)
         print(
-            f"Stage 01: level {level}/{plan.max_level} "
-            f"({len(shard_keys)} shard(s))...",
+            f"Stage 01: level {level}/{plan.max_level} ({len(shard_keys)} shard(s))...",
             flush=True,
         )
 
@@ -115,7 +136,17 @@ def build_intermediates(
                 f"(prefix_bits={shard.prefix_bits}, prefix={shard.prefix})",
                 flush=True,
             )
-            writer = IntermediateShardWriter(shard, out_dir)
+            render_writer = IntermediateShardWriter(shard, out_dir)
+            meta_writer: IntermediateShardWriter | None = None
+            if ident_map is not None:
+                meta_writer = IntermediateShardWriter(
+                    shard,
+                    out_dir,
+                    index_magic=META_INDEX_MAGIC,
+                    filename_fn=meta_shard_filenames,
+                    manifest_index_key="meta_index_path",
+                    manifest_payload_key="meta_payload_path",
+                )
             shard_cells = 0
             try:
                 rows = iter_sorted_rows(
@@ -124,17 +155,49 @@ def build_intermediates(
                     shard=shard,
                     batch_size=plan.batch_size,
                 )
-                for cell in iter_encoded_cells(rows, level=level):
-                    writer.write_cell(cell)
-                    shard_cells += 1
+                if ident_map is None:
+                    for cell in iter_encoded_cells(rows, level=level):
+                        render_writer.write_cell(cell)
+                        shard_cells += 1
+                else:
+                    assert meta_writer is not None
+                    for render_cell, meta_blob in iter_encoded_cells_with_meta(
+                        rows, level, ident_map
+                    ):
+                        render_writer.write_cell(render_cell)
+                        meta_writer.write_cell(
+                            EncodedCell(
+                                key=render_cell.key,
+                                payload=meta_blob,
+                                star_count=render_cell.star_count,
+                            )
+                        )
+                        shard_cells += 1
 
-                shard_manifest = writer.close()
+                render_manifest = render_writer.close()
+                meta_manifest = meta_writer.close() if meta_writer is not None else None
                 total_cells += shard_cells
-                if shard_manifest is not None:
+                if render_manifest is not None:
+                    if meta_manifest is not None:
+                        if (
+                            render_manifest["record_count"]
+                            != meta_manifest["record_count"]
+                        ):
+                            raise ValueError(
+                                "Render / meta shard record_count mismatch: "
+                                f"{render_manifest['record_count']} != "
+                                f"{meta_manifest['record_count']}"
+                            )
+                        shard_manifest = {
+                            **render_manifest,
+                            "meta_index_path": meta_manifest["meta_index_path"],
+                            "meta_payload_path": meta_manifest["meta_payload_path"],
+                        }
+                    else:
+                        shard_manifest = render_manifest
                     manifest_entries_list.append(shard_manifest)
                     completed_shards.add(shard_key_id)
                     shard_non_empty += 1
-                    # Checkpoint manifest after every completed non-empty shard.
                     write_manifest(
                         out_dir,
                         plan.max_level,
@@ -149,7 +212,9 @@ def build_intermediates(
                 else:
                     print("Stage 01: shard complete (empty).", flush=True)
             except Exception:
-                writer.abort()
+                render_writer.abort()
+                if meta_writer is not None:
+                    meta_writer.abort()
                 raise
 
     print(

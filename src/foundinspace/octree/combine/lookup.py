@@ -183,9 +183,16 @@ class _FixedRecordCache:
 
 
 class IntermediateLookup:
-    def __init__(self, manifest: CombineManifest, *, max_open_files: int = 32):
+    def __init__(
+        self,
+        manifest: CombineManifest,
+        *,
+        max_open_files: int = 32,
+        index_magic: bytes = INDEX_MAGIC,
+    ):
         self._by_level: dict[int, list[IndexedShard]] = {}
         self._reader_cache = _FixedRecordCache(max_open_files=max_open_files)
+        self._index_magic = index_magic
         for entry in manifest.shards:
             lo, hi = _shard_node_range(
                 entry.key.level, entry.key.prefix_bits, entry.key.prefix
@@ -213,7 +220,7 @@ class IntermediateLookup:
             shard.index_path,
             header_struct=INDEX_FILE_HDR,
             record_struct=INDEX_RECORD,
-            magic=INDEX_MAGIC,
+            magic=self._index_magic,
         )
 
     def has_payload_node(self, level: int, node_id: int) -> bool:

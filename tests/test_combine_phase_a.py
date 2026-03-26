@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import json
 
 from combine_helpers import PayloadNode, build_intermediates
 from foundinspace.octree.combine.dfs import iter_cells_dfs
@@ -57,3 +58,31 @@ def test_relocate_payloads_writes_payloads_and_relocation(tmp_path) -> None:
             assert fr.header.record_count >= 1
         finally:
             fr.close()
+
+
+def test_relocate_meta_payloads_writes_correct_bytes(tmp_path) -> None:
+    nodes = [
+        PayloadNode(level=0, node_id=0, star_count=1, raw_payload=b"root"),
+        PayloadNode(level=1, node_id=0, star_count=2, raw_payload=b"left"),
+        PayloadNode(level=1, node_id=1, star_count=3, raw_payload=b"right"),
+    ]
+    manifest_path = build_intermediates(
+        tmp_path, nodes, max_level=1, with_meta=True
+    )
+    out = tmp_path / "final.octree"
+
+    with open(out, "wb") as fp:
+        fp.write(b"\x00" * 64)
+        result = relocate_payloads_dfs(
+            manifest_path,
+            fp,
+            plan=CombinePlan(max_open_files=2),
+            payload_kind="meta",
+        )
+
+    payload_bytes = out.read_bytes()[64 : result.payload_end_offset]
+    expected = b"".join(
+        gzip.compress(json.dumps([{}] * n.star_count).encode())
+        for n in [nodes[0], nodes[1], nodes[2]]
+    )
+    assert payload_bytes == expected

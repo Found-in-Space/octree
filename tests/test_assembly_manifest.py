@@ -5,10 +5,18 @@ import json
 
 import pytest
 
-from foundinspace.octree.assembly.manifest import validate_shard, write_manifest
-from foundinspace.octree.config import DEFAULT_MAG_VIS
+from foundinspace.octree.assembly.formats import META_INDEX_MAGIC
+from foundinspace.octree.assembly.manifest import (
+    manifest_entries,
+    validate_shard,
+    write_manifest,
+)
 from foundinspace.octree.assembly.types import CellKey, EncodedCell, ShardKey
-from foundinspace.octree.assembly.writer import IntermediateShardWriter
+from foundinspace.octree.assembly.writer import (
+    IntermediateShardWriter,
+    meta_shard_filenames,
+)
+from foundinspace.octree.config import DEFAULT_MAG_VIS
 
 
 def _write_test_shard(
@@ -26,6 +34,36 @@ def _write_test_shard(
     result = writer.close()
     assert result is not None
     return result
+
+
+def _write_render_and_meta(
+    tmp_path, level: int = 5, node_ids: tuple[int, ...] = (10, 20)
+) -> dict:
+    rend = _write_test_shard(tmp_path, level=level, node_ids=node_ids)
+    shard = ShardKey(level=level, prefix_bits=0, prefix=0)
+    mw = IntermediateShardWriter(
+        shard,
+        tmp_path,
+        index_magic=META_INDEX_MAGIC,
+        filename_fn=meta_shard_filenames,
+        manifest_index_key="meta_index_path",
+        manifest_payload_key="meta_payload_path",
+    )
+    for nid in node_ids:
+        mw.write_cell(
+            EncodedCell(
+                key=CellKey(level=level, node_id=nid),
+                payload=gzip.compress(b"{}"),
+                star_count=1,
+            )
+        )
+    meta = mw.close()
+    assert meta is not None
+    return {
+        **rend,
+        "meta_index_path": meta["meta_index_path"],
+        "meta_payload_path": meta["meta_payload_path"],
+    }
 
 
 class TestValidateShard:
@@ -59,6 +97,10 @@ class TestValidateShard:
         idx_path.write_bytes(b"\x00" * 10)
         with pytest.raises(ValueError, match="too small"):
             validate_shard(tmp_path, entry)
+
+    def test_valid_shard_with_meta(self, tmp_path):
+        entry = _write_render_and_meta(tmp_path)
+        validate_shard(tmp_path, entry)
 
 
 class TestWriteManifest:
@@ -122,3 +164,15 @@ class TestWriteManifest:
         )
         assert (tmp_path / "manifest.json").exists()
         assert not (tmp_path / ".manifest.json.tmp").exists()
+
+    def test_manifest_roundtrip_includes_meta_paths(self, tmp_path):
+        entry = _write_render_and_meta(tmp_path)
+        write_manifest(
+            tmp_path, max_level=13, shard_entries=[entry], mag_limit=DEFAULT_MAG_VIS
+        )
+        data = json.loads((tmp_path / "manifest.json").read_text())
+        shard0 = data["levels"][0]["shards"][0]
+        assert "meta_index_path" in shard0
+        assert "meta_payload_path" in shard0
+        entries = manifest_entries(data)
+        assert entries[0]["meta_index_path"] == shard0["meta_index_path"]
