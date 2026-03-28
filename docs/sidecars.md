@@ -79,6 +79,8 @@ Per shard:
 - `.meta-index`
 - `.meta-payload`
 
+The current `.meta-*` naming is one concrete sidecar family for the current implementation. It should not be treated as the final long-term model for all metadata products.
+
 ---
 
 ## Index format
@@ -169,6 +171,8 @@ When the sidecar is present, each manifest shard entry must include:
 - `meta_index_path`
 - `meta_payload_path`
 
+This is the current v1 manifest shape for the existing metadata sidecar. A future manifest revision should generalize this into named sidecar descriptors rather than a single hard-coded `meta_*` slot.
+
 ---
 
 ## Consumer lookup contract
@@ -179,6 +183,60 @@ Given `(level, node_id, ordinal)`:
 2. binary-search sidecar index by `node_id`
 3. if record exists, read and decompress payload blob
 4. JSON-parse the array and return entry at `ordinal`
+
+---
+
+## Future compatibility requirements
+
+These requirements are intentionally forward-looking. They do not retroactively change the current v1 sidecar files, but they should guide the next compatible format revision.
+
+### F1. Parent dataset identity
+
+Each sidecar artifact should carry `parent_dataset_uuid`, which identifies the render octree dataset whose star ordering the sidecar matches.
+
+This UUID is the primary compatibility check. Matching world geometry is useful, but it is not a substitute for explicit dataset identity.
+
+### F2. Sidecar identity
+
+Each sidecar artifact should also carry its own `sidecar_uuid`.
+
+`sidecar_uuid` identifies one concrete build/version of a sidecar for a particular parent dataset. It exists so caches can distinguish:
+
+- two versions of the same sidecar family for one render octree
+- different sidecar families built for the same render octree
+
+### F3. Named multi-sidecar model
+
+The current metadata sidecar should be treated as the first concrete sidecar family, not the only one.
+
+Future builds should support multiple named sidecars such as:
+
+- `identifiers`
+- `exoplanets`
+- `stellarParameters`
+- `curatedRoutes`
+
+### F4. Cache identity
+
+The recommended cache identity for a sidecar is:
+
+- `parent_dataset_uuid`
+- sidecar kind or manifest key
+- `sidecar_uuid`
+
+### F5. Manifest generalization
+
+A future manifest revision should replace the single `meta_index_path` / `meta_payload_path` pair with named sidecar descriptors that include at least:
+
+- sidecar kind
+- index path
+- payload path
+- `parent_dataset_uuid`
+- `sidecar_uuid`
+
+### F6. Consumer validation
+
+Consumers should reject a sidecar before use when its `parent_dataset_uuid` does not match the active render octree dataset UUID.
 
 ---
 

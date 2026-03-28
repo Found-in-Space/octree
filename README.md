@@ -121,6 +121,7 @@ For full specifications, invariants, and binary layouts:
 - `docs/stage-02.md`
 - `docs/sidecars.md` (optional Stage 01 metadata sidecars)
 - `docs/reader.md` (query/read behavior for `stars.octree`)
+- `docs/roadmap.md` (future format and artifact requirements)
 
 ## Help
 

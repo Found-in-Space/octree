@@ -156,6 +156,19 @@ Fields, in order:
 
 The header is first written with `index_offset = 0` and `index_length = 0`, then patched during Phase C.
 
+### Future header roadmap
+
+The current version 1 header does not carry dataset identity.
+
+A future top-level header revision should include an explicit render-dataset UUID so consumers can validate compatibility and key caches without depending on URLs or filenames.
+
+Sidecar outputs will also need explicit UUID metadata:
+
+- `parent_dataset_uuid` to identify the render octree they align with
+- `sidecar_uuid` to identify the specific version of that sidecar artifact
+
+Because version 1 reserves only 16 bytes, supporting both UUIDs for sidecar outputs will likely require a header version bump or another explicit descriptor layer rather than silently overloading the v1 reserved bytes.
+
 ### Final shard header
 
 Each shard begins with a fixed 80-byte header.

@@ -401,6 +401,20 @@ The manifest must describe:
 
 The manifest must only list completed non-empty shard files.
 
+### Future manifest roadmap
+
+The current manifest shape supports one optional metadata sidecar through `meta_index_path` and `meta_payload_path`.
+
+A future manifest revision should support a named sidecar registry instead. Each sidecar descriptor should include:
+
+- sidecar kind
+- index path
+- payload path
+- `parent_dataset_uuid`
+- `sidecar_uuid`
+
+That change is needed so one render octree can publish several sidecar families and so caches can distinguish different sidecar versions for the same dataset.
+
 ---
 
 ## Writer API
