@@ -403,7 +403,7 @@ The manifest must only list completed non-empty shard files.
 
 ### Future manifest roadmap
 
-The current manifest shape supports one optional metadata sidecar through `meta_index_path` and `meta_payload_path`.
+The current manifest shape supports one optional sidecar family, `meta`, through `meta_index_path` and `meta_payload_path`.
 
 A future manifest revision should support a named sidecar registry instead. Each sidecar descriptor should include:
 
@@ -414,6 +414,12 @@ A future manifest revision should support a named sidecar registry instead. Each
 - `sidecar_uuid`
 
 That change is needed so one render octree can publish several sidecar families and so caches can distinguish different sidecar versions for the same dataset.
+
+Recommended long-term stage boundary:
+
+- Stage 01 should remain focused on render intermediates and the authoritative render manifest
+- optional sidecar-family builds should move to a later Stage 03
+- the current `meta_*` fields should be treated as a v1 bridge, not the final sidecar architecture
 
 ---
 

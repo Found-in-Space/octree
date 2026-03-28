@@ -112,6 +112,17 @@ Defaults (same `FIS_OCTREE_DIR` as Stage 01):
 uv run fis-octree stage-02
 ```
 
+## Future Stage 02 companion + Stage 03 sidecar families
+
+The recommended future base dataset package is:
+
+- `stars.octree`
+- one foundational `identifiers/order` companion artifact
+
+That companion artifact preserves canonical star ordering for the render dataset so future sidecar families can be rebuilt without depending on all older pipeline outputs.
+
+Named sidecar families should then move into an optional Stage 03 so they can be rebuilt independently of the core render octree package. See `docs/roadmap.md` and `docs/identifiers-order.md`.
+
 ## Detailed stage docs
 
 For full specifications, invariants, and binary layouts:
@@ -120,6 +131,7 @@ For full specifications, invariants, and binary layouts:
 - `docs/stage-01.md`
 - `docs/stage-02.md`
 - `docs/sidecars.md` (optional Stage 01 metadata sidecars)
+- `docs/identifiers-order.md` (foundational Stage 2 companion artifact)
 - `docs/reader.md` (query/read behavior for `stars.octree`)
 - `docs/roadmap.md` (future format and artifact requirements)
 

@@ -6,6 +6,8 @@ Define the sidecar artifact written alongside Stage 01 intermediate octree shard
 
 The sidecar provides per-star identity and metadata without changing the main render payload format.
 
+`meta` is the name of the current sidecar family in the implementation today. It should not be read as the generic word for all sidecars.
+
 ## Scope
 
 This specification covers:
@@ -25,13 +27,25 @@ This specification does not cover:
 
 ## Stage placement
 
-The sidecar is built in **Stage 01**, in the same streaming pass that writes main intermediate shards.
+Current implementation:
+
+- the `meta` sidecar family is built in **Stage 01**, in the same streaming pass that writes main intermediate shards
+- the final `*.meta.octree` artifact is optionally combined in **Stage 02**
+
+Recommended future model:
+
+- render octree production should remain Stages 00-02
+- Stage 02 should also emit a foundational `identifiers/order` artifact for the same render dataset UUID
+- named sidecar families should move to an optional **Stage 03**
+- Stage 03 should target an already-built render dataset UUID and consume the Stage 2 base package to emit one or more sidecar artifacts for that dataset
 
 ### Rationale
 
 - The per-star ordinal is defined by Stage 01 cell grouping and row order.
 - Sidecar rows must match render rows exactly within each cell.
-- A separate pass would require re-running the query and reproducing identical ordering.
+- A separate pass is still viable as long as it can reproduce the same row ordering from canonical inputs.
+- The preferred future canonical input is the Stage 2 `identifiers/order` artifact rather than old Stage 00 or Stage 01 files.
+- Moving sidecars to Stage 03 makes optionality, reruns, and multi-sidecar support much clearer.
 
 ---
 
@@ -207,7 +221,7 @@ Each sidecar artifact should also carry its own `sidecar_uuid`.
 
 ### F3. Named multi-sidecar model
 
-The current metadata sidecar should be treated as the first concrete sidecar family, not the only one.
+The current `meta` sidecar should be treated as the first concrete sidecar family, not the only one.
 
 Future builds should support multiple named sidecars such as:
 
@@ -224,7 +238,17 @@ The recommended cache identity for a sidecar is:
 - sidecar kind or manifest key
 - `sidecar_uuid`
 
-### F5. Manifest generalization
+### F5. Foundational build input
+
+Future sidecar-family builds should use the Stage 2 `identifiers/order` artifact as their primary canonical build input.
+
+That artifact should preserve:
+
+- `parent_dataset_uuid`
+- per-cell key `(level, node_id)`
+- canonical ordered star identities within each cell
+
+### F6. Manifest generalization
 
 A future manifest revision should replace the single `meta_index_path` / `meta_payload_path` pair with named sidecar descriptors that include at least:
 
@@ -234,9 +258,63 @@ A future manifest revision should replace the single `meta_index_path` / `meta_p
 - `parent_dataset_uuid`
 - `sidecar_uuid`
 
-### F6. Consumer validation
+### F7. Consumer validation
 
 Consumers should reject a sidecar before use when its `parent_dataset_uuid` does not match the active render octree dataset UUID.
+
+### F8. Recommended stage model
+
+The recommended long-term stage model is:
+
+- Stage 00: row enrichment parquet
+- Stage 01: render intermediates and manifest
+- Stage 02: final render octree plus foundational `identifiers/order` artifact
+- Stage 03: optional sidecar-family builds and derived indices targeting an existing render dataset UUID
+
+This keeps sidecars explicitly optional and makes it possible to rebuild them without rebuilding the render octree.
+
+### F9. Rebuild policy
+
+Sidecars should be treated as immutable derived artifacts.
+
+When new identifiers or other enrichment data become available, the preferred process is:
+
+1. keep the existing render octree unchanged
+2. rebuild the affected sidecar family from the Stage 2 `identifiers/order` artifact plus canonical enrichment inputs for the same `parent_dataset_uuid`
+3. emit a new `sidecar_uuid`
+4. publish the new sidecar descriptor without mutating the old sidecar in place
+
+### F10. Merge policy for existing sidecar families
+
+Adding data to an existing sidecar family should happen at build time from source-of-truth tables keyed by canonical star identity such as `(source, source_id)`.
+
+Recommended process:
+
+1. define the sidecar family schema
+2. load the upstream enrichment sources for that family
+3. merge upstream rows by canonical star identity before encoding
+4. resolve field collisions by explicit family-level rules, not silent last-write-wins
+5. write a complete new sidecar artifact
+
+For the current `meta` family, that means rebuilding `meta` with a new identifiers map or expanded enrichment tables, not patching old `.meta.octree` files in place.
+
+### F11. Adding new sidecar families
+
+When adding a new sidecar family:
+
+1. choose a stable family name such as `exoplanets`
+2. define its payload schema and source tables
+3. define its canonical join key against render stars
+4. define any merge/precedence rules across upstream sources
+5. emit a descriptor with sidecar kind, `parent_dataset_uuid`, and `sidecar_uuid`
+
+### F12. Relationship to reverse lookup
+
+Reverse lookup indices such as:
+
+- `canonical_star_id -> (level, node_id, ordinal)`
+
+should be derived artifacts built from the Stage 2 `identifiers/order` artifact rather than baked into every sidecar-family specification.
 
 ---
 
@@ -244,3 +322,4 @@ Consumers should reject a sidecar before use when its `parent_dataset_uuid` does
 
 - Reverse indices are derived artifacts and should be generated as post-build jobs when needed.
 - gzip compression handles repeated JSON key names (`source`, `source_id`, and any enrichment keys) well across entries within a cell.
+- The foundational Stage 2 `identifiers/order` artifact should use a compact binary layout rather than per-cell JSON because its main job is to make later sidecar-family builds cheap.

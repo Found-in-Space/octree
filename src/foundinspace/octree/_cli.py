@@ -264,7 +264,7 @@ def stage_01(
     "meta_flag",
     default=None,
     help=(
-        "Combine metadata sidecar into a .meta.octree file. "
+        "Combine the current 'meta' sidecar family into a .meta.octree file. "
         "Default: auto-detect from manifest."
     ),
 )
@@ -290,7 +290,7 @@ def stage_02(
     - Manifest: ``<octree>/stage01/manifest.json`` (default ``data/octree/...``)
     - Output: ``<octree>/stars.octree``
 
-    When the manifest includes metadata sidecar shards, also writes ``<stem>.meta.octree``
+    When the manifest includes the current ``meta`` sidecar family, also writes ``<stem>.meta.octree``
     next to the render output unless ``--no-meta`` is set.
     """
     from foundinspace.octree.combine import CombinePlan, combine_octree

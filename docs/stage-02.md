@@ -169,6 +169,40 @@ Sidecar outputs will also need explicit UUID metadata:
 
 Because version 1 reserves only 16 bytes, supporting both UUIDs for sidecar outputs will likely require a header version bump or another explicit descriptor layer rather than silently overloading the v1 reserved bytes.
 
+### Future companion artifact roadmap
+
+The recommended Stage 2 base dataset package is:
+
+- `stars.octree`
+- one foundational `identifiers/order` companion artifact
+
+That companion artifact should preserve canonical per-cell star ordering for the render dataset and act as the primary build input for future Stage 3 sidecar-family generation.
+
+Its primary mapping should be:
+
+- `(level, node_id) -> ordered list of canonical star identities`
+
+Recommended high-level structure:
+
+1. compact file header with artifact UUIDs and offsets
+2. fixed-width cell directory sorted by `(level, node_id)`
+3. payload section containing compact binary ordered identities
+
+The artifact should be optimized for:
+
+- fast sequential cell-by-cell scans
+- bounded-memory sidecar builds
+- compact binary storage
+
+It should not be optimized first for reverse lookup. Reverse lookup indices should be derived from it as later artifacts.
+
+Recommended long-term stage boundary:
+
+- Stage 02 should remain the render dataset packaging stage
+- Stage 02 should emit the foundational `identifiers/order` companion artifact along with the render octree
+- optional sidecar families should move to Stage 03 rather than staying coupled to Stage 02
+- the current `.meta.octree` output should be treated as the current `meta` sidecar family, not as the generic model for all future sidecars
+
 ### Final shard header
 
 Each shard begins with a fixed 80-byte header.
