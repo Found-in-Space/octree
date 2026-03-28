@@ -25,6 +25,7 @@ In particular, we need:
 - compatibility checks stronger than geometry-only comparisons
 - a stage boundary that makes sidecars clearly optional and rerunnable
 - a foundational artifact that preserves canonical star ordering for later sidecar builds
+- an explicit project configuration model so dataset variants are reproducible without hidden path defaults
 
 ## Recommended Stage Model
 
@@ -147,6 +148,37 @@ Within one sidecar family, upstream sources should be merged by canonical star i
 
 It is not the generic term for sidecars, and future tooling should avoid using `meta` as a blanket flag for all sidecar families.
 
+### R10. Explicit Project Configuration
+
+Future octree build commands should run from an explicit project configuration rather than from ambient path defaults or implicit environment state.
+
+Why this is needed:
+
+- dataset variants such as Gaia-only, Gaia+Hipparcos, magnitude-limited subsets, or alternate override sets should be first-class project definitions
+- build commands should fail early when required paths or parameters are missing instead of silently discovering defaults
+- the same project definition should be reusable across Stage 00, Stage 01, Stage 02, and future Stage 03 runs
+
+Recommended direction:
+
+- operational commands should require a project config input such as `--project path/to/project.toml`
+- bootstrap commands may help create that file and initialize a folder layout, but build commands themselves should not fall back to hidden defaults
+- the project config should describe intended inputs, outputs, enabled sources, and build parameters
+- a manifest should remain a build receipt that records resolved artifact paths, UUIDs, provenance, and completion state for one realized run
+
+The project config and manifest will overlap, but they serve different roles:
+
+- project config: the desired dataset/build definition
+- manifest: the realized outputs and provenance of one build
+
+For octree specifically, the project config should be the preferred place to define:
+
+- input merged snapshot location
+- identifiers/order and sidecar output locations
+- render build settings such as magnitude limit and max level
+- variant identity or human-readable project name
+
+This is a good area to prototype before applying the same pattern more broadly upstream.
+
 ## Likely Implementation Shape
 
 These requirements will probably require:
@@ -157,6 +189,7 @@ These requirements will probably require:
 - a manifest revision that generalizes `meta_*` paths into named sidecar descriptors
 - reader and stats tooling updates so UUID compatibility is checked directly
 - a Stage 03 CLI surface for building or rebuilding named sidecar families and derived indices independently of render-octree assembly
+- a project-config loader and validation layer so operational commands can require explicit project definitions
 
 ## Related Docs
 

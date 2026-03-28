@@ -123,6 +123,12 @@ That companion artifact preserves canonical star ordering for the render dataset
 
 Named sidecar families should then move into an optional Stage 03 so they can be rebuilt independently of the core render octree package. See `docs/roadmap.md` and `docs/identifiers-order.md`.
 
+## Future project configuration
+
+The current CLI still uses path defaults and environment variables for convenience, but the recommended direction is to move operational build commands to an explicit project config such as `--project path/to/project.toml`.
+
+That would make dataset variants like Gaia-only, Gaia+Hipparcos, or magnitude-limited subsets first-class project definitions and let build commands fail early instead of relying on hidden defaults. See `docs/roadmap.md`.
+
 ## Detailed stage docs
 
 For full specifications, invariants, and binary layouts:
