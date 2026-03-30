@@ -73,16 +73,16 @@ Each record stores:
 
 ### Payload Encoding
 
-Each payload blob stores exactly one cell’s ordered canonical identities.
+Each payload blob stores exactly one cell's ordered canonical identities, gzip-compressed.
 
-For each star:
+The uncompressed content encodes each star as:
 
 1. `u16` length of `source`
 2. UTF-8 bytes of `source`
 3. `u16` length of `source_id`
 4. UTF-8 bytes of `source_id`
 
-The final `identifiers.order` payload section stores these rows in compact binary form.
+This matches the per-cell gzip compression used by `stars.octree` and sidecar octrees.
 
 ## Why It Exists
 

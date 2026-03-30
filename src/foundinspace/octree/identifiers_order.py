@@ -126,10 +126,12 @@ class IdentifiersOrderReader:
             )
             payload_abs = self.header.payload_offset + payload_offset
             self._fp.seek(payload_abs)
-            payload = self._fp.read(payload_length)
-            if len(payload) != payload_length:
+            compressed = self._fp.read(payload_length)
+            if len(compressed) != payload_length:
                 raise ValueError("Identifiers/order payload truncated")
-            identities = decode_identity_rows(payload, star_count=star_count)
+            identities = decode_identity_rows(
+                gzip.decompress(compressed), star_count=star_count
+            )
             yield (
                 IdentifiersOrderRecord(
                     level=level,
@@ -185,17 +187,16 @@ def combine_identifiers_order(
                                 raise ValueError(
                                     f"Truncated identifiers intermediate payload for node {node_id}"
                                 )
-                            raw = gzip.decompress(compressed)
                             dir_fp.write(
                                 DIRECTORY_RECORD_FMT.pack(
                                     shard.key.level,
                                     int(node_id),
                                     int(star_count),
                                     int(payload_fp.tell()),
-                                    len(raw),
+                                    len(compressed),
                                 )
                             )
-                            payload_fp.write(raw)
+                            payload_fp.write(compressed)
                             record_count += 1
                 finally:
                     index_file.close()
