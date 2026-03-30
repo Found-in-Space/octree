@@ -169,7 +169,7 @@ The sidecar builder loads the identifiers map once at build start. For each star
 
 ### Configurable identifier inclusion
 
-`--sidecar-fields` (Stage 01) limits **which enrichment columns** from `identifiers_map.parquet` are emitted into each entry. **`source` and `source_id` are always included** regardless of that list. The table above lists the full enrichment set; any subset of those column names is valid for `--sidecar-fields`.
+`stage01.sidecar_fields` in the project file limits **which enrichment columns** from `identifiers_map.parquet` are emitted into each entry. **`source` and `source_id` are always included** regardless of that list. The table above lists the full enrichment set; any subset of those column names is valid for `stage01.sidecar_fields`.
 
 ### Constraints
 

@@ -24,29 +24,27 @@ Input files are never modified in-place.
 
 **Stage 00 contract at a glance**
 
-- **Input**: HEALPix-sharded merged parquet (`{FIS_PROCESSED_DIR}/merged/healpix/...`)
+- **Input**: HEALPix-sharded merged parquet (configured in the project file)
 - **Required columns**: `x_icrs_pc`, `y_icrs_pc`, `z_icrs_pc`, `mag_abs`
-- **Output**: enriched parquet in `{FIS_OCTREE_DIR}/stage00` with `morton_code`, `render`, `level` added
+- **Output**: enriched parquet in the project-configured Stage 00 output directory with `morton_code`, `render`, `level` added
 - **Why it exists**: isolate expensive per-row enrichment into a streaming pass before cell/shard assembly
+
+### Project bootstrap
+
+```bash
+uv run fis-octree project init project.toml
+```
+
+`project init` writes a complete starter TOML using built-in defaults. It does not read environment variables or expand them into the generated file.
 
 ### Basic usage
 
 ```bash
-uv run fis-octree stage-00 data/processed/merged/healpix data/octree/stage00
-```
-
-### Common options
-
-```bash
-uv run fis-octree stage-00 data/processed/merged/healpix data/octree/stage00 \
-  --v-mag 6.5 \
-  --max-level 13
+uv run fis-octree stage-00 --project project.toml
 ```
 
 ```bash
-uv run fis-octree stage-00 data/processed/merged/healpix data/octree/stage00 \
-  --force \
-  --batch-size 1000000
+uv run fis-octree stage-00 --project project.toml --force
 ```
 
 ## Stage 01: build intermediates
@@ -65,31 +63,19 @@ Stage 01 reads Stage 00 parquet files and produces:
 
 ### Basic usage
 
-Defaults match `foundinspace.octree.paths` and `FIS_OCTREE_DIR` / `FIS_PROCESSED_DIR` from `.env`:
-
-- Input glob: `{FIS_OCTREE_DIR}/stage00/**/*.parquet` (default `data/octree/stage00/**/*.parquet`)
-- Output dir: `{FIS_OCTREE_DIR}/stage01` (default `data/octree/stage01`)
-- `--deep-shard-from-level` defaults to **99** (above typical `--max-level`, so **no** prefix sharding unless you lower it)
-
 ```bash
-uv run fis-octree stage-01
+uv run fis-octree stage-01 --project project.toml
 ```
 
-Explicit paths and deep sharding (e.g. from level 8):
+Project-file paths may be absolute or relative to the project file location. Build commands do not expand environment variables from TOML values.
+
+### Shard tuning
 
 ```bash
-uv run fis-octree stage-01 "data/octree/stage00/**/*.parquet" data/octree/stage01 \
-  --deep-shard-from-level 8
-```
-
-### With explicit shard tuning
-
-```bash
-uv run fis-octree stage-01 "data/octree/stage00/**/*.parquet" data/octree/stage01 \
-  --max-level 13 \
-  --deep-shard-from-level 8 \
-  --deep-prefix-bits 3 \
-  --batch-size 100000
+# edit project.toml:
+# [stage01]
+# deep_shard_from_level = 8
+# deep_prefix_bits = 3
 ```
 
 ## Stage 02: combine into `stars.octree`
@@ -103,13 +89,8 @@ Stage 02 reads Stage 01’s `manifest.json` and intermediate shards and writes t
 - **Output**: final `stars.octree`
 - **Why it exists**: perform final file assembly without global in-memory materialization
 
-Defaults (same `FIS_OCTREE_DIR` as Stage 01):
-
-- Manifest: `{FIS_OCTREE_DIR}/stage01/manifest.json` (default `data/octree/stage01/manifest.json`)
-- Output: `{FIS_OCTREE_DIR}/stars.octree` (default `data/octree/stars.octree`)
-
 ```bash
-uv run fis-octree stage-02
+uv run fis-octree stage-02 --project project.toml
 ```
 
 ## Future Stage 02 companion + Stage 03 sidecar families
@@ -123,11 +104,11 @@ That companion artifact preserves canonical star ordering for the render dataset
 
 Named sidecar families should then move into an optional Stage 03 so they can be rebuilt independently of the core render octree package. See `docs/roadmap.md` and `docs/identifiers-order.md`.
 
-## Future project configuration
+## Project configuration
 
-The current CLI still uses path defaults and environment variables for convenience, but the recommended direction is to move operational build commands to an explicit project config such as `--project path/to/project.toml`.
+Operational octree build commands now use an explicit TOML project file via `--project path/to/project.toml`.
 
-That would make dataset variants like Gaia-only, Gaia+Hipparcos, or magnitude-limited subsets first-class project definitions and let build commands fail early instead of relying on hidden defaults. See `docs/roadmap.md`.
+Project-file paths may be absolute or relative to the project file directory. TOML values do not support environment-variable expansion.
 
 ## Detailed stage docs
 

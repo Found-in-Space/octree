@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from click.testing import CliRunner
 
 from foundinspace.octree._cli import cli
@@ -10,33 +12,62 @@ class TestStage01CLI:
         runner = CliRunner()
         result = runner.invoke(cli, ["stage-01", "--help"])
         assert result.exit_code == 0
-        assert "INPUT_GLOB" in result.output
-        assert "OUT_DIR" in result.output
-        assert "--deep-shard-from-level" in result.output
-        assert "--max-level" in result.output
-        assert "--deep-prefix-bits" in result.output
-        assert "--batch-size" in result.output
-        assert "--identifiers-map" in result.output
-        assert "--sidecar-fields" in result.output
+        assert "--project" in result.output
+        assert "INPUT_GLOB" not in result.output
+        assert "OUT_DIR" not in result.output
+        assert "--deep-shard-from-level" not in result.output
+        assert "--batch-size" not in result.output
 
-    def test_help_shows_default_deep_shard_level(self):
+    def test_requires_project(self):
         runner = CliRunner()
-        result = runner.invoke(cli, ["stage-01", "--help"])
-        assert result.exit_code == 0
-        assert "--deep-shard-from-level" in result.output
-        assert "99" in result.output
+        result = runner.invoke(cli, ["stage-01"])
+        assert result.exit_code != 0
+        assert "--project" in result.output
 
-    def test_non_empty_output_dir(self, tmp_path):
-        (tmp_path / "existing.txt").write_text("occupied")
+    def test_non_empty_output_dir(self, tmp_path: Path):
+        project_path = tmp_path / "project.toml"
+        out_dir = tmp_path / "stage01"
+        out_dir.mkdir()
+        (out_dir / "existing.txt").write_text("occupied")
+        project_path.write_text(
+            f"""
+format_version = 1
+
+[paths]
+merged_healpix_dir = "{(tmp_path / 'merged').as_posix()}"
+identifiers_map_path = "{(tmp_path / 'identifiers_map.parquet').as_posix()}"
+stage00_output_dir = "{(tmp_path / 'stage00').as_posix()}"
+stage01_output_dir = "{out_dir.as_posix()}"
+stage02_output_path = "{(tmp_path / 'stars.octree').as_posix()}"
+
+[stage00]
+batch_size = 1000000
+v_mag = 6.5
+max_level = 14
+
+[stage01]
+input_glob = "{(tmp_path / 'missing' / '**' / '*.parquet').as_posix()}"
+batch_size = 100000
+deep_shard_from_level = 99
+deep_prefix_bits = 3
+sidecar_fields = []
+
+[stage02]
+manifest_path = "{(out_dir / 'manifest.json').as_posix()}"
+max_open_files = 32
+meta_mode = "auto"
+meta_output_path = "{(tmp_path / 'stars.meta.octree').as_posix()}"
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
         runner = CliRunner()
         result = runner.invoke(
             cli,
             [
                 "stage-01",
-                "nonexistent/*.parquet",
-                str(tmp_path),
-                "--deep-shard-from-level",
-                "8",
+                "--project",
+                str(project_path),
             ],
         )
         assert result.exit_code != 0

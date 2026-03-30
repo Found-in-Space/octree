@@ -150,15 +150,15 @@ It is not the generic term for sidecars, and future tooling should avoid using `
 
 ### R10. Explicit Project Configuration
 
-Future octree build commands should run from an explicit project configuration rather than from ambient path defaults or implicit environment state.
+Octree build commands now run from an explicit project configuration rather than from ambient path defaults or implicit environment state.
 
-Why this is needed:
+Why this matters:
 
 - dataset variants such as Gaia-only, Gaia+Hipparcos, magnitude-limited subsets, or alternate override sets should be first-class project definitions
 - build commands should fail early when required paths or parameters are missing instead of silently discovering defaults
 - the same project definition should be reusable across Stage 00, Stage 01, Stage 02, and future Stage 03 runs
 
-Recommended direction:
+Current direction:
 
 - operational commands should require a project config input such as `--project path/to/project.toml`
 - bootstrap commands may help create that file and initialize a folder layout, but build commands themselves should not fall back to hidden defaults
@@ -177,7 +177,7 @@ For octree specifically, the project config should be the preferred place to def
 - render build settings such as magnitude limit and max level
 - variant identity or human-readable project name
 
-This is a good area to prototype before applying the same pattern more broadly upstream.
+This remains a good pattern to apply more broadly upstream after the octree-side model has settled.
 
 ## Likely Implementation Shape
 

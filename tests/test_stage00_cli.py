@@ -52,9 +52,9 @@ def test_stage00_help_contains_batch_size():
     runner = CliRunner()
     result = runner.invoke(cli, ["stage-00", "--help"])
     assert result.exit_code == 0
-    assert "Rows per streaming enrichment batch" in result.output
-    assert "--batch-size" in result.output
-    assert "--no-clear-output" not in result.output
+    assert "--project" in result.output
+    assert "--force" in result.output
+    assert "octree project TOML" in result.output
 
 
 def test_run_enrich_healpix_per_pixel_non_destructive_and_resumable(tmp_path: Path):

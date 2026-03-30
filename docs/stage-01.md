@@ -775,9 +775,9 @@ The outputs must satisfy all of the following:
 ## V1 defaults
 
 * `deep_prefix_bits = 3` (octant sharding)
-* `deep_shard_from_level` — configurable, no fixed default yet
-* `batch_size = 100_000`
-* `max_level` — from `MagLevelConfig` (default `DEFAULT_MAX_LEVEL` = 13)
+* generated project files seed `deep_shard_from_level = 99`
+* generated project files seed `batch_size = 100_000`
+* generated project files seed `max_level = 13`
 * input mode: precomputed-render only
 * restart policy: fail if `out_dir` is non-empty
 * manifest publish: atomic (write temp, rename)
@@ -788,30 +788,35 @@ The outputs must satisfy all of the following:
 ## CLI contract
 
 ```
-uv run fis-octree stage-01 [INPUT_GLOB] [OUT_DIR] [options]
+uv run fis-octree stage-01 --project path/to/project.toml
 ```
 
-### Arguments (optional; defaults from `foundinspace.octree.paths` / `.env`)
+### Project-file inputs
 
-* **`INPUT_GLOB`** — glob for Stage 00 parquet (default: `{FIS_OCTREE_DIR}/stage00/**/*.parquet`)
-* **`OUT_DIR`** — directory for intermediate shard files and `manifest.json` (default: `{FIS_OCTREE_DIR}/stage01`)
+Stage 01 reads all build-defining paths and parameters from the project file:
 
-### Options
+* `paths.identifiers_map_path`
+* `paths.stage01_output_dir`
+* `stage01.input_glob`
+* `stage01.batch_size`
+* `stage01.deep_shard_from_level`
+* `stage01.deep_prefix_bits`
+* `stage01.sidecar_fields`
+* `stage00.v_mag`
+* `stage00.max_level`
 
-* `--max-level N` — maximum octree level (default: `DEFAULT_MAX_LEVEL`)
-* `--deep-shard-from-level N` — first level to use prefix sharding (default: `99`, above typical `max_level`, so one shard per level)
-* `--deep-prefix-bits N` — prefix width for deep sharding (default: `3`)
-* `--batch-size N` — row batch size for streaming (default: `100000`)
-* `--v-mag F` — indexing magnitude (default: `DEFAULT_MAG_VIS`)
-* `--identifiers-map PATH` — `identifiers_map.parquet` for metadata sidecar; if omitted, uses `{FIS_PROCESSED_DIR}/identifiers_map.parquet` when that file exists (`docs/sidecars.md`)
-* `--sidecar-fields` — comma-separated subset of **enrichment** fields from `identifiers_map.parquet` (default: all allowed columns; see `docs/sidecars.md`). Canonical `source` / `source_id` are always written into each metadata JSON entry and are not controlled by this option.
+Project-file path rules:
+
+* paths may be absolute
+* relative paths are resolved from the project file directory
+* environment-variable expansion is not supported in TOML values
 
 ### Error behavior
 
-* Fail immediately if `OUT_DIR` exists and is non-empty.
+* Fail immediately if `paths.stage01_output_dir` exists and is non-empty.
 * Fail immediately if shard plan parameters are invalid (see parameter guardrails).
 * Fail immediately if input parquet is missing required columns (`render`, `level`, `morton_code`, `mag_abs`, `source`, `source_id`).
-* If `--identifiers-map` is given and the path is not a readable file, fail immediately.
+* If `paths.identifiers_map_path` does not point to a readable file, Stage 01 proceeds without sidecar input.
 
 ---
 

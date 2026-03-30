@@ -9,52 +9,12 @@ import click
 from rich.console import Console
 from rich.table import Table
 
-from foundinspace.octree.config import (
-    DEFAULT_DEEP_SHARD_FROM_LEVEL,
-    DEFAULT_MAG_VIS,
-    DEFAULT_MAX_LEVEL,
-    LEVEL_CONFIG,
-    WORLD_HALF_SIZE_PC,
-)
 from foundinspace.octree.mag_levels import MagLevelConfig
-from foundinspace.octree.paths import (
-    IDENTIFIERS_MAP_PATH,
-    MERGED_HEALPIX_DIR,
-    STAGE00_OUTPUT_DIR,
-    STAGE00_PARQUET_GLOB,
-    STAGE01_DIR,
-)
+from foundinspace.octree.project import load_project, render_project_template
 from foundinspace.octree.reader import Point
 from foundinspace.octree.reader.source import OctreeSource, is_url_source
 from foundinspace.octree.reader.stats import StatsReport, collect_stats
 from foundinspace.octree.sources.add_shard_columns import run_enrich_healpix
-
-
-def _default_stage02_manifest(*_args: object) -> Path:
-    import foundinspace.octree.paths as _paths
-
-    return _paths.STAGE01_MANIFEST_PATH
-
-
-def _default_stage02_output(*_args: object) -> Path:
-    import foundinspace.octree.paths as _paths
-
-    return _paths.STAGE02_OUTPUT
-
-
-def _resolve_mag_config(
-    v_mag: float | None,
-    max_level: int | None,
-) -> MagLevelConfig:
-    vm = DEFAULT_MAG_VIS if v_mag is None else v_mag
-    ml = DEFAULT_MAX_LEVEL if max_level is None else max_level
-    if vm == DEFAULT_MAG_VIS and ml == DEFAULT_MAX_LEVEL:
-        return LEVEL_CONFIG
-    return MagLevelConfig(
-        v_mag=vm,
-        world_half_size=WORLD_HALF_SIZE_PC,
-        max_level=ml,
-    )
 
 
 @click.group()
@@ -62,61 +22,69 @@ def cli() -> None:
     """Found-in-space octree pipeline."""
 
 
-@cli.command("stage-00")
+@cli.group("project")
+def project_group() -> None:
+    """Manage octree project files."""
+
+
+@project_group.command("init")
 @click.argument(
-    "input_dir",
-    required=False,
-    type=click.Path(exists=True, file_okay=False, path_type=Path),
-    default=MERGED_HEALPIX_DIR,
-)
-@click.argument(
-    "output_dir",
-    required=False,
+    "project_path",
     type=click.Path(path_type=Path),
-    default=STAGE00_OUTPUT_DIR,
+)
+def project_init(project_path: Path) -> None:
+    """Write a starter project.toml for octree build commands."""
+    project_path = project_path.expanduser()
+    if project_path.exists():
+        raise click.ClickException(f"Project file already exists: {project_path}")
+    project_path.parent.mkdir(parents=True, exist_ok=True)
+    project_path.write_text(
+        render_project_template(),
+        encoding="utf-8",
+    )
+    click.echo(f"Wrote project file to {project_path.resolve()}")
+
+
+def _load_project_or_die(project_path: Path):
+    try:
+        return load_project(project_path)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@cli.command("stage-00")
+@click.option(
+    "--project",
+    "project_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Path to octree project TOML.",
 )
 @click.option(
     "--force",
     is_flag=True,
     help="Recompute output for pixel directories that already exist.",
 )
-@click.option(
-    "--batch-size",
-    type=int,
-    default=1_000_000,
-    show_default=True,
-    help="Rows per streaming enrichment batch.",
-)
-@click.option(
-    "--v-mag",
-    type=float,
-    default=None,
-    help=f"Indexing magnitude for level assignment (default: {DEFAULT_MAG_VIS}).",
-)
-@click.option(
-    "--max-level",
-    type=int,
-    default=None,
-    help=f"Max octree level (default: {DEFAULT_MAX_LEVEL}).",
-)
 def stage_00(
-    input_dir: Path,
-    output_dir: Path,
+    project_path: Path,
     force: bool,
-    batch_size: int,
-    v_mag: float | None,
-    max_level: int | None,
 ) -> None:
-    """Stream-enrich HEALPix parquet into Stage 00 outputs without mutating input."""
-    mag_config = _resolve_mag_config(v_mag, max_level)
+    """Stream-enrich HEALPix parquet into Stage 00 outputs using project config."""
+    project = _load_project_or_die(project_path)
+    mag_config = MagLevelConfig(
+        v_mag=project.stage00.v_mag,
+        max_level=project.stage00.max_level,
+    )
 
+    input_dir = project.paths.merged_healpix_dir
+    output_dir = project.paths.stage00_output_dir
     click.echo(f"Stage 00 — per-pixel enrichment: {input_dir} -> {output_dir}")
     processed, skipped = run_enrich_healpix(
         src_root=input_dir,
         output_root=output_dir,
         mag_config=mag_config,
         force=force,
-        batch_size=batch_size,
+        batch_size=project.stage00.batch_size,
         verbose=True,
     )
     click.echo(
@@ -125,200 +93,85 @@ def stage_00(
 
 
 @cli.command("stage-01")
-@click.argument(
-    "input_glob",
-    required=False,
-    default=STAGE00_PARQUET_GLOB,
-)
-@click.argument(
-    "out_dir",
-    required=False,
-    type=click.Path(path_type=Path),
-    default=STAGE01_DIR,
-)
 @click.option(
-    "--max-level",
-    type=int,
-    default=None,
-    help=f"Max octree level (default: {DEFAULT_MAX_LEVEL}).",
-)
-@click.option(
-    "--deep-shard-from-level",
-    type=int,
-    default=DEFAULT_DEEP_SHARD_FROM_LEVEL,
-    show_default=True,
-    help=(
-        "First level to use prefix sharding "
-        f"(default: {DEFAULT_DEEP_SHARD_FROM_LEVEL}, above typical max_level so one shard per level)."
-    ),
-)
-@click.option(
-    "--deep-prefix-bits",
-    type=int,
-    default=3,
-    help="Prefix width for deep sharding (default: 3).",
-)
-@click.option(
-    "--batch-size",
-    type=int,
-    default=100_000,
-    help="Row batch size for streaming (default: 100000).",
-)
-@click.option(
-    "--v-mag",
-    type=float,
-    default=None,
-    help=f"Indexing magnitude (default: {DEFAULT_MAG_VIS}).",
-)
-@click.option(
-    "--identifiers-map",
-    "identifiers_map_opt",
-    type=click.Path(path_type=Path, dir_okay=False),
-    default=None,
-    help=(
-        "Path to identifiers_map.parquet for metadata sidecar. "
-        f"If omitted, use {IDENTIFIERS_MAP_PATH} when that file exists."
-    ),
-)
-@click.option(
-    "--sidecar-fields",
-    type=str,
-    default=None,
-    help=(
-        "Comma-separated subset of sidecar identifier fields "
-        "(default: all). See docs/sidecars.md entry schema."
-    ),
+    "--project",
+    "project_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Path to octree project TOML.",
 )
 def stage_01(
-    input_glob: str,
-    out_dir: Path,
-    max_level: int | None,
-    deep_shard_from_level: int,
-    deep_prefix_bits: int,
-    batch_size: int,
-    v_mag: float | None,
-    identifiers_map_opt: Path | None,
-    sidecar_fields: str | None,
+    project_path: Path,
 ) -> None:
-    """Build intermediate shard files from Stage 00 parquet."""
+    """Build intermediate shard files from project-configured Stage 00 parquet."""
     from foundinspace.octree.assembly import BuildPlan, build_intermediates
 
-    ml = DEFAULT_MAX_LEVEL if max_level is None else max_level
-    vm = DEFAULT_MAG_VIS if v_mag is None else v_mag
+    project = _load_project_or_die(project_path)
 
     plan = BuildPlan(
-        max_level=ml,
-        deep_shard_from_level=deep_shard_from_level,
-        deep_prefix_bits=deep_prefix_bits,
-        batch_size=batch_size,
-        mag_limit=vm,
+        max_level=project.stage00.max_level,
+        deep_shard_from_level=project.stage01.deep_shard_from_level,
+        deep_prefix_bits=project.stage01.deep_prefix_bits,
+        batch_size=project.stage01.batch_size,
+        mag_limit=project.stage00.v_mag,
     )
 
-    if identifiers_map_opt is not None:
-        map_path = identifiers_map_opt.expanduser()
-        if not map_path.is_file():
-            raise click.ClickException(f"Identifiers map not found: {map_path}")
-    elif IDENTIFIERS_MAP_PATH.is_file():
-        map_path = IDENTIFIERS_MAP_PATH
-    else:
+    map_path = project.paths.identifiers_map_path
+    if not map_path.is_file():
         map_path = None
 
-    fields_list: list[str] | None = None
-    if sidecar_fields and sidecar_fields.strip():
-        fields_list = [p.strip() for p in sidecar_fields.split(",") if p.strip()]
-
     manifest_path = build_intermediates(
-        input_glob,
-        out_dir,
+        project.stage01.input_glob,
+        project.paths.stage01_output_dir,
         plan=plan,
         identifiers_map_path=map_path,
-        sidecar_fields=fields_list,
+        sidecar_fields=list(project.stage01.sidecar_fields) or None,
     )
     click.echo(f"Manifest written to {manifest_path}")
 
 
 @cli.command("stage-02")
-@click.argument(
-    "manifest_path",
-    required=False,
-    type=click.Path(exists=True, dir_okay=False, path_type=Path),
-    default=_default_stage02_manifest,
-)
-@click.argument(
-    "output_path",
-    required=False,
-    type=click.Path(path_type=Path),
-    default=_default_stage02_output,
-)
 @click.option(
-    "--max-open-files",
-    type=int,
-    default=32,
-    show_default=True,
-    help="Maximum number of payload file handles kept open.",
+    "--project",
+    "project_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Path to octree project TOML.",
 )
 @click.option(
     "--retain-relocation-files",
     is_flag=True,
     help="Keep intermediate relocation files created during combine.",
 )
-@click.option(
-    "--meta/--no-meta",
-    "meta_flag",
-    default=None,
-    help=(
-        "Combine the current 'meta' sidecar family into a .meta.octree file. "
-        "Default: auto-detect from manifest."
-    ),
-)
-@click.option(
-    "--meta-output",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Output path for metadata octree (default: derived from OUTPUT_PATH).",
-)
 def stage_02(
-    manifest_path: Path,
-    output_path: Path,
-    max_open_files: int,
+    project_path: Path,
     retain_relocation_files: bool,
-    meta_flag: bool | None,
-    meta_output: Path | None,
 ) -> None:
-    """Combine intermediates into final stars.octree output.
-
-    With no positional arguments, defaults match Stage 01 output and a repo-standard
-    final path (see ``foundinspace.octree.paths`` and ``FIS_OCTREE_DIR``):
-
-    - Manifest: ``<octree>/stage01/manifest.json`` (default ``data/octree/...``)
-    - Output: ``<octree>/stars.octree``
-
-    When the manifest includes the current ``meta`` sidecar family, also writes ``<stem>.meta.octree``
-    next to the render output unless ``--no-meta`` is set.
-    """
+    """Combine intermediates into final stars.octree output using project config."""
     from foundinspace.octree.combine import CombinePlan, combine_octree
     from foundinspace.octree.combine.manifest import manifest_has_meta
 
+    project = _load_project_or_die(project_path)
+    manifest_path = project.stage02.manifest_path
+    output_path = project.paths.stage02_output_path
     plan = CombinePlan(
-        max_open_files=max_open_files,
+        max_open_files=project.stage02.max_open_files,
         retain_relocation_files=retain_relocation_files,
     )
     combine_octree(manifest_path, output_path, plan=plan)
     click.echo(f"Wrote {output_path}")
 
-    do_meta = meta_flag
-    if do_meta is None:
+    do_meta = project.stage02.meta_mode == "on"
+    if project.stage02.meta_mode == "auto":
         do_meta = manifest_has_meta(manifest_path)
 
     if do_meta:
-        meta_out = meta_output
-        if meta_out is None:
-            meta_out = output_path.parent / f"{output_path.stem}.meta{output_path.suffix}"
+        meta_out = project.stage02.meta_output_path
         combine_octree(
             manifest_path, meta_out, plan=plan, payload_kind="meta"
         )
         click.echo(f"Wrote {meta_out}")
-    elif meta_flag is None:
+    elif project.stage02.meta_mode == "auto":
         click.echo("No metadata sidecar in manifest; skipping meta combine.")
 
 
