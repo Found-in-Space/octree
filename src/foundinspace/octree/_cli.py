@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+from urllib.parse import urlsplit
+from urllib.parse import urlunsplit
 
 import click
 from rich.console import Console
@@ -23,6 +25,7 @@ from foundinspace.octree.paths import (
     STAGE01_DIR,
 )
 from foundinspace.octree.reader import Point
+from foundinspace.octree.reader.source import OctreeSource, is_url_source
 from foundinspace.octree.reader.stats import StatsReport, collect_stats
 from foundinspace.octree.sources.add_shard_columns import run_enrich_healpix
 
@@ -389,19 +392,82 @@ def _format_identifiers(identifiers: tuple[tuple[str, object], ...]) -> str:
     return ", ".join(f"{k}={v}" for k, v in identifiers)
 
 
-def _resolve_meta_octree_path(
-    octree_path: Path,
-    meta_octree_opt: Path | None,
-) -> Path | None:
+def _resolve_octree_source(source: str) -> OctreeSource:
+    normalized = source.strip()
+    if not normalized:
+        raise click.BadParameter("octree source must not be empty")
+    if is_url_source(normalized):
+        return normalized
+
+    octree_path = Path(normalized).expanduser()
+    if not octree_path.exists():
+        raise FileNotFoundError(
+            f"Octree file not found: {octree_path}. Run stage-02 first."
+        )
+    return octree_path
+
+
+def _infer_meta_octree_url(octree_url: str) -> str | None:
+    parts = urlsplit(octree_url)
+    if not parts.path.endswith(".octree"):
+        return None
+    stem, suffix = parts.path.rsplit(".", 1)
+    return urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            f"{stem}.meta.{suffix}",
+            parts.query,
+            parts.fragment,
+        )
+    )
+
+
+def _resolve_meta_octree_source(
+    octree_source: OctreeSource,
+    meta_octree_opt: str | None,
+) -> OctreeSource | None:
     if meta_octree_opt is not None:
-        meta_path = meta_octree_opt.expanduser()
-        if not meta_path.is_file():
-            raise click.ClickException(f"Metadata octree not found: {meta_path}")
-        return meta_path
-    inferred = octree_path.parent / f"{octree_path.stem}.meta{octree_path.suffix}"
-    if inferred.is_file():
-        return inferred
-    return None
+        meta_source = _resolve_octree_source(meta_octree_opt)
+        if isinstance(meta_source, Path) and not meta_source.is_file():
+            raise click.ClickException(f"Metadata octree not found: {meta_source}")
+        return meta_source
+
+    if isinstance(octree_source, Path):
+        inferred = octree_source.parent / f"{octree_source.stem}.meta{octree_source.suffix}"
+        if inferred.is_file():
+            return inferred
+        return None
+
+    return _infer_meta_octree_url(octree_source)
+
+
+def _format_source_label(source: OctreeSource) -> str:
+    return str(source)
+
+
+def _resolve_source_or_none(source: str | None) -> str | None:
+    if source is None:
+        return None
+    normalized = source.strip()
+    return normalized or None
+
+
+def _resolve_meta_option_value(source: str | None) -> str | None:
+    normalized = _resolve_source_or_none(source)
+    return normalized if normalized is not None else None
+
+
+def _resolve_stats_sources(
+    octree_source_arg: str,
+    meta_octree_arg: str | None,
+) -> tuple[OctreeSource, OctreeSource | None]:
+    octree_source = _resolve_octree_source(octree_source_arg)
+    meta_source = _resolve_meta_octree_source(
+        octree_source,
+        _resolve_meta_option_value(meta_octree_arg),
+    )
+    return octree_source, meta_source
 
 
 def _render_stats(console: Console, report: StatsReport, nearest_n: int) -> None:
@@ -462,8 +528,8 @@ def _render_stats(console: Console, report: StatsReport, nearest_n: int) -> None
 
 @cli.command("stats")
 @click.argument(
-    "octree_path",
-    type=click.Path(exists=False, dir_okay=False, path_type=Path),
+    "octree_source",
+    type=str,
 )
 @click.option(
     "--point",
@@ -497,44 +563,43 @@ def _render_stats(console: Console, report: StatsReport, nearest_n: int) -> None
 )
 @click.option(
     "--meta-octree",
-    type=click.Path(path_type=Path, dir_okay=False),
+    type=str,
     default=None,
     help=(
-        "Optional metadata octree path for nearest-star identifiers "
-        "(default: infer <octree_stem>.meta<suffix> when present)."
+        "Optional metadata octree path or URL for nearest-star identifiers "
+        "(default: infer a local .meta sidecar for paths and a sibling .meta.octree URL for URLs)."
     ),
 )
 def stats(
-    octree_path: Path,
+    octree_source: str,
     point: str,
     magnitude: float,
     radius: float,
     nearest: int,
-    meta_octree: Path | None,
+    meta_octree: str | None,
 ) -> None:
     """Read a stage-02 octree and print bounded query stats."""
-    if not octree_path.exists():
-        raise FileNotFoundError(
-            f"Octree file not found: {octree_path}. Run stage-02 first."
-        )
     if radius < 0:
         raise click.BadParameter("--radius must be >= 0")
     if nearest <= 0:
         raise click.BadParameter("--nearest must be > 0")
 
     query_point = _parse_point(point)
-    meta_octree_path = _resolve_meta_octree_path(octree_path, meta_octree)
+    resolved_octree_source, meta_octree_source = _resolve_stats_sources(
+        octree_source,
+        meta_octree,
+    )
     report = collect_stats(
-        octree_path,
+        resolved_octree_source,
         point=query_point,
         limiting_magnitude=magnitude,
         radius_pc=radius,
-        metadata_path=meta_octree_path,
+        metadata_path=meta_octree_source,
         nearest_n=nearest,
     )
     console = Console()
     console.print(
-        f"File: {octree_path} | center={report.header.world_center} "
+        f"File: {_format_source_label(resolved_octree_source)} | center={report.header.world_center} "
         f"| half_size={report.header.world_half_size:.1f} pc "
         f"| max_level={report.header.max_level} "
         f"| mag_limit={report.header.mag_limit:.2f}"

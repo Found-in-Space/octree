@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
-from pathlib import Path
-from typing import BinaryIO
 
 from ..combine.records import (
     FRONTIER_REF_FMT,
@@ -19,6 +17,7 @@ from ..combine.records import (
     SHARD_VERSION,
 )
 from .header import OctreeHeader
+from .source import OctreeSource, SeekableBinaryReader, open_octree_source
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,10 +84,10 @@ class _ShardHeader:
 
 
 class IndexNavigator:
-    def __init__(self, path: Path, header: OctreeHeader) -> None:
-        self._path = path
+    def __init__(self, source: OctreeSource, header: OctreeHeader) -> None:
+        self._source = source
         self._header = header
-        self._fp: BinaryIO = open(path, "rb")
+        self._fp: SeekableBinaryReader = open_octree_source(source)
 
     def close(self) -> None:
         self._fp.close()

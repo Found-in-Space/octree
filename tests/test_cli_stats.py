@@ -4,6 +4,8 @@ import struct
 from pathlib import Path
 
 from click.testing import CliRunner
+import pytest
+import foundinspace.octree.reader.source as reader_source
 
 from combine_helpers import PayloadNode, build_intermediates
 from foundinspace.octree._cli import _format_identifiers, cli
@@ -92,6 +94,38 @@ def _build_small_octree_with_meta(tmp_path: Path) -> Path:
     return output
 
 
+class _FakeHttpResponse:
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    def __enter__(self) -> _FakeHttpResponse:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._payload
+
+
+def _install_fake_range_urlopen(monkeypatch: pytest.MonkeyPatch, path: Path) -> str:
+    octree_bytes = path.read_bytes()
+    octree_url = "https://example.test/stars.octree"
+
+    def fake_urlopen(request: object) -> _FakeHttpResponse:
+        range_header = getattr(request, "headers", {}).get("Range")
+        if not range_header:
+            return _FakeHttpResponse(octree_bytes)
+        raw_range = range_header.removeprefix("bytes=")
+        start_s, end_s = raw_range.split("-", 1)
+        start = int(start_s)
+        end = int(end_s)
+        return _FakeHttpResponse(octree_bytes[start : end + 1])
+
+    monkeypatch.setattr(reader_source, "urlopen", fake_urlopen)
+    return octree_url
+
+
 def test_cli_stats_output_sections(tmp_path: Path) -> None:
     octree_path = _build_small_octree(tmp_path)
     runner = CliRunner()
@@ -141,6 +175,34 @@ def test_cli_stats_uses_inferred_meta_and_stars_alias(tmp_path: Path) -> None:
     assert "Identifiers" in result.output
     assert "Sun" in result.output
     assert "HIP 71683" in result.output
+
+
+def test_cli_stats_accepts_http_range_urls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    octree_path = _build_small_octree(tmp_path)
+    octree_url = _install_fake_range_urlopen(monkeypatch, octree_path)
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "stats",
+            octree_url,
+            "--point",
+            "0,0,0",
+            "--magnitude",
+            "6.5",
+            "--radius",
+            "3.0",
+            "--nearest",
+            "2",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert octree_url in result.output
+    assert "By level (shell set at Sun)" in result.output
 
 
 def test_format_identifiers_falls_back_to_primary_key() -> None:

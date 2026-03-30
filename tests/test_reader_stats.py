@@ -5,6 +5,7 @@ import struct
 from pathlib import Path
 
 import pytest
+import foundinspace.octree.reader.source as reader_source
 
 from combine_helpers import PayloadNode, build_intermediates
 from foundinspace.octree.combine import CombinePlan, combine_octree
@@ -99,6 +100,38 @@ def _build_small_octree_with_meta(tmp_path: Path) -> tuple[Path, Path]:
         payload_kind="meta",
     )
     return render_output, meta_output
+
+
+class _FakeHttpResponse:
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    def __enter__(self) -> _FakeHttpResponse:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._payload
+
+
+def _install_fake_range_urlopen(monkeypatch: pytest.MonkeyPatch, path: Path) -> str:
+    octree_bytes = path.read_bytes()
+    octree_url = "https://example.test/stars.octree"
+
+    def fake_urlopen(request: object) -> _FakeHttpResponse:
+        range_header = getattr(request, "headers", {}).get("Range")
+        if not range_header:
+            return _FakeHttpResponse(octree_bytes)
+        raw_range = range_header.removeprefix("bytes=")
+        start_s, end_s = raw_range.split("-", 1)
+        start = int(start_s)
+        end = int(end_s)
+        return _FakeHttpResponse(octree_bytes[start : end + 1])
+
+    monkeypatch.setattr(reader_source, "urlopen", fake_urlopen)
+    return octree_url
 
 
 def test_read_header_roundtrip_with_shard_probe(tmp_path: Path) -> None:
@@ -208,3 +241,16 @@ def test_collect_stats_includes_identifiers_from_meta_octree(tmp_path: Path) -> 
     assert first.get("proper_name") == "Sun"
     assert second.get("proper_name") == "Rigil Kentaurus"
     assert second.get("hip_id") == 71683
+
+
+def test_octree_reader_accepts_http_range_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    octree_path = _build_small_octree(tmp_path)
+    octree_url = _install_fake_range_urlopen(monkeypatch, octree_path)
+
+    with OctreeReader(octree_url) as reader:
+        bright = list(reader.stars_brighter_than(Point(0.0, 0.0, 0.0), 6.5))
+
+    assert len(bright) == 2

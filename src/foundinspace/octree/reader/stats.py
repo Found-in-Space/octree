@@ -4,14 +4,15 @@ import gzip
 import json
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
-from typing import BinaryIO
 from typing import Iterator
 
 from .header import OctreeHeader, read_header
 from .index import IndexNavigator, NodeEntry, Point
 from .payload import decode_payload
+from .source import OctreeSource, SeekableBinaryReader, open_octree_source
+
+DEFAULT_SHELL_COALESCE_GAP_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,23 +63,23 @@ class _MutableLevelStats:
 @dataclass(slots=True)
 class _MetaReader:
     nav: IndexNavigator
-    fp: BinaryIO
+    fp: SeekableBinaryReader
 
 
 def collect_stats(
-    path: Path,
+    source: OctreeSource,
     *,
     point: Point,
     limiting_magnitude: float,
     radius_pc: float,
-    metadata_path: Path | None = None,
+    metadata_path: OctreeSource | None = None,
     nearest_n: int = 10,
-    coalesce_gap_bytes: int = 64 * 1024,
+    coalesce_gap_bytes: int = DEFAULT_SHELL_COALESCE_GAP_BYTES,
 ) -> StatsReport:
-    header = read_header(path)
+    header = read_header(source)
     with (
-        IndexNavigator(path, header) as nav,
-        open(path, "rb") as payload_fp,
+        IndexNavigator(source, header) as nav,
+        open_octree_source(source) as payload_fp,
         _open_meta_reader(metadata_path, expected_header=header) as meta_reader,
     ):
         by_level, touched_ranges = _collect_shell_level_stats(
@@ -169,7 +170,7 @@ def coalesce_payload_ranges(
 
 def _collect_shell_level_stats(
     nav: IndexNavigator,
-    payload_fp: BinaryIO,
+    payload_fp: SeekableBinaryReader,
     header: OctreeHeader,
     *,
     point: Point,
@@ -203,14 +204,14 @@ def _collect_shell_level_stats(
 
 def _collect_nearest(
     nav: IndexNavigator,
-    payload_fp: BinaryIO,
+    payload_fp: SeekableBinaryReader,
     header: OctreeHeader,
     *,
     point: Point,
     radius_pc: float,
     nearest_n: int,
     meta_nav: IndexNavigator | None = None,
-    meta_payload_fp: BinaryIO | None = None,
+    meta_payload_fp: SeekableBinaryReader | None = None,
 ) -> list[NearestStar]:
     if radius_pc < 0:
         raise ValueError(f"radius_pc must be >= 0, got {radius_pc}")
@@ -289,7 +290,7 @@ def _collect_nearest(
 
 @contextmanager
 def _open_meta_reader(
-    metadata_path: Path | None,
+    metadata_path: OctreeSource | None,
     *,
     expected_header: OctreeHeader,
 ) -> Iterator[_MetaReader | None]:
@@ -308,15 +309,15 @@ def _open_meta_reader(
             f"({metadata_path})"
         )
 
-    with IndexNavigator(metadata_path, meta_header) as nav, open(
-        metadata_path, "rb"
+    with IndexNavigator(metadata_path, meta_header) as nav, open_octree_source(
+        metadata_path
     ) as fp:
         yield _MetaReader(nav=nav, fp=fp)
 
 
 def _decode_meta_entries(
     *,
-    meta_payload_fp: BinaryIO,
+    meta_payload_fp: SeekableBinaryReader,
     node: NodeEntry | None,
 ) -> list[dict[str, Any]]:
     if node is None or not node.has_payload:
