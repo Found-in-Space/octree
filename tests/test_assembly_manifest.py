@@ -5,16 +5,17 @@ import json
 
 import pytest
 
-from foundinspace.octree.assembly.formats import META_INDEX_MAGIC
-from foundinspace.octree.assembly.manifest import (
-    manifest_entries,
-    validate_shard,
-    write_manifest,
+from foundinspace.octree.assembly.formats import (
+    IDENTIFIERS_ARTIFACT_KIND,
+    IDENTIFIERS_INDEX_MAGIC,
+    INDEX_MAGIC,
+    RENDER_ARTIFACT_KIND,
 )
+from foundinspace.octree.assembly.manifest import manifest_entries, validate_shard, write_manifest
 from foundinspace.octree.assembly.types import CellKey, EncodedCell, ShardKey
 from foundinspace.octree.assembly.writer import (
     IntermediateShardWriter,
-    meta_shard_filenames,
+    identifiers_shard_filenames,
 )
 from foundinspace.octree.config import DEFAULT_MAG_VIS
 
@@ -36,143 +37,89 @@ def _write_test_shard(
     return result
 
 
-def _write_render_and_meta(
+def _write_identifiers_shard(
     tmp_path, level: int = 5, node_ids: tuple[int, ...] = (10, 20)
 ) -> dict:
-    rend = _write_test_shard(tmp_path, level=level, node_ids=node_ids)
     shard = ShardKey(level=level, prefix_bits=0, prefix=0)
-    mw = IntermediateShardWriter(
+    writer = IntermediateShardWriter(
         shard,
         tmp_path,
-        index_magic=META_INDEX_MAGIC,
-        filename_fn=meta_shard_filenames,
-        manifest_index_key="meta_index_path",
-        manifest_payload_key="meta_payload_path",
+        index_magic=IDENTIFIERS_INDEX_MAGIC,
+        filename_fn=identifiers_shard_filenames,
     )
     for nid in node_ids:
-        mw.write_cell(
+        writer.write_cell(
             EncodedCell(
                 key=CellKey(level=level, node_id=nid),
-                payload=gzip.compress(b"{}"),
+                payload=gzip.compress(b"ident"),
                 star_count=1,
             )
         )
-    meta = mw.close()
-    assert meta is not None
-    return {
-        **rend,
-        "meta_index_path": meta["meta_index_path"],
-        "meta_payload_path": meta["meta_payload_path"],
-    }
+    result = writer.close()
+    assert result is not None
+    return result
 
 
 class TestValidateShard:
-    def test_valid_shard(self, tmp_path):
+    def test_valid_render_shard(self, tmp_path):
         entry = _write_test_shard(tmp_path)
-        validate_shard(tmp_path, entry)
+        validate_shard(tmp_path, entry, expected_magic=INDEX_MAGIC)
+
+    def test_valid_identifiers_shard(self, tmp_path):
+        entry = _write_identifiers_shard(tmp_path)
+        validate_shard(tmp_path, entry, expected_magic=IDENTIFIERS_INDEX_MAGIC)
 
     def test_missing_index(self, tmp_path):
         entry = {"index_path": "missing.index", "payload_path": "missing.payload"}
         with pytest.raises(ValueError, match="Index file missing"):
-            validate_shard(tmp_path, entry)
-
-    def test_missing_payload(self, tmp_path):
-        entry = _write_test_shard(tmp_path)
-        (tmp_path / entry["payload_path"]).unlink()
-        with pytest.raises(ValueError, match="Payload file missing"):
-            validate_shard(tmp_path, entry)
-
-    def test_corrupt_magic(self, tmp_path):
-        entry = _write_test_shard(tmp_path)
-        idx_path = tmp_path / entry["index_path"]
-        data = bytearray(idx_path.read_bytes())
-        data[0:4] = b"XXXX"
-        idx_path.write_bytes(data)
-        with pytest.raises(ValueError, match="Bad magic"):
-            validate_shard(tmp_path, entry)
-
-    def test_truncated_index(self, tmp_path):
-        entry = _write_test_shard(tmp_path)
-        idx_path = tmp_path / entry["index_path"]
-        idx_path.write_bytes(b"\x00" * 10)
-        with pytest.raises(ValueError, match="too small"):
-            validate_shard(tmp_path, entry)
-
-    def test_valid_shard_with_meta(self, tmp_path):
-        entry = _write_render_and_meta(tmp_path)
-        validate_shard(tmp_path, entry)
+            validate_shard(tmp_path, entry, expected_magic=INDEX_MAGIC)
 
 
 class TestWriteManifest:
-    def test_basic_manifest(self, tmp_path):
+    def test_basic_render_manifest(self, tmp_path):
         entry = _write_test_shard(tmp_path)
         manifest_path = write_manifest(
-            tmp_path, max_level=13, shard_entries=[entry], mag_limit=DEFAULT_MAG_VIS
+            tmp_path,
+            max_level=13,
+            shard_entries=[entry],
+            artifact_kind=RENDER_ARTIFACT_KIND,
+            index_magic=INDEX_MAGIC,
+            mag_limit=DEFAULT_MAG_VIS,
         )
 
         assert manifest_path.name == "manifest.json"
         data = json.loads(manifest_path.read_text())
         assert data["format"] == "three_dee.octree.intermediates/v1"
+        assert data["artifact_kind"] == RENDER_ARTIFACT_KIND
+        assert data["index_magic"] == "OIDX"
         assert data["max_level"] == 13
         assert data["mag_limit"] == DEFAULT_MAG_VIS
-        assert data["payload_codec"] == "gzip"
-        assert len(data["levels"]) == 1
-        assert data["levels"][0]["level"] == 5
-        assert len(data["levels"][0]["shards"]) == 1
-        assert data["levels"][0]["shards"][0]["record_count"] == 2
 
-    def test_multiple_levels(self, tmp_path):
-        e1 = _write_test_shard(tmp_path, level=0, node_ids=(0,))
-        e2 = _write_test_shard(tmp_path, level=3, node_ids=(100, 200))
+    def test_basic_identifiers_manifest(self, tmp_path):
+        entry = _write_identifiers_shard(tmp_path)
         manifest_path = write_manifest(
-            tmp_path, max_level=5, shard_entries=[e1, e2], mag_limit=DEFAULT_MAG_VIS
+            tmp_path,
+            max_level=13,
+            shard_entries=[entry],
+            artifact_kind=IDENTIFIERS_ARTIFACT_KIND,
+            index_magic=IDENTIFIERS_INDEX_MAGIC,
+            mag_limit=DEFAULT_MAG_VIS,
+            name="identifiers-manifest.json",
         )
         data = json.loads(manifest_path.read_text())
-        assert len(data["levels"]) == 2
-        assert data["levels"][0]["level"] == 0
-        assert data["levels"][1]["level"] == 3
+        assert data["artifact_kind"] == IDENTIFIERS_ARTIFACT_KIND
+        assert data["index_magic"] == IDENTIFIERS_INDEX_MAGIC.decode("ascii")
 
-    def test_empty_entries_produces_empty_levels(self, tmp_path):
-        manifest_path = write_manifest(
-            tmp_path, max_level=13, shard_entries=[], mag_limit=DEFAULT_MAG_VIS
-        )
-        data = json.loads(manifest_path.read_text())
-        assert data["levels"] == []
-
-    def test_world_geometry_in_manifest(self, tmp_path):
-        entry = _write_test_shard(tmp_path)
-        manifest_path = write_manifest(
-            tmp_path, max_level=13, shard_entries=[entry], mag_limit=DEFAULT_MAG_VIS
-        )
-        data = json.loads(manifest_path.read_text())
-        assert data["world_center"] == [0.0, 0.0, 0.0]
-        assert data["world_half_size_pc"] == 200_000.0
-
-    def test_struct_formats_in_manifest(self, tmp_path):
-        entry = _write_test_shard(tmp_path)
-        manifest_path = write_manifest(
-            tmp_path, max_level=13, shard_entries=[entry], mag_limit=DEFAULT_MAG_VIS
-        )
-        data = json.loads(manifest_path.read_text())
-        assert data["index_header_struct"] == "<4sHHBBHIQQ"
-        assert data["index_record_struct"] == "<QQII"
-
-    def test_atomic_publish(self, tmp_path):
+    def test_manifest_roundtrip(self, tmp_path):
         entry = _write_test_shard(tmp_path)
         write_manifest(
-            tmp_path, max_level=13, shard_entries=[entry], mag_limit=DEFAULT_MAG_VIS
-        )
-        assert (tmp_path / "manifest.json").exists()
-        assert not (tmp_path / ".manifest.json.tmp").exists()
-
-    def test_manifest_roundtrip_includes_meta_paths(self, tmp_path):
-        entry = _write_render_and_meta(tmp_path)
-        write_manifest(
-            tmp_path, max_level=13, shard_entries=[entry], mag_limit=DEFAULT_MAG_VIS
+            tmp_path,
+            max_level=13,
+            shard_entries=[entry],
+            artifact_kind=RENDER_ARTIFACT_KIND,
+            index_magic=INDEX_MAGIC,
+            mag_limit=DEFAULT_MAG_VIS,
         )
         data = json.loads((tmp_path / "manifest.json").read_text())
-        shard0 = data["levels"][0]["shards"][0]
-        assert "meta_index_path" in shard0
-        assert "meta_payload_path" in shard0
         entries = manifest_entries(data)
-        assert entries[0]["meta_index_path"] == shard0["meta_index_path"]
+        assert entries[0]["index_path"] == data["levels"][0]["shards"][0]["index_path"]

@@ -506,6 +506,10 @@ No additional dependencies are needed. `rich` may optionally be added for table 
 - `decode_payload` must return an empty list (not raise) if decompression fails on a single node, to allow the query to continue over other nodes. A warning should be logged.
 - The `stats` CLI must raise `FileNotFoundError` with guidance if the octree file does not exist.
 
+Compatibility note:
+
+- readers should validate `parent_dataset_uuid` against the active render dataset UUID before accepting a sidecar; geometry checks are secondary validation rather than the primary gate.
+
 ---
 
 ## Testing strategy

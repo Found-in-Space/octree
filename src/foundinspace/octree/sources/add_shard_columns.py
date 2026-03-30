@@ -59,13 +59,6 @@ def _compute_render_and_level(
     teff = np.where(np.isfinite(teff), teff.astype(np.float64), 5800.0)
     level_arr = mag_config.assign_level_array(mag_abs)
 
-    max_level = int(level_arr.max()) if n > 0 else 0
-    if max_level > 13:
-        raise NotImplementedError(
-            f"Max level {max_level} exceeds 13. This script is currently limited to level ≤ 13. "
-            f"Higher levels require uint64 for node_id handling — extend and re-enable if needed."
-        )
-
     teff_log8 = encode_teff(teff)
     render_out = np.zeros(n, dtype=_RENDER_DT)
 

@@ -6,7 +6,7 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..assembly.formats import INDEX_FILE_HDR, INDEX_MAGIC, INDEX_RECORD
+from ..assembly.formats import INDEX_FILE_HDR, INDEX_RECORD
 from ..assembly.types import ShardKey
 from .manifest import CombineManifest
 from .records import RELOC_HEADER_FMT, RELOC_MAGIC, RELOC_RECORD_FMT
@@ -188,11 +188,10 @@ class IntermediateLookup:
         manifest: CombineManifest,
         *,
         max_open_files: int = 32,
-        index_magic: bytes = INDEX_MAGIC,
     ):
         self._by_level: dict[int, list[IndexedShard]] = {}
         self._reader_cache = _FixedRecordCache(max_open_files=max_open_files)
-        self._index_magic = index_magic
+        self._index_magic = manifest.index_magic
         for entry in manifest.shards:
             lo, hi = _shard_node_range(
                 entry.key.level, entry.key.prefix_bits, entry.key.prefix

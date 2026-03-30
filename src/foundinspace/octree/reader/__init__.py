@@ -1,20 +1,19 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
-from pathlib import Path
-from typing import BinaryIO
 
 from .header import OctreeHeader, read_header
 from .index import IndexNavigator, NodeEntry, Point
 from .payload import Star, decode_payload
+from .source import OctreeSource, SeekableBinaryReader, open_octree_source
 
 
 class OctreeReader:
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._header = read_header(path)
-        self._navigator = IndexNavigator(path, self._header)
-        self._payload_fp: BinaryIO = open(path, "rb")
+    def __init__(self, source: OctreeSource) -> None:
+        self._source = source
+        self._header = read_header(source)
+        self._navigator = IndexNavigator(source, self._header)
+        self._payload_fp: SeekableBinaryReader = open_octree_source(source)
 
     def close(self) -> None:
         self._navigator.close()

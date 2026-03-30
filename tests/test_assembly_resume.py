@@ -6,10 +6,19 @@ import json
 import pytest
 
 from foundinspace.octree.assembly.build import build_intermediates
+from foundinspace.octree.assembly.formats import (
+    IDENTIFIERS_ARTIFACT_KIND,
+    IDENTIFIERS_INDEX_MAGIC,
+    IDENTIFIERS_MANIFEST_NAME,
+    INDEX_MAGIC,
+    RENDER_ARTIFACT_KIND,
+    RENDER_MANIFEST_NAME,
+)
 from foundinspace.octree.assembly.manifest import write_manifest
+from foundinspace.octree.assembly.identity_encoder import encode_identity_rows
 from foundinspace.octree.assembly.plan import BuildPlan
 from foundinspace.octree.assembly.types import CellKey, EncodedCell, ShardKey
-from foundinspace.octree.assembly.writer import IntermediateShardWriter
+from foundinspace.octree.assembly.writer import IntermediateShardWriter, identifiers_shard_filenames
 
 
 def _make_entry(tmp_path, *, level: int, prefix_bits: int, prefix: int) -> dict:
@@ -19,6 +28,26 @@ def _make_entry(tmp_path, *, level: int, prefix_bits: int, prefix: int) -> dict:
         EncodedCell(
             key=CellKey(level=level, node_id=0),
             payload=gzip.compress(b"\x00" * 16),
+            star_count=1,
+        )
+    )
+    entry = writer.close()
+    assert entry is not None
+    return entry
+
+
+def _make_identifiers_entry(tmp_path, *, level: int, prefix_bits: int, prefix: int) -> dict:
+    shard = ShardKey(level=level, prefix_bits=prefix_bits, prefix=prefix)
+    writer = IntermediateShardWriter(
+        shard,
+        tmp_path,
+        index_magic=IDENTIFIERS_INDEX_MAGIC,
+        filename_fn=identifiers_shard_filenames,
+    )
+    writer.write_cell(
+        EncodedCell(
+            key=CellKey(level=level, node_id=0),
+            payload=gzip.compress(encode_identity_rows([("gaia", "1")])),
             star_count=1,
         )
     )
@@ -45,7 +74,25 @@ def test_non_empty_out_dir_without_manifest_fails(tmp_path, monkeypatch):
 
 def test_resume_skips_completed_shards(tmp_path, monkeypatch):
     entry = _make_entry(tmp_path, level=0, prefix_bits=0, prefix=0)
-    write_manifest(tmp_path, max_level=0, shard_entries=[entry], mag_limit=6.5)
+    ident_entry = _make_identifiers_entry(tmp_path, level=0, prefix_bits=0, prefix=0)
+    write_manifest(
+        tmp_path,
+        max_level=0,
+        shard_entries=[entry],
+        artifact_kind=RENDER_ARTIFACT_KIND,
+        index_magic=INDEX_MAGIC,
+        mag_limit=6.5,
+        name=RENDER_MANIFEST_NAME,
+    )
+    write_manifest(
+        tmp_path,
+        max_level=0,
+        shard_entries=[ident_entry],
+        artifact_kind=IDENTIFIERS_ARTIFACT_KIND,
+        index_magic=IDENTIFIERS_INDEX_MAGIC,
+        mag_limit=6.5,
+        name=IDENTIFIERS_MANIFEST_NAME,
+    )
 
     monkeypatch.setattr(
         "foundinspace.octree.assembly.build._check_input_columns",
@@ -76,7 +123,25 @@ def test_resume_skips_completed_shards(tmp_path, monkeypatch):
 
 def test_resume_manifest_max_level_mismatch_fails(tmp_path, monkeypatch):
     entry = _make_entry(tmp_path, level=0, prefix_bits=0, prefix=0)
-    write_manifest(tmp_path, max_level=2, shard_entries=[entry], mag_limit=6.5)
+    ident_entry = _make_identifiers_entry(tmp_path, level=0, prefix_bits=0, prefix=0)
+    write_manifest(
+        tmp_path,
+        max_level=2,
+        shard_entries=[entry],
+        artifact_kind=RENDER_ARTIFACT_KIND,
+        index_magic=INDEX_MAGIC,
+        mag_limit=6.5,
+        name=RENDER_MANIFEST_NAME,
+    )
+    write_manifest(
+        tmp_path,
+        max_level=2,
+        shard_entries=[ident_entry],
+        artifact_kind=IDENTIFIERS_ARTIFACT_KIND,
+        index_magic=IDENTIFIERS_INDEX_MAGIC,
+        mag_limit=6.5,
+        name=IDENTIFIERS_MANIFEST_NAME,
+    )
     monkeypatch.setattr(
         "foundinspace.octree.assembly.build._check_input_columns",
         lambda _glob: None,

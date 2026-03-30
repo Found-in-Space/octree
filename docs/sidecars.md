@@ -1,188 +1,148 @@
-# Sidecars specification
+# Sidecars Specification
 
 ## Purpose
 
-Define the sidecar artifact written alongside Stage 01 intermediate octree shards.
+Define named sidecar artifacts built in Stage 03.
 
-The sidecar provides per-star identity and metadata without changing the main render payload format.
+Sidecars add per-star identity and enrichment data without changing the render payload format in `stars.octree`.
 
-## Scope
+`meta` is the first implemented sidecar family. It is not the generic name for all sidecars.
 
-This specification covers:
+## Stage Placement
 
-- where the sidecar is built in the pipeline
-- required ordering and identity invariants
-- JSON payload contract for sidecar files
-- consumer lookup behavior
+The current pipeline is:
 
-This specification does not cover:
+- Stage 00: row enrichment parquet
+- Stage 01: render intermediates plus identifiers-order intermediates
+- Stage 02: `stars.octree` plus `identifiers.order`
+- Stage 03: named sidecar families
 
-- reverse/global indices (`source_id -> octree location`)
-- UI/client search ranking behavior
-- post-build derived artifacts
+Stage 03 consumes the Stage 02 base dataset package for one `dataset_uuid` and emits one or more sidecars for that same dataset.
 
----
+## Core Invariants
 
-## Stage placement
+### R1. Same Cell Identity
 
-The sidecar is built in **Stage 01**, in the same streaming pass that writes main intermediate shards.
-
-### Rationale
-
-- The per-star ordinal is defined by Stage 01 cell grouping and row order.
-- Sidecar rows must match render rows exactly within each cell.
-- A separate pass would require re-running the query and reproducing identical ordering.
-
----
-
-## Normative requirements
-
-### R1. Same cell identity
-
-Each sidecar payload entry corresponds to exactly one cell identified by:
+Each sidecar payload entry corresponds to exactly one render cell identified by:
 
 - `level`
 - `node_id`
 
-where `node_id` is the level-specific Morton prefix used by Stage 01.
+### R2. Same Star Order
 
-### R2. Same star order
+Within a cell, sidecar star order must match render star order exactly.
 
-Within a cell, sidecar star order must match main payload star order exactly.
+The canonical ordering carried forward from Stage 01 and Stage 02 is:
 
-The Stage 01 row stream must use:
+- `node_id`
+- `mag_abs`
+- `source_id`
 
-`ORDER BY node_id, mag_abs, source_id`
+### R3. UUID Compatibility First
 
-where `source_id` provides a deterministic, unique-per-row tiebreak.
+Each sidecar octree must carry:
 
-### R3. Append-only writes
+- `parent_dataset_uuid`
+- `sidecar_uuid`
+- `sidecar_kind`
 
-Sidecar index and payload files are append-only during build.
+Consumers must validate `parent_dataset_uuid` against the active render octree `dataset_uuid` before falling back to geometry checks.
 
-### R4. Bounded memory
+### R4. Optionality
 
-The implementation must remain streaming and bounded-memory, consistent with Stage 01 invariants.
+Sidecars are optional. Core rendering must continue to work without them.
 
-Identifier enrichment data (the identifiers map from the pipeline) is loaded once into memory at build start. This is a small lookup table (order of thousands of entries) and does not violate the bounded-memory invariant.
+## Current `meta` Family
 
-### R5. Optionality
+The `meta` family is built from:
 
-The sidecar is optional. When absent, consumers must continue to function for core rendering.
+- `identifiers.order`
+- `identifiers_map.parquet`
 
----
+Each payload blob is a gzip-compressed JSON array with one entry per star in ordinal order.
 
-## Files
+Every entry always contains:
 
-Per shard:
+- `source`
+- `source_id`
 
-- `.meta-index`
-- `.meta-payload`
+Optional enrichment fields come from `identifiers_map.parquet` keyed by `(source, source_id)`.
 
----
+Supported enrichment fields are:
 
-## Index format
+- `gaia_source_id`
+- `hip_id`
+- `hd`
+- `bayer`
+- `flamsteed`
+- `constellation`
+- `proper_name`
 
-Use the same index header and record layout as Stage 01 index files:
+`[[stage03.sidecars]]` configures families in the project file.
 
-- `INDEX_FILE_HDR = struct.Struct("<4sHHBBHIQQ")`
-- `INDEX_RECORD = struct.Struct("<QQII")`
+For `meta`, `fields = [...]` limits which enrichment columns are emitted. `source` and `source_id` are always included.
 
-Semantics:
+## Intermediate Files
 
-- `node_id` identifies the cell
-- `payload_offset`/`payload_length` locate the sidecar cell payload blob
-- `star_count` equals the number of stars in this cell
+Stage 03 builds per-family intermediate shard files under:
 
----
+- `paths.stage03_output_dir/intermediates/<family>/`
 
-## Payload format
+For the `meta` family, shard filenames end with:
 
-Each blob is a gzip-compressed JSON array with one entry per star in ordinal order.
+- `.meta.index`
+- `.meta.payload`
 
-### Entry schema
+These intermediates use the same shard structure as render intermediates, but with `artifact_kind = sidecar`.
 
-Each entry is a JSON object. **Canonical identity is always present** for every star:
+## Final Artifacts
 
-| Field | Type | Source | Description |
-|---|---|---|---|
-| `source` | string | Stage 01 row stream | Catalog key from merged output (e.g. `gaia`, `hip`, `manual`) |
-| `source_id` | string | Stage 01 row stream | Primary identifier for that `source` (same string as in Stage 00 parquet) |
+Each final sidecar is written to:
 
-These two fields are written for **every** star and are **not** optional.
+- `paths.stage03_output_dir/<family>.octree`
 
-**Enrichment fields** (optional) come from the identifiers map (`identifiers_map.parquet`), looked up by the same `(source, source_id)` key. Enrichment fields are never null — absent means not applicable.
+The final sidecar octree keeps the STAR top-level header and adds the mandatory descriptor block immediately after it.
 
-Field semantics and provenance for `identifiers_map.parquet` are defined by the producer of that file. This document specifies only how those fields are serialized into octree metadata payloads.
+For sidecars the descriptor carries:
 
-| Field | Type | Source | Description |
-|---|---|---|---|
-| `gaia_source_id` | integer | identifiers map | Gaia DR3 source identifier |
-| `hip_id` | integer | identifiers map | Hipparcos catalog number |
-| `hd` | integer | identifiers map | Henry Draper catalog number |
-| `bayer` | string | identifiers map | Bayer designation (e.g. `"alpha Cen"`) |
-| `flamsteed` | integer | identifiers map | Flamsteed number |
-| `constellation` | string | identifiers map | Constellation abbreviation |
-| `proper_name` | string | identifiers map | IAU proper name |
+- `artifact_kind = sidecar`
+- `parent_dataset_uuid`
+- `sidecar_uuid`
+- `sidecar_kind`
 
-The final object is built by starting with `{ "source", "source_id" }` and merging any non-empty enrichment fields from the map. Map entries never replace `source` / `source_id` (those columns are not part of the enrichment field set).
+## Stage 03 Manifest
 
-### Examples
+Stage 03 writes:
 
-Gaia-only star with no row in the identifiers map (only canonical identity):
+- `paths.stage03_output_dir/manifest.json`
 
-```json
-{"source":"gaia","source_id":"2081898984199228160"}
-```
+It records:
 
-Hipparcos star with Gaia crossmatch and catalog identifiers in the map:
+- `render_octree_path`
+- `identifiers_order_path`
+- `parent_dataset_uuid`
+- one descriptor per built family
 
-```json
-{"source":"hip","source_id":"71683","gaia_source_id":2081898984199228160,"hip_id":71683,"hd":128620,"bayer":"alpha Cen","proper_name":"Rigil Kentaurus"}
-```
+Each family descriptor records:
 
-Manual star (e.g. the Sun) with override identifiers in the map:
+- `name`
+- `output_path`
+- `parent_dataset_uuid`
+- `sidecar_uuid`
 
-```json
-{"source":"manual","source_id":"sun","proper_name":"Sun"}
-```
+## Rebuild Policy
 
-### Identifier enrichment
+Sidecars are immutable derived artifacts.
 
-The sidecar builder loads the identifiers map once at build start. For each star in the streaming pass, the builder starts from `(source, source_id)` from the row, then looks up that key in the map. When a match is found, the selected enrichment fields from the map entry are merged into the JSON object (on top of the always-present identity).
+When enrichment inputs change:
 
-### Configurable identifier inclusion
+1. keep the Stage 02 render octree unchanged
+2. keep the Stage 02 `identifiers.order` artifact unchanged
+3. rebuild the affected sidecar family
+4. publish a new `sidecar_uuid`
 
-`--sidecar-fields` (Stage 01) limits **which enrichment columns** from `identifiers_map.parquet` are emitted into each entry. **`source` and `source_id` are always included** regardless of that list. The table above lists the full enrichment set; any subset of those column names is valid for `--sidecar-fields`.
+## Related Docs
 
-### Constraints
-
-- Array length must equal `star_count` from the index record.
-- Every star gets an entry with at least `source` and `source_id`. Entries are never empty objects `{}`.
-
----
-
-## Manifest requirements
-
-When the sidecar is present, each manifest shard entry must include:
-
-- `meta_index_path`
-- `meta_payload_path`
-
----
-
-## Consumer lookup contract
-
-Given `(level, node_id, ordinal)`:
-
-1. locate shard for `(level, node_id)`
-2. binary-search sidecar index by `node_id`
-3. if record exists, read and decompress payload blob
-4. JSON-parse the array and return entry at `ordinal`
-
----
-
-## Non-normative implementation notes
-
-- Reverse indices are derived artifacts and should be generated as post-build jobs when needed.
-- gzip compression handles repeated JSON key names (`source`, `source_id`, and any enrichment keys) well across entries within a cell.
+- `docs/stage-03.md`
+- `docs/identifiers-order.md`
+- `docs/reader.md`

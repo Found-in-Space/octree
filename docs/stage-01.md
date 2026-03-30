@@ -6,11 +6,20 @@ Input parquet for this stage must be prepared by **Stage 00** (see [stage-00.md]
 
 ## Purpose
 
-Stage 01 builds the **intermediate on-disk representation** used by the octree combine stage. It consumes a stream of stars that is **already sorted for the target cell order** and writes a set of append-only shard files:
+Stage 01 builds the **intermediate on-disk representation** used by the later packaging stages. It consumes a stream of stars that is **already sorted for the target cell order** and writes two parallel intermediate families:
+
+* render shard files used to assemble `stars.octree`
+* identifiers-order shard files used to assemble `identifiers.order`
+
+For each family, Stage 01 writes:
 
 * a binary **payload file** containing one compressed payload blob per cell
 * a binary **index file** containing one fixed-size record per cell
-* a top-level **manifest** describing all generated shard files and the binary layout
+
+It also publishes two authoritative manifests:
+
+* `render-manifest.json`
+* `identifiers-manifest.json`
 
 Stage 01 is a **bounded-memory writer**. It must never materialize the full dataset, the full set of cells, or any cross-level/global lookup structures in RAM. The only permitted in-memory state is:
 
@@ -21,9 +30,9 @@ Stage 01 is a **bounded-memory writer**. It must never materialize the full data
 
 The output of Stage 01 is designed so that Stage 02 can later:
 
-* traverse cells in DFS order
-* relocate payloads directly into the final `stars.octree`
-* perform existence and payload lookups using disk-backed fixed-record search
+* traverse render cells in DFS order
+* relocate render payloads directly into the final `stars.octree`
+* combine canonical ordered identities into the final `identifiers.order`
 * avoid global in-memory concatenation
 
 ---
@@ -33,6 +42,8 @@ The output of Stage 01 is designed so that Stage 02 can later:
 Stage 01 does **not**:
 
 * build the final `stars.octree`
+* build the final `identifiers.order`
+* build any Stage 03 sidecar family
 * compute final payload offsets in the output octree
 * build shard headers for the final octree index
 * materialize ancestors or child masks globally
@@ -125,7 +136,7 @@ def build_intermediates(
     *,
     plan: BuildPlan,
 ) -> Path:
-    """Build intermediate shard files and return the path to manifest.json."""
+    """Build intermediate shard files and return the path to render-manifest.json."""
 ```
 
 ### Function contract
@@ -133,9 +144,10 @@ def build_intermediates(
 `build_intermediates(...)` must:
 
 1. create shard payload/index files under `out_dir` for shards that contain at least one cell
-2. write all cell payload blobs and matching index records
-3. write a complete `manifest.json`
-4. return the path to that manifest
+2. write render cell payload blobs and matching index records
+3. write identifiers-order payload blobs and matching index records
+4. write complete `render-manifest.json` and `identifiers-manifest.json`
+5. return the path to `render-manifest.json`
 
 It must fail atomically at shard-file granularity: partial output for a shard is permitted during execution, but the final manifest must only describe successfully completed non-empty shard files.
 
@@ -401,6 +413,15 @@ The manifest must describe:
 
 The manifest must only list completed non-empty shard files.
 
+### Companion identifiers manifest
+
+Stage 01 now publishes two manifests in the same output directory:
+
+- `render-manifest.json`
+- `identifiers-manifest.json`
+
+Each manifest describes exactly one artifact family and its shard files. Stage 01 does not publish sidecar descriptors.
+
 ---
 
 ## Writer API
@@ -522,11 +543,11 @@ If the process terminates mid-shard, the partially written shard files may remai
 
 ### Manifest publication
 
-The manifest must be written only after all shard writers have completed successfully. It must be published atomically: write to a temporary file then rename to `manifest.json`.
+The paired manifests must be written only after all shard writers have completed successfully. Each manifest must be published atomically: write to a temporary file then rename into place.
 
 ### Restart behavior
 
-For v1, `build_intermediates` must fail if `out_dir` already exists and is non-empty. This avoids mixing outputs from different runs. A future version may add `--resume` (validate-and-skip complete shards) or `--clean` (delete and rebuild).
+Stage 01 supports paired-manifest resume semantics. Existing completed shards may be reused only when both manifests are present and validate against the current build plan. A half-present manifest pair must fail fast.
 
 ---
 
@@ -755,9 +776,9 @@ The outputs must satisfy all of the following:
 ## V1 defaults
 
 * `deep_prefix_bits = 3` (octant sharding)
-* `deep_shard_from_level` — configurable, no fixed default yet
-* `batch_size = 100_000`
-* `max_level` — from `MagLevelConfig` (default `DEFAULT_MAX_LEVEL` = 13)
+* generated project files seed `deep_shard_from_level = 99`
+* generated project files seed `batch_size = 100_000`
+* generated project files seed `max_level = 13`
 * input mode: precomputed-render only
 * restart policy: fail if `out_dir` is non-empty
 * manifest publish: atomic (write temp, rename)
@@ -768,30 +789,38 @@ The outputs must satisfy all of the following:
 ## CLI contract
 
 ```
-uv run fis-octree stage-01 [INPUT_GLOB] [OUT_DIR] [options]
+uv run fis-octree stage-01 --project path/to/project.toml
 ```
 
-### Arguments (optional; defaults from `foundinspace.octree.paths` / `.env`)
+### Project-file inputs
 
-* **`INPUT_GLOB`** — glob for Stage 00 parquet (default: `{FIS_OCTREE_DIR}/stage00/**/*.parquet`)
-* **`OUT_DIR`** — directory for intermediate shard files and `manifest.json` (default: `{FIS_OCTREE_DIR}/stage01`)
+Stage 01 reads all build-defining paths and parameters from the project file:
 
-### Options
+* `paths.stage01_output_dir`
+* `stage01.input_glob`
+* `stage01.batch_size`
+* `stage01.deep_shard_from_level`
+* `stage01.deep_prefix_bits`
+* `stage00.v_mag`
+* `stage00.max_level`
 
-* `--max-level N` — maximum octree level (default: `DEFAULT_MAX_LEVEL`)
-* `--deep-shard-from-level N` — first level to use prefix sharding (default: `99`, above typical `max_level`, so one shard per level)
-* `--deep-prefix-bits N` — prefix width for deep sharding (default: `3`)
-* `--batch-size N` — row batch size for streaming (default: `100000`)
-* `--v-mag F` — indexing magnitude (default: `DEFAULT_MAG_VIS`)
-* `--identifiers-map PATH` — `identifiers_map.parquet` for metadata sidecar; if omitted, uses `{FIS_PROCESSED_DIR}/identifiers_map.parquet` when that file exists (`docs/sidecars.md`)
-* `--sidecar-fields` — comma-separated subset of **enrichment** fields from `identifiers_map.parquet` (default: all allowed columns; see `docs/sidecars.md`). Canonical `source` / `source_id` are always written into each metadata JSON entry and are not controlled by this option.
+Project-file path rules:
+
+* paths may be absolute
+* relative paths are resolved from the project file directory
+* environment-variable expansion is not supported in TOML values
+
+Stage 01 writes:
+
+* `render-manifest.json`
+* `identifiers-manifest.json`
 
 ### Error behavior
 
-* Fail immediately if `OUT_DIR` exists and is non-empty.
+* Fail immediately if `paths.stage01_output_dir` exists and is non-empty.
 * Fail immediately if shard plan parameters are invalid (see parameter guardrails).
 * Fail immediately if input parquet is missing required columns (`render`, `level`, `morton_code`, `mag_abs`, `source`, `source_id`).
-* If `--identifiers-map` is given and the path is not a readable file, fail immediately.
+* Fail immediately if only one of the paired manifests is present in an otherwise resumable output directory.
 
 ---
 

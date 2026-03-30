@@ -4,14 +4,17 @@ import gzip
 import json
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
-from typing import BinaryIO
 from typing import Iterator
+
+import numpy as np
 
 from .header import OctreeHeader, read_header
 from .index import IndexNavigator, NodeEntry, Point
 from .payload import decode_payload
+from .source import OctreeSource, SeekableBinaryReader, open_octree_source
+
+DEFAULT_SHELL_COALESCE_GAP_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +24,11 @@ class LevelStats:
     stars_loaded: int
     stars_rendered: int
     payload_bytes: int
+    mag_min: float
+    mag_p25: float
+    mag_p50: float
+    mag_p75: float
+    mag_max: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,28 +65,29 @@ class _MutableLevelStats:
     stars_loaded: int = 0
     stars_rendered: int = 0
     payload_bytes: int = 0
+    magnitudes: list[float] | None = None
 
 
 @dataclass(slots=True)
 class _MetaReader:
     nav: IndexNavigator
-    fp: BinaryIO
+    fp: SeekableBinaryReader
 
 
 def collect_stats(
-    path: Path,
+    source: OctreeSource,
     *,
     point: Point,
     limiting_magnitude: float,
     radius_pc: float,
-    metadata_path: Path | None = None,
+    metadata_path: OctreeSource | None = None,
     nearest_n: int = 10,
-    coalesce_gap_bytes: int = 64 * 1024,
+    coalesce_gap_bytes: int = DEFAULT_SHELL_COALESCE_GAP_BYTES,
 ) -> StatsReport:
-    header = read_header(path)
+    header = read_header(source)
     with (
-        IndexNavigator(path, header) as nav,
-        open(path, "rb") as payload_fp,
+        IndexNavigator(source, header) as nav,
+        open_octree_source(source) as payload_fp,
         _open_meta_reader(metadata_path, expected_header=header) as meta_reader,
     ):
         by_level, touched_ranges = _collect_shell_level_stats(
@@ -106,15 +115,28 @@ def collect_stats(
             stars_loaded=stats.stars_loaded,
             stars_rendered=stats.stars_rendered,
             payload_bytes=stats.payload_bytes,
+            mag_min=_quantile_or_nan(stats.magnitudes, 0.0),
+            mag_p25=_quantile_or_nan(stats.magnitudes, 0.25),
+            mag_p50=_quantile_or_nan(stats.magnitudes, 0.5),
+            mag_p75=_quantile_or_nan(stats.magnitudes, 0.75),
+            mag_max=_quantile_or_nan(stats.magnitudes, 1.0),
         )
         for level, stats in sorted(by_level.items())
     )
+    all_magnitudes = [
+        mag for stats in by_level.values() for mag in (stats.magnitudes or [])
+    ]
     totals = LevelStats(
         level=-1,
         nodes=sum(row.nodes for row in level_rows),
         stars_loaded=sum(row.stars_loaded for row in level_rows),
         stars_rendered=sum(row.stars_rendered for row in level_rows),
         payload_bytes=sum(row.payload_bytes for row in level_rows),
+        mag_min=_quantile_or_nan(all_magnitudes, 0.0),
+        mag_p25=_quantile_or_nan(all_magnitudes, 0.25),
+        mag_p50=_quantile_or_nan(all_magnitudes, 0.5),
+        mag_p75=_quantile_or_nan(all_magnitudes, 0.75),
+        mag_max=_quantile_or_nan(all_magnitudes, 1.0),
     )
     coalesced = coalesce_payload_ranges(
         touched_ranges,
@@ -169,7 +191,7 @@ def coalesce_payload_ranges(
 
 def _collect_shell_level_stats(
     nav: IndexNavigator,
-    payload_fp: BinaryIO,
+    payload_fp: SeekableBinaryReader,
     header: OctreeHeader,
     *,
     point: Point,
@@ -195,22 +217,32 @@ def _collect_shell_level_stats(
                 for star in stars
                 if star.apparent_magnitude_at(point) <= limiting_magnitude
             )
+            if level_stats.magnitudes is None:
+                level_stats.magnitudes = []
+            level_stats.magnitudes.extend(star.magnitude for star in stars)
             level_stats.payload_bytes += node.payload_length
             payload_ranges.append((node.payload_offset, node.payload_length))
         _push_children(nav, stack, node)
     return by_level, payload_ranges
 
 
+def _quantile_or_nan(values: list[float] | None, q: float) -> float:
+    if not values:
+        return float("nan")
+    arr = np.asarray(values, dtype=np.float64)
+    return float(np.quantile(arr, q))
+
+
 def _collect_nearest(
     nav: IndexNavigator,
-    payload_fp: BinaryIO,
+    payload_fp: SeekableBinaryReader,
     header: OctreeHeader,
     *,
     point: Point,
     radius_pc: float,
     nearest_n: int,
     meta_nav: IndexNavigator | None = None,
-    meta_payload_fp: BinaryIO | None = None,
+    meta_payload_fp: SeekableBinaryReader | None = None,
 ) -> list[NearestStar]:
     if radius_pc < 0:
         raise ValueError(f"radius_pc must be >= 0, got {radius_pc}")
@@ -289,7 +321,7 @@ def _collect_nearest(
 
 @contextmanager
 def _open_meta_reader(
-    metadata_path: Path | None,
+    metadata_path: OctreeSource | None,
     *,
     expected_header: OctreeHeader,
 ) -> Iterator[_MetaReader | None]:
@@ -298,6 +330,17 @@ def _open_meta_reader(
         return
 
     meta_header = read_header(metadata_path)
+    if meta_header.artifact_kind != "sidecar":
+        raise ValueError(f"Metadata octree is not a sidecar artifact ({metadata_path})")
+    if meta_header.sidecar_kind != "meta":
+        raise ValueError(f"Metadata octree is not the `meta` sidecar ({metadata_path})")
+    if expected_header.dataset_uuid is None:
+        raise ValueError("Render octree is missing dataset_uuid metadata")
+    if meta_header.parent_dataset_uuid != expected_header.dataset_uuid:
+        raise ValueError(
+            "Metadata octree dataset_uuid does not match render octree "
+            f"({metadata_path})"
+        )
     if (
         meta_header.max_level != expected_header.max_level
         or meta_header.world_center != expected_header.world_center
@@ -308,15 +351,15 @@ def _open_meta_reader(
             f"({metadata_path})"
         )
 
-    with IndexNavigator(metadata_path, meta_header) as nav, open(
-        metadata_path, "rb"
+    with IndexNavigator(metadata_path, meta_header) as nav, open_octree_source(
+        metadata_path
     ) as fp:
         yield _MetaReader(nav=nav, fp=fp)
 
 
 def _decode_meta_entries(
     *,
-    meta_payload_fp: BinaryIO,
+    meta_payload_fp: SeekableBinaryReader,
     node: NodeEntry | None,
 ) -> list[dict[str, Any]]:
     if node is None or not node.has_payload:

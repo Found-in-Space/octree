@@ -4,7 +4,6 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..assembly.formats import INDEX_MAGIC, META_INDEX_MAGIC
 from ..assembly.types import ShardKey
 from .lookup import IntermediateLookup
 from .manifest import read_combine_manifest
@@ -24,13 +23,9 @@ def iter_cells_dfs(
     manifest_path: Path,
     *,
     max_open_files: int = 32,
-    payload_kind: str = "render",
 ) -> Iterator[CellPayloadRef]:
-    manifest = read_combine_manifest(manifest_path, payload_kind=payload_kind)
-    index_magic = META_INDEX_MAGIC if payload_kind == "meta" else INDEX_MAGIC
-    lookup = IntermediateLookup(
-        manifest, max_open_files=max_open_files, index_magic=index_magic
-    )
+    manifest = read_combine_manifest(manifest_path)
+    lookup = IntermediateLookup(manifest, max_open_files=max_open_files)
     try:
         max_level = manifest.max_level
         if max_level < 0:

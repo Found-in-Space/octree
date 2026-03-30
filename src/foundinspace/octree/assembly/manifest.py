@@ -8,17 +8,15 @@ from ..config import WORLD_CENTER, WORLD_HALF_SIZE_PC
 from .formats import (
     INDEX_FILE_HDR,
     INDEX_HEADER_SIZE,
-    INDEX_MAGIC,
     INDEX_RECORD,
     INDEX_VERSION,
     MANIFEST_FORMAT,
-    META_INDEX_MAGIC,
     PAYLOAD_CODEC,
 )
 
 
-def manifest_path(out_dir: Path) -> Path:
-    return out_dir / "manifest.json"
+def manifest_path(out_dir: Path, *, name: str = "manifest.json") -> Path:
+    return out_dir / name
 
 
 def _validate_index_payload_pair(
@@ -97,43 +95,37 @@ def manifest_entries(manifest: dict) -> list[dict]:
     for level_entry in manifest.get("levels", []):
         level = int(level_entry["level"])
         for shard in level_entry.get("shards", []):
-            entry: dict = {
-                "level": level,
-                "prefix_bits": int(shard["prefix_bits"]),
-                "prefix": int(shard["prefix"]),
-                "index_path": shard["index_path"],
-                "payload_path": shard["payload_path"],
-                "record_count": int(shard["record_count"]),
-            }
-            if "meta_index_path" in shard:
-                entry["meta_index_path"] = str(shard["meta_index_path"])
-                entry["meta_payload_path"] = str(shard["meta_payload_path"])
-            entries.append(entry)
+            entries.append(
+                {
+                    "level": level,
+                    "prefix_bits": int(shard["prefix_bits"]),
+                    "prefix": int(shard["prefix"]),
+                    "index_path": str(shard["index_path"]),
+                    "payload_path": str(shard["payload_path"]),
+                    "record_count": int(shard["record_count"]),
+                }
+            )
     return entries
 
 
-def read_manifest(out_dir: Path) -> dict | None:
-    path = manifest_path(out_dir)
+def read_manifest(out_dir: Path, *, name: str = "manifest.json") -> dict | None:
+    path = manifest_path(out_dir, name=name)
     if not path.exists():
         return None
     return json.loads(path.read_text())
 
 
-def validate_shard(out_dir: Path, entry: dict) -> None:
-    """Structural validation of render shard pair and optional meta pair."""
+def read_manifest_file(path: Path) -> dict:
+    return json.loads(path.read_text())
+
+
+def validate_shard(out_dir: Path, entry: dict, *, expected_magic: bytes) -> None:
     _validate_index_payload_pair(
         out_dir,
         str(entry["index_path"]),
         str(entry["payload_path"]),
-        expected_magic=INDEX_MAGIC,
+        expected_magic=expected_magic,
     )
-    if "meta_index_path" in entry:
-        _validate_index_payload_pair(
-            out_dir,
-            str(entry["meta_index_path"]),
-            str(entry["meta_payload_path"]),
-            expected_magic=META_INDEX_MAGIC,
-        )
 
 
 def write_manifest(
@@ -141,14 +133,13 @@ def write_manifest(
     max_level: int,
     shard_entries: list[dict],
     *,
+    artifact_kind: str,
+    index_magic: bytes,
     mag_limit: float,
+    name: str = "manifest.json",
 ) -> Path:
-    """Validate shard files and atomically publish manifest.json.
-
-    ``mag_limit`` is stored for Stage 02 (final octree header).
-    """
     for entry in shard_entries:
-        validate_shard(out_dir, entry)
+        validate_shard(out_dir, entry, expected_magic=index_magic)
 
     levels_map: dict[int, list[dict]] = {}
     for entry in shard_entries:
@@ -159,17 +150,15 @@ def write_manifest(
         shards = sorted(levels_map[lvl], key=lambda e: e["prefix"])
         level_shards = []
         for s in shards:
-            d: dict = {
-                "prefix_bits": s["prefix_bits"],
-                "prefix": s["prefix"],
-                "index_path": s["index_path"],
-                "payload_path": s["payload_path"],
-                "record_count": s["record_count"],
-            }
-            if "meta_index_path" in s:
-                d["meta_index_path"] = s["meta_index_path"]
-                d["meta_payload_path"] = s["meta_payload_path"]
-            level_shards.append(d)
+            level_shards.append(
+                {
+                    "prefix_bits": s["prefix_bits"],
+                    "prefix": s["prefix"],
+                    "index_path": s["index_path"],
+                    "payload_path": s["payload_path"],
+                    "record_count": s["record_count"],
+                }
+            )
         levels.append(
             {
                 "level": lvl,
@@ -179,6 +168,8 @@ def write_manifest(
 
     manifest = {
         "format": MANIFEST_FORMAT,
+        "artifact_kind": artifact_kind,
+        "index_magic": index_magic.decode("ascii"),
         "world_center": WORLD_CENTER.tolist(),
         "world_half_size_pc": WORLD_HALF_SIZE_PC,
         "max_level": max_level,
@@ -189,8 +180,8 @@ def write_manifest(
         "levels": levels,
     }
 
-    out_manifest = manifest_path(out_dir)
-    tmp_path = out_dir / ".manifest.json.tmp"
+    out_manifest = manifest_path(out_dir, name=name)
+    tmp_path = out_dir / f".{name}.tmp"
     with open(tmp_path, "w") as f:
         json.dump(manifest, f, indent=2)
         f.write("\n")

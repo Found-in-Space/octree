@@ -27,7 +27,7 @@ It does not perform catalog reconciliation tasks such as duplicate resolution, c
 ## Why this design
 
 - **Non-destructive**: source merge files are never modified in-place.
-- **Bounded memory**: rows are processed in batches (`--batch-size`, default `1_000_000`).
+- **Bounded memory**: rows are processed in project-configured batches.
 - **Disk-efficient**: no full-dataset intermediate copy; only per-pixel temporary run files.
 - **Stage 01-compatible**: output includes `render`, `level`, `morton_code`, and `mag_abs`.
 
@@ -47,20 +47,28 @@ This gives local Morton ordering inside every output file, which improves Stage 
 ## CLI
 
 ```bash
-uv run fis-octree stage-00 [INPUT_DIR] [OUTPUT_DIR] [options]
+uv run fis-octree stage-00 --project path/to/project.toml [--force]
 ```
 
-Defaults come from `foundinspace.octree.paths`:
+Build-defining paths and parameters come from the project file.
 
-- `INPUT_DIR`: `FIS_PROCESSED_DIR/merged/healpix`
-- `OUTPUT_DIR`: `FIS_OCTREE_DIR/stage00`
+Required project-file values for Stage 00:
 
-Options:
+- `paths.merged_healpix_dir`
+- `paths.stage00_output_dir`
+- `stage00.batch_size`
+- `stage00.v_mag`
+- `stage00.max_level`
+
+Project-file path rules:
+
+- paths may be absolute
+- relative paths are resolved from the project file directory
+- environment-variable expansion is not supported in TOML values
+
+CLI options:
 
 - `--force`: recompute pixels already present in output
-- `--batch-size N`: rows per batch (default `1000000`)
-- `--v-mag F`: indexing magnitude (default from config)
-- `--max-level N`: max octree level (default from config)
 
 ## Required input columns
 

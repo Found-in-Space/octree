@@ -5,19 +5,22 @@ import gzip
 import pytest
 
 from foundinspace.octree.assembly.formats import (
+    IDENTIFIERS_INDEX_MAGIC,
     INDEX_FILE_HDR,
     INDEX_HEADER_SIZE,
     INDEX_MAGIC,
     INDEX_RECORD,
     INDEX_VERSION,
-    META_INDEX_MAGIC,
+    SIDECAR_INDEX_MAGIC,
 )
 from foundinspace.octree.assembly.types import CellKey, EncodedCell, ShardKey
 from foundinspace.octree.assembly.writer import (
     IntermediateShardWriter,
     belongs_to_shard,
+    identifiers_shard_filenames,
     meta_shard_filenames,
     shard_filenames,
+    sidecar_shard_filenames,
 )
 
 
@@ -52,15 +55,15 @@ class TestMetaShardFilenames:
     def test_unsharded(self):
         shard = ShardKey(level=0, prefix_bits=0, prefix=0)
         assert meta_shard_filenames(shard) == (
-            "level-00.meta-index",
-            "level-00.meta-payload",
+            "level-00.meta.index",
+            "level-00.meta.payload",
         )
 
     def test_sharded(self):
         shard = ShardKey(level=10, prefix_bits=3, prefix=5)
         assert meta_shard_filenames(shard) == (
-            "level-10-p3-5.meta-index",
-            "level-10-p3-5.meta-payload",
+            "level-10-p3-5.meta.index",
+            "level-10-p3-5.meta.payload",
         )
 
 
@@ -183,23 +186,40 @@ class TestIntermediateShardWriter:
         assert r1 is not None
         assert r2 is None
 
-    def test_meta_writer_uses_meta_magic_and_paths(self, tmp_path):
+    def test_identifiers_writer_uses_identifiers_magic_and_paths(self, tmp_path):
         shard = ShardKey(level=4, prefix_bits=0, prefix=0)
         writer = IntermediateShardWriter(
             shard,
             tmp_path,
-            index_magic=META_INDEX_MAGIC,
-            filename_fn=meta_shard_filenames,
-            manifest_index_key="meta_index_path",
-            manifest_payload_key="meta_payload_path",
+            index_magic=IDENTIFIERS_INDEX_MAGIC,
+            filename_fn=identifiers_shard_filenames,
         )
         writer.write_cell(_make_cell(4, 99))
         result = writer.close()
         assert result is not None
-        assert result["meta_index_path"] == "level-04.meta-index"
-        assert result["meta_payload_path"] == "level-04.meta-payload"
+        assert result["index_path"] == "level-04.ident-index"
+        assert result["payload_path"] == "level-04.ident-payload"
 
-        index_path = tmp_path / result["meta_index_path"]
+        index_path = tmp_path / result["index_path"]
         with open(index_path, "rb") as f:
             hdr = INDEX_FILE_HDR.unpack(f.read(INDEX_FILE_HDR.size))
-            assert hdr[0] == META_INDEX_MAGIC
+            assert hdr[0] == IDENTIFIERS_INDEX_MAGIC
+
+    def test_sidecar_writer_uses_sidecar_magic_and_paths(self, tmp_path):
+        shard = ShardKey(level=4, prefix_bits=0, prefix=0)
+        writer = IntermediateShardWriter(
+            shard,
+            tmp_path,
+            index_magic=SIDECAR_INDEX_MAGIC,
+            filename_fn=sidecar_shard_filenames("meta"),
+        )
+        writer.write_cell(_make_cell(4, 99))
+        result = writer.close()
+        assert result is not None
+        assert result["index_path"] == "level-04.meta.index"
+        assert result["payload_path"] == "level-04.meta.payload"
+
+        index_path = tmp_path / result["index_path"]
+        with open(index_path, "rb") as f:
+            hdr = INDEX_FILE_HDR.unpack(f.read(INDEX_FILE_HDR.size))
+            assert hdr[0] == SIDECAR_INDEX_MAGIC

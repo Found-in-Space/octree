@@ -2,7 +2,12 @@
 
 ## Purpose
 
-`combine` consumes a set of intermediate shard files and produces the final `stars.octree` file.
+`combine` consumes one intermediate shard family and produces one final octree artifact.
+
+Within the Stage 02 package step, it is used twice conceptually:
+
+- once to assemble the final render octree from `render-manifest.json`
+- once, via the companion Stage 02 path, to assemble `identifiers.order` from `identifiers-manifest.json`
 
 It must:
 
@@ -13,7 +18,7 @@ It must:
 * use disk-backed fixed-record files for all large metadata
 * preserve deterministic output
 
-This pipeline is responsible only for assembling the final octree from already-built intermediates. It does **not** generate cell payloads from stars.
+This pipeline is responsible only for assembling final artifacts from already-built intermediates. It does **not** generate cell payloads from stars.
 
 ---
 
@@ -21,13 +26,13 @@ This pipeline is responsible only for assembling the final octree from already-b
 
 ### Inputs
 
-* `manifest.json` describing all intermediate shards
+* one artifact-specific manifest describing all intermediate shards
 * one `.index` file per intermediate shard
 * one `.payload` file per intermediate shard
 
 ### Outputs
 
-* final `stars.octree`
+* one final octree artifact such as `stars.octree`
 * temporary relocation files, deleted on success unless debug retention is enabled
 
 ### Invariants
@@ -106,7 +111,7 @@ All integer fields are little-endian.
 
 ### Top-level file header
 
-The final `stars.octree` file begins with a fixed 64-byte header.
+The final `stars.octree` file begins with a fixed 64-byte STAR header followed immediately by a mandatory 128-byte descriptor block.
 
 ```python
 HEADER_FMT = struct.Struct("<4sHHQQ3ffHHf16s")
@@ -154,7 +159,50 @@ Fields, in order:
 
 * all zero for version 1
 
-The header is first written with `index_offset = 0` and `index_length = 0`, then patched during Phase C.
+The STAR header is first written with `index_offset = 0` and `index_length = 0`, then patched during Phase C.
+
+### Descriptor block
+
+Immediately after the STAR header, the file stores:
+
+```python
+DESCRIPTOR_FMT = struct.Struct("<4sHH16s16s16s32s40x")
+DESCRIPTOR_SIZE = 128
+```
+
+Fields, in order:
+
+1. descriptor magic `b"ODSC"`
+2. descriptor version
+3. artifact-kind code
+4. `dataset_uuid`
+5. `parent_dataset_uuid`
+6. `sidecar_uuid`
+7. `sidecar_kind` as zero-padded UTF-8
+
+For Stage 02 render outputs:
+
+- `artifact_kind = render`
+- `dataset_uuid` is populated
+- `parent_dataset_uuid`, `sidecar_uuid`, and `sidecar_kind` are empty
+
+Stage 03 sidecars reuse the same descriptor block with:
+
+- `artifact_kind = sidecar`
+- `parent_dataset_uuid`
+- `sidecar_uuid`
+- `sidecar_kind`
+
+Readers must parse this descriptor block before probing the final shard index.
+
+### Stage 02 base dataset package
+
+The Stage 02 CLI now publishes:
+
+- `stars.octree`
+- `identifiers.order`
+
+`identifiers.order` preserves canonical per-cell star ordering for the same render `dataset_uuid` and is the primary input to later Stage 03 sidecar builds.
 
 ### Final shard header
 

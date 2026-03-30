@@ -3,15 +3,20 @@ from __future__ import annotations
 import math
 import struct
 from pathlib import Path
+from uuid import UUID
 
 import pytest
+import foundinspace.octree.reader.source as reader_source
 
-from combine_helpers import PayloadNode, build_intermediates
+from combine_helpers import PayloadNode, build_intermediates, build_sidecar_intermediates
 from foundinspace.octree.combine import CombinePlan, combine_octree
 from foundinspace.octree.combine.records import (
+    DESCRIPTOR_SIZE,
     HEADER_SIZE,
+    PackedDescriptorFields,
     PackedHeaderFields,
     SHARD_MAGIC,
+    pack_descriptor,
     pack_top_level_header,
 )
 from foundinspace.octree.reader import NodeEntry, OctreeReader, Point, read_header
@@ -19,6 +24,8 @@ from foundinspace.octree.reader.index import GridCoord
 from foundinspace.octree.reader.stats import collect_stats
 
 STAR_RECORD_FMT = struct.Struct("<fffhBB")
+DATASET_UUID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+SIDECAR_UUID = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
 
 
 def _encode_star(
@@ -56,7 +63,15 @@ def _build_small_octree(tmp_path: Path) -> Path:
         mag_limit=6.5,
     )
     output = tmp_path / "stars.octree"
-    combine_octree(manifest_path, output, plan=CombinePlan(max_open_files=2))
+    combine_octree(
+        manifest_path,
+        output,
+        plan=CombinePlan(max_open_files=2),
+        descriptor=PackedDescriptorFields(
+            artifact_kind="render",
+            dataset_uuid=DATASET_UUID,
+        ),
+    )
     return output
 
 
@@ -70,7 +85,13 @@ def _build_small_octree_with_meta(tmp_path: Path) -> tuple[Path, Path]:
             _encode_star(x_rel=5.0e-5, y_rel=0.0, z_rel=0.0, abs_mag=5.0, teff_log8=255),
         ]
     )
-    manifest_path = build_intermediates(
+    render_manifest_path = build_intermediates(
+        tmp_path / "intermediates",
+        [PayloadNode(level=0, node_id=0, star_count=3, raw_payload=payload)],
+        max_level=0,
+        mag_limit=6.5,
+    )
+    sidecar_manifest_path = build_sidecar_intermediates(
         tmp_path / "intermediates_meta",
         [
             PayloadNode(
@@ -87,18 +108,62 @@ def _build_small_octree_with_meta(tmp_path: Path) -> tuple[Path, Path]:
         ],
         max_level=0,
         mag_limit=6.5,
-        with_meta=True,
     )
     render_output = tmp_path / "stars.octree"
     meta_output = tmp_path / "stars.meta.octree"
-    combine_octree(manifest_path, render_output, plan=CombinePlan(max_open_files=2))
     combine_octree(
-        manifest_path,
+        render_manifest_path,
+        render_output,
+        plan=CombinePlan(max_open_files=2),
+        descriptor=PackedDescriptorFields(
+            artifact_kind="render",
+            dataset_uuid=DATASET_UUID,
+        ),
+    )
+    combine_octree(
+        sidecar_manifest_path,
         meta_output,
         plan=CombinePlan(max_open_files=2),
-        payload_kind="meta",
+        descriptor=PackedDescriptorFields(
+            artifact_kind="sidecar",
+            parent_dataset_uuid=DATASET_UUID,
+            sidecar_uuid=SIDECAR_UUID,
+            sidecar_kind="meta",
+        ),
     )
     return render_output, meta_output
+
+
+class _FakeHttpResponse:
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+
+    def __enter__(self) -> _FakeHttpResponse:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._payload
+
+
+def _install_fake_range_urlopen(monkeypatch: pytest.MonkeyPatch, path: Path) -> str:
+    octree_bytes = path.read_bytes()
+    octree_url = "https://example.test/stars.octree"
+
+    def fake_urlopen(request: object) -> _FakeHttpResponse:
+        range_header = getattr(request, "headers", {}).get("Range")
+        if not range_header:
+            return _FakeHttpResponse(octree_bytes)
+        raw_range = range_header.removeprefix("bytes=")
+        start_s, end_s = raw_range.split("-", 1)
+        start = int(start_s)
+        end = int(end_s)
+        return _FakeHttpResponse(octree_bytes[start : end + 1])
+
+    monkeypatch.setattr(reader_source, "urlopen", fake_urlopen)
+    return octree_url
 
 
 def test_read_header_roundtrip_with_shard_probe(tmp_path: Path) -> None:
@@ -108,20 +173,28 @@ def test_read_header_roundtrip_with_shard_probe(tmp_path: Path) -> None:
             world_half_size_pc=10.0,
             max_level=7,
             mag_limit=5.5,
-            index_offset=HEADER_SIZE,
+            index_offset=HEADER_SIZE + DESCRIPTOR_SIZE,
             index_length=123,
         )
     )
+    descriptor = pack_descriptor(
+        PackedDescriptorFields(
+            artifact_kind="render",
+            dataset_uuid=DATASET_UUID,
+        )
+    )
     path = tmp_path / "header-only.octree"
-    path.write_bytes(header + SHARD_MAGIC + b"\x00" * 16)
+    path.write_bytes(header + descriptor + SHARD_MAGIC + b"\x00" * 16)
 
     parsed = read_header(path)
-    assert parsed.index_offset == HEADER_SIZE
+    assert parsed.index_offset == HEADER_SIZE + DESCRIPTOR_SIZE
     assert parsed.index_length == 123
     assert parsed.world_center == pytest.approx((1.0, 2.0, 3.0))
     assert parsed.world_half_size == pytest.approx(10.0)
     assert parsed.max_level == 7
     assert parsed.mag_limit == pytest.approx(5.5)
+    assert parsed.artifact_kind == "render"
+    assert parsed.dataset_uuid == DATASET_UUID
 
 
 def test_node_aabb_distance_cases() -> None:
@@ -208,3 +281,16 @@ def test_collect_stats_includes_identifiers_from_meta_octree(tmp_path: Path) -> 
     assert first.get("proper_name") == "Sun"
     assert second.get("proper_name") == "Rigil Kentaurus"
     assert second.get("hip_id") == 71683
+
+
+def test_octree_reader_accepts_http_range_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    octree_path = _build_small_octree(tmp_path)
+    octree_url = _install_fake_range_urlopen(monkeypatch, octree_path)
+
+    with OctreeReader(octree_url) as reader:
+        bright = list(reader.stars_brighter_than(Point(0.0, 0.0, 0.0), 6.5))
+
+    assert len(bright) == 2
