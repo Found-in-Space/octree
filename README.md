@@ -51,15 +51,17 @@ uv run fis-octree stage-00 --project project.toml --force
 
 Stage 01 reads Stage 00 parquet files and produces:
 
-- per-shard `.index` and `.payload` files
-- `manifest.json`
+- render shard `.index` / `.payload` files
+- identifiers-order shard `.index` / `.payload` files
+- `render-manifest.json`
+- `identifiers-manifest.json`
 
 **Stage 01 contract at a glance**
 
 - **Input**: Stage 00 parquet with precomputed `morton_code`, `render`, `level`, `mag_abs`
-- **Core operation**: stream rows grouped by target cell and encode one payload blob per `(level, node_id)`
-- **Output layout**: append-only shard pairs (`.index` + `.payload`) plus authoritative `manifest.json`
-- **Why it exists**: convert row-oriented parquet into bounded-memory, fixed-record intermediates used by Stage 02
+- **Core operation**: stream rows grouped by target cell and encode both render bytes and canonical `(source, source_id)` ordering per `(level, node_id)`
+- **Output layout**: append-only shard pairs for render and identifiers/order plus authoritative paired manifests
+- **Why it exists**: convert row-oriented parquet into bounded-memory intermediates used by Stage 02 render assembly and Stage 02 `identifiers/order` assembly
 
 ### Basic usage
 
@@ -78,31 +80,41 @@ Project-file paths may be absolute or relative to the project file location. Bui
 # deep_prefix_bits = 3
 ```
 
-## Stage 02: combine into `stars.octree`
+## Stage 02: package the base dataset
 
-Stage 02 reads Stage 01’s `manifest.json` and intermediate shards and writes the final octree file.
+Stage 02 reads Stage 01’s paired manifests and writes the base dataset package:
+
+- `stars.octree`
+- `identifiers.order`
 
 **Stage 02 contract at a glance**
 
-- **Input**: Stage 01 manifest + all referenced intermediate shard files
-- **Core operation**: relocate payload bytes in global DFS order, then build final shard index section
-- **Output**: final `stars.octree`
-- **Why it exists**: perform final file assembly without global in-memory materialization
+- **Input**: `render-manifest.json`, `identifiers-manifest.json`, and all referenced shard files
+- **Core operation**: assemble the render octree, emit a matching `dataset_uuid`, and combine the canonical identifiers/order companion artifact for the same dataset
+- **Output**: final `stars.octree` plus `identifiers.order`
+- **Why it exists**: publish one UUID-bound base dataset package without global in-memory materialization
 
 ```bash
 uv run fis-octree stage-02 --project project.toml
 ```
 
-## Future Stage 02 companion + Stage 03 sidecar families
+## Stage 03: named sidecars
 
-The recommended future base dataset package is:
+Stage 03 reads the Stage 02 base dataset package and builds one or more named sidecar families.
 
-- `stars.octree`
-- one foundational `identifiers/order` companion artifact
+The first implemented family is `meta`.
 
-That companion artifact preserves canonical star ordering for the render dataset so future sidecar families can be rebuilt without depending on all older pipeline outputs.
+```bash
+uv run fis-octree stage-03 --project project.toml
+uv run fis-octree stage-03 --project project.toml --family meta
+```
 
-Named sidecar families should then move into an optional Stage 03 so they can be rebuilt independently of the core render octree package. See `docs/roadmap.md` and `docs/identifiers-order.md`.
+Each final octree now carries a mandatory descriptor block immediately after the STAR header:
+
+- render octrees carry `dataset_uuid`
+- sidecars carry `parent_dataset_uuid`, `sidecar_uuid`, and `sidecar_kind`
+
+This lets readers validate sidecars by dataset identity before falling back to geometry checks.
 
 ## Project configuration
 
@@ -117,10 +129,11 @@ For full specifications, invariants, and binary layouts:
 - `docs/stage-00.md`
 - `docs/stage-01.md`
 - `docs/stage-02.md`
-- `docs/sidecars.md` (optional Stage 01 metadata sidecars)
-- `docs/identifiers-order.md` (foundational Stage 2 companion artifact)
+- `docs/stage-03.md`
+- `docs/sidecars.md`
+- `docs/identifiers-order.md`
 - `docs/reader.md` (query/read behavior for `stars.octree`)
-- `docs/roadmap.md` (future format and artifact requirements)
+- `docs/roadmap.md`
 
 ## Help
 
@@ -131,4 +144,5 @@ uv run fis-octree --help
 uv run fis-octree stage-00 --help
 uv run fis-octree stage-01 --help
 uv run fis-octree stage-02 --help
+uv run fis-octree stage-03 --help
 ```

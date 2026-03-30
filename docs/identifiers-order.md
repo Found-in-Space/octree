@@ -2,215 +2,119 @@
 
 ## Status
 
-This document describes a recommended future artifact for the octree base dataset package.
+`identifiers.order` is part of the implemented Stage 02 base dataset package.
 
-It is not part of the current v1 pipeline yet.
+Its job is to preserve the canonical ordered star identities for one render octree dataset so later sidecar families can be rebuilt without reopening earlier pipeline stages.
 
-## Purpose
+## Stage Placement
 
-Define a foundational Stage 2 companion artifact that preserves the canonical per-cell star ordering for one render octree dataset.
+The current pipeline is:
 
-Its primary role is:
-
-- input to future sidecar-family builds
-
-Secondary roles:
-
-- source for reverse lookup index generation
-- source for validation and audit tools
-
-## Why This Exists
-
-Today, if we want to build a new sidecar after the render octree is already published, we still depend on earlier pipeline outputs.
-
-A canonical identifiers/order artifact would let us archive:
-
-- `stars.octree`
-- one compact companion artifact that preserves canonical star identity and order
-
-and then build later sidecars from that base package without keeping all Stage 00 and Stage 01 files around.
+- Stage 00: row enrichment parquet
+- Stage 01: render intermediates plus identifiers-order intermediates
+- Stage 02: final `stars.octree` plus final `identifiers.order`
+- Stage 03: named sidecar families and derived indices
 
 ## Primary Mapping
 
-The primary mapping should be:
+The artifact stores:
 
 - `(level, node_id) -> ordered list of canonical star identities`
 
-This is a forward mapping optimized for sidecar generation.
-
-It should not be optimized first for:
-
-- `star_id -> node`
-- free-text search
-- UI lookup ranking
-
-Those are better handled as derived artifacts built from this one.
-
-## Canonical Identity
-
-Each ordered star entry should preserve canonical star identity in a stable form.
-
-The minimum useful identity is:
+Each star identity is the canonical pair:
 
 - `source`
 - `source_id`
 
-That matches the current render/sidecar alignment contract and is sufficient to join later enrichment tables.
+This is a forward mapping optimized for sidecar generation rather than reverse lookup.
 
-## Stage Placement
+## Binary Layout
 
-Recommended future placement:
-
-- Stage 00: row enrichment parquet
-- Stage 01: render intermediates and render manifest
-- Stage 02: final render octree plus this identifiers/order artifact
-- Stage 03: optional sidecar families and derived indices built from the Stage 2 base package
-
-Why Stage 2:
-
-- the artifact is foundational enough to belong with the base dataset package
-- later sidecar builds should not depend on old intermediate files when the base package can carry the canonical ordering directly
-
-## Design Goals
-
-- fast sequential cell-by-cell scans
-- bounded-memory sidecar generation
-- compact binary representation
-- compatibility and cache safety via UUIDs
-- no dependence on JSON parsing for core build loops
-
-## Non-goals
-
-- replacing `stars.octree`
-- serving as the primary reverse lookup index
-- packing arbitrary metadata fields
-- becoming another generic `meta` artifact
-
-## Recommended File Structure
-
-One workable structure is:
+`identifiers.order` uses a compact binary layout:
 
 1. file header
-2. fixed-width cell directory
-3. payload section with ordered canonical identities
+2. fixed-width directory sorted by `(level, node_id)`
+3. payload section containing ordered identity rows
 
-### File header
+### Header
 
-The header should include at least:
+```python
+HEADER_FMT = struct.Struct("<4sHH16s16sQQQQQ")
+HEADER_MAGIC = b"OIOR"
+HEADER_VERSION = 1
+```
 
-- artifact magic
-- artifact format version
-- `parent_dataset_uuid`
-- artifact UUID for this identifiers/order artifact
-- directory offset
-- directory length
-- payload offset
-- payload length
-- codec or compression flags
-- source-kind dictionary version or equivalent identifier
+Fields, in order:
 
-### Cell directory
+1. magic
+2. version
+3. header size
+4. `parent_dataset_uuid`
+5. artifact UUID
+6. directory offset
+7. directory length
+8. payload offset
+9. payload length
+10. record count
 
-The directory should be sorted by `(level, node_id)` so sidecar builders can stream the file in the same logical order used by render cells.
+### Directory Records
 
-Each fixed-width directory record should include at least:
+```python
+DIRECTORY_RECORD_FMT = struct.Struct("<H2xQIQQ")
+```
+
+Each record stores:
 
 - `level`
 - `node_id`
 - `star_count`
-- `payload_offset`
+- `payload_offset` relative to the payload section
 - `payload_length`
 
-Optional useful fields:
+### Payload Encoding
 
-- flags
-- per-cell digest
-- block identifier when block compression is used
+Each payload blob stores exactly one cell’s ordered canonical identities.
 
-### Payload section
+For each star:
 
-Each payload blob should store the ordered canonical identities for exactly one cell.
+1. `u16` length of `source`
+2. UTF-8 bytes of `source`
+3. `u16` length of `source_id`
+4. UTF-8 bytes of `source_id`
 
-Recommended representation:
+The final `identifiers.order` payload section stores these rows in compact binary form.
 
-- compact binary records
-- one record per star, in render order
-- optional cell-local string pool for non-numeric identifiers
+## Why It Exists
 
-Avoid using per-cell gzip JSON for this artifact. The main goal is efficient rebuild input, not human readability.
+This artifact lets the base dataset package be archived as:
 
-## Recommended Identity Encoding
+- `stars.octree`
+- `identifiers.order`
 
-One workable approach is:
+Stage 03 can then rebuild sidecars from that package plus fresh enrichment inputs, without depending on Stage 00 or Stage 01 outputs.
 
-- compact source-kind tag
-- compact id-kind tag
-- numeric payload for common numeric identifiers
-- string-pool reference for non-numeric or manual identifiers
+## Validation And Cache Identity
 
-That keeps Gaia/HIP-like cases compact while still supporting manual or other string identifiers.
+The render octree carries `dataset_uuid`.
 
-Exact binary packing can be decided later, but the important design point is:
+`identifiers.order` carries:
 
-- optimize for compact ordered identity storage, not for arbitrary metadata extensibility
+- `parent_dataset_uuid`
+- artifact UUID
 
-## Compression Strategy
+Consumers and builders must treat `parent_dataset_uuid` as the primary compatibility key for the render dataset.
 
-Recommended order of preference:
+## Relationship To Sidecars
 
-1. uncompressed binary for the simplest and fastest initial implementation
-2. block compression if file size becomes a problem
+`identifiers.order` is not a sidecar.
 
-Avoid per-cell gzip as the default because it adds CPU overhead to the exact streaming path this artifact is supposed to make cheap.
+It is a foundational companion artifact for the render dataset.
 
-## Why This Is Better Than A Generic “Meta Meta” File
-
-If the artifact preserves canonical ordered identities, it is not a hacky extra sidecar. It is a first-class foundational companion artifact for the render dataset.
-
-That is cleaner because:
-
-- it has one crisp responsibility
-- it can support many future sidecar families
-- it can support reverse lookup index generation
-- it avoids coupling future tooling to the current `meta` family
-
-## Reverse Lookup As A Derived Artifact
-
-Reverse lookup should remain a derived artifact built from the identifiers/order artifact.
-
-That build can emit:
-
-- `canonical_id -> (level, node_id, ordinal)`
-
-This keeps the foundational artifact optimized for sidecar generation rather than trying to optimize both forward and reverse lookup equally.
-
-## Sidecar Build Flow
-
-The intended Stage 3 flow becomes:
-
-1. open `stars.octree`
-2. open the identifiers/order artifact
-3. stream one cell at a time
-4. join external enrichment by canonical star identity
-5. write one sidecar cell for the chosen family
-6. emit a new `sidecar_uuid`
-
-## Cache Identity
-
-Recommended cache identity:
-
-- render octree: `dataset_uuid`
-- identifiers/order artifact: `parent_dataset_uuid` plus artifact UUID
-- derived sidecars: `parent_dataset_uuid`, sidecar kind, `sidecar_uuid`
-
-## Relationship To `meta`
-
-`meta` should remain the name of the current sidecar family.
-
-This identifiers/order artifact is not the `meta` sidecar and should not inherit `meta` naming.
+The first implemented Stage 03 family is `meta`, but the same artifact can support additional sidecar families later.
 
 ## Related Docs
 
-- `docs/roadmap.md`
 - `docs/stage-02.md`
+- `docs/stage-03.md`
 - `docs/sidecars.md`
+- `docs/roadmap.md`

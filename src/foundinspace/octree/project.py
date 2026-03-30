@@ -8,12 +8,28 @@ from typing import Any
 from .config import DEFAULT_DEEP_SHARD_FROM_LEVEL, DEFAULT_MAG_VIS, DEFAULT_MAX_LEVEL
 
 FORMAT_VERSION = 1
-_META_MODES = {"auto", "on", "off"}
 _DEFAULT_MERGED_HEALPIX_DIR = "../data/processed/merged/healpix"
 _DEFAULT_IDENTIFIERS_MAP_PATH = "../data/processed/identifiers_map.parquet"
 _DEFAULT_STAGE00_OUTPUT_DIR = "artifacts/stage00"
 _DEFAULT_STAGE01_OUTPUT_DIR = "artifacts/stage01"
 _DEFAULT_STAGE02_OUTPUT_PATH = "artifacts/stars.octree"
+_DEFAULT_IDENTIFIERS_ORDER_OUTPUT_PATH = "artifacts/identifiers.order"
+_DEFAULT_STAGE03_OUTPUT_DIR = "artifacts/stage03"
+
+_PATH_KEYS = {
+    "merged_healpix_dir",
+    "identifiers_map_path",
+    "stage00_output_dir",
+    "stage01_output_dir",
+    "stage02_output_path",
+    "identifiers_order_output_path",
+    "stage03_output_dir",
+}
+_STAGE00_KEYS = {"batch_size", "v_mag", "max_level"}
+_STAGE01_KEYS = {"input_glob", "batch_size", "deep_shard_from_level", "deep_prefix_bits"}
+_STAGE02_KEYS = {"max_open_files"}
+_STAGE03_KEYS = {"sidecars"}
+_STAGE03_SIDECAR_KEYS = {"name", "fields"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +39,8 @@ class ProjectPaths:
     stage00_output_dir: Path
     stage01_output_dir: Path
     stage02_output_path: Path
+    identifiers_order_output_path: Path
+    stage03_output_dir: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,15 +56,22 @@ class Stage01ProjectConfig:
     batch_size: int
     deep_shard_from_level: int
     deep_prefix_bits: int
-    sidecar_fields: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class Stage02ProjectConfig:
-    manifest_path: Path
     max_open_files: int
-    meta_mode: str
-    meta_output_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class SidecarProjectConfig:
+    name: str
+    fields: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Stage03ProjectConfig:
+    sidecars: tuple[SidecarProjectConfig, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +81,7 @@ class OctreeProject:
     stage00: Stage00ProjectConfig
     stage01: Stage01ProjectConfig
     stage02: Stage02ProjectConfig
+    stage03: Stage03ProjectConfig
 
 
 def _reject_env_expansion(value: str, *, field_name: str) -> None:
@@ -109,6 +135,12 @@ def _resolve_glob(project_dir: Path, value: str, *, field_name: str) -> str:
     return (project_dir / raw_path).as_posix()
 
 
+def _reject_unknown_keys(raw: dict[str, Any], *, allowed: set[str], table_name: str) -> None:
+    unknown = sorted(set(raw) - allowed)
+    if unknown:
+        raise ValueError(f"Unknown key(s) in [{table_name}]: {', '.join(unknown)}")
+
+
 def load_project(project_path: Path) -> OctreeProject:
     resolved_project_path = project_path.expanduser().resolve()
     with resolved_project_path.open("rb") as fp:
@@ -125,6 +157,13 @@ def load_project(project_path: Path) -> OctreeProject:
     stage00_raw = _require_table(raw, "stage00")
     stage01_raw = _require_table(raw, "stage01")
     stage02_raw = _require_table(raw, "stage02")
+    stage03_raw = _require_table(raw, "stage03")
+
+    _reject_unknown_keys(paths_raw, allowed=_PATH_KEYS, table_name="paths")
+    _reject_unknown_keys(stage00_raw, allowed=_STAGE00_KEYS, table_name="stage00")
+    _reject_unknown_keys(stage01_raw, allowed=_STAGE01_KEYS, table_name="stage01")
+    _reject_unknown_keys(stage02_raw, allowed=_STAGE02_KEYS, table_name="stage02")
+    _reject_unknown_keys(stage03_raw, allowed=_STAGE03_KEYS, table_name="stage03")
 
     paths = ProjectPaths(
         merged_healpix_dir=_resolve_path(
@@ -152,6 +191,16 @@ def load_project(project_path: Path) -> OctreeProject:
             _require_str(paths_raw, "stage02_output_path"),
             field_name="paths.stage02_output_path",
         ),
+        identifiers_order_output_path=_resolve_path(
+            project_dir,
+            _require_str(paths_raw, "identifiers_order_output_path"),
+            field_name="paths.identifiers_order_output_path",
+        ),
+        stage03_output_dir=_resolve_path(
+            project_dir,
+            _require_str(paths_raw, "stage03_output_dir"),
+            field_name="paths.stage03_output_dir",
+        ),
     )
 
     stage00 = Stage00ProjectConfig(
@@ -164,11 +213,6 @@ def load_project(project_path: Path) -> OctreeProject:
     if stage00.max_level < 0:
         raise ValueError("stage00.max_level must be >= 0")
 
-    sidecar_fields_raw = stage01_raw.get("sidecar_fields", [])
-    if not isinstance(sidecar_fields_raw, list) or not all(
-        isinstance(v, str) and v.strip() for v in sidecar_fields_raw
-    ):
-        raise ValueError("stage01.sidecar_fields must be a list of non-empty strings")
     stage01 = Stage01ProjectConfig(
         input_glob=_resolve_glob(
             project_dir,
@@ -178,7 +222,6 @@ def load_project(project_path: Path) -> OctreeProject:
         batch_size=_require_int(stage01_raw, "batch_size"),
         deep_shard_from_level=_require_int(stage01_raw, "deep_shard_from_level"),
         deep_prefix_bits=_require_int(stage01_raw, "deep_prefix_bits"),
-        sidecar_fields=tuple(v.strip() for v in sidecar_fields_raw),
     )
     if stage01.batch_size <= 0:
         raise ValueError("stage01.batch_size must be > 0")
@@ -187,27 +230,42 @@ def load_project(project_path: Path) -> OctreeProject:
     if stage01.deep_prefix_bits < 0:
         raise ValueError("stage01.deep_prefix_bits must be >= 0")
 
-    meta_mode = _require_str(stage02_raw, "meta_mode").lower()
-    if meta_mode not in _META_MODES:
-        raise ValueError(
-            f"stage02.meta_mode must be one of {sorted(_META_MODES)}, got {meta_mode!r}"
-        )
     stage02 = Stage02ProjectConfig(
-        manifest_path=_resolve_path(
-            project_dir,
-            _require_str(stage02_raw, "manifest_path"),
-            field_name="stage02.manifest_path",
-        ),
         max_open_files=_require_int(stage02_raw, "max_open_files"),
-        meta_mode=meta_mode,
-        meta_output_path=_resolve_path(
-            project_dir,
-            _require_str(stage02_raw, "meta_output_path"),
-            field_name="stage02.meta_output_path",
-        ),
     )
     if stage02.max_open_files <= 0:
         raise ValueError("stage02.max_open_files must be > 0")
+
+    sidecars_raw = stage03_raw.get("sidecars", [])
+    if not isinstance(sidecars_raw, list):
+        raise ValueError("stage03.sidecars must be an array of tables")
+    seen_names: set[str] = set()
+    sidecars: list[SidecarProjectConfig] = []
+    for idx, sidecar_raw in enumerate(sidecars_raw):
+        if not isinstance(sidecar_raw, dict):
+            raise ValueError(f"stage03.sidecars[{idx}] must be a table")
+        _reject_unknown_keys(
+            sidecar_raw,
+            allowed=_STAGE03_SIDECAR_KEYS,
+            table_name=f"stage03.sidecars[{idx}]",
+        )
+        name = _require_str(sidecar_raw, "name").strip()
+        if name in seen_names:
+            raise ValueError(f"Duplicate stage03 sidecar name: {name}")
+        seen_names.add(name)
+        fields_raw = sidecar_raw.get("fields", [])
+        if not isinstance(fields_raw, list) or not all(
+            isinstance(v, str) and v.strip() for v in fields_raw
+        ):
+            raise ValueError(
+                f"stage03.sidecars[{idx}].fields must be a list of non-empty strings"
+            )
+        sidecars.append(
+            SidecarProjectConfig(
+                name=name,
+                fields=tuple(v.strip() for v in fields_raw),
+            )
+        )
 
     return OctreeProject(
         project_path=resolved_project_path,
@@ -215,6 +273,7 @@ def load_project(project_path: Path) -> OctreeProject:
         stage00=stage00,
         stage01=stage01,
         stage02=stage02,
+        stage03=Stage03ProjectConfig(sidecars=tuple(sidecars)),
     )
 
 
@@ -222,13 +281,9 @@ def render_project_template() -> str:
     stage00_output_dir = _DEFAULT_STAGE00_OUTPUT_DIR
     stage01_output_dir = _DEFAULT_STAGE01_OUTPUT_DIR
     stage02_output_path = _DEFAULT_STAGE02_OUTPUT_PATH
+    identifiers_order_output_path = _DEFAULT_IDENTIFIERS_ORDER_OUTPUT_PATH
+    stage03_output_dir = _DEFAULT_STAGE03_OUTPUT_DIR
     stage00_input_glob = f"{stage00_output_dir}/**/*.parquet"
-    stage02_manifest_path = f"{stage01_output_dir}/manifest.json"
-
-    stage02_output_name = Path(stage02_output_path)
-    meta_output_path = stage02_output_name.with_name(
-        f"{stage02_output_name.stem}.meta{stage02_output_name.suffix}"
-    ).as_posix()
 
     return (
         f"format_version = {FORMAT_VERSION}\n\n"
@@ -237,7 +292,9 @@ def render_project_template() -> str:
         f'identifiers_map_path = "{_DEFAULT_IDENTIFIERS_MAP_PATH}"\n'
         f'stage00_output_dir = "{stage00_output_dir}"\n'
         f'stage01_output_dir = "{stage01_output_dir}"\n'
-        f'stage02_output_path = "{stage02_output_path}"\n\n'
+        f'stage02_output_path = "{stage02_output_path}"\n'
+        f'identifiers_order_output_path = "{identifiers_order_output_path}"\n'
+        f'stage03_output_dir = "{stage03_output_dir}"\n\n'
         "[stage00]\n"
         'batch_size = 1000000\n'
         f"v_mag = {DEFAULT_MAG_VIS}\n"
@@ -246,11 +303,11 @@ def render_project_template() -> str:
         f'input_glob = "{stage00_input_glob}"\n'
         'batch_size = 100000\n'
         f"deep_shard_from_level = {DEFAULT_DEEP_SHARD_FROM_LEVEL}\n"
-        "deep_prefix_bits = 3\n"
-        "sidecar_fields = []\n\n"
+        "deep_prefix_bits = 3\n\n"
         "[stage02]\n"
-        f'manifest_path = "{stage02_manifest_path}"\n'
-        "max_open_files = 32\n"
-        'meta_mode = "auto"\n'
-        f'meta_output_path = "{meta_output_path}"\n'
+        "max_open_files = 32\n\n"
+        "[stage03]\n\n"
+        "[[stage03.sidecars]]\n"
+        'name = "meta"\n'
+        "fields = []\n"
     )

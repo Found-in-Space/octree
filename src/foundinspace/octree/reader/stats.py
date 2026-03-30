@@ -330,6 +330,17 @@ def _open_meta_reader(
         return
 
     meta_header = read_header(metadata_path)
+    if meta_header.artifact_kind != "sidecar":
+        raise ValueError(f"Metadata octree is not a sidecar artifact ({metadata_path})")
+    if meta_header.sidecar_kind != "meta":
+        raise ValueError(f"Metadata octree is not the `meta` sidecar ({metadata_path})")
+    if expected_header.dataset_uuid is None:
+        raise ValueError("Render octree is missing dataset_uuid metadata")
+    if meta_header.parent_dataset_uuid != expected_header.dataset_uuid:
+        raise ValueError(
+            "Metadata octree dataset_uuid does not match render octree "
+            f"({metadata_path})"
+        )
     if (
         meta_header.max_level != expected_header.max_level
         or meta_header.world_center != expected_header.world_center

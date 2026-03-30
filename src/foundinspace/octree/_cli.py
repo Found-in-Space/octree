@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from urllib.parse import urlsplit
-from urllib.parse import urlunsplit
+from uuid import uuid4
 
 import click
 from rich.console import Console
 from rich.table import Table
 
+from foundinspace.octree.assembly.formats import (
+    IDENTIFIERS_MANIFEST_NAME,
+    RENDER_MANIFEST_NAME,
+)
 from foundinspace.octree.mag_levels import MagLevelConfig
 from foundinspace.octree.project import load_project, render_project_template
 from foundinspace.octree.reader import Point
@@ -116,18 +119,16 @@ def stage_01(
         mag_limit=project.stage00.v_mag,
     )
 
-    map_path = project.paths.identifiers_map_path
-    if not map_path.is_file():
-        map_path = None
-
     manifest_path = build_intermediates(
         project.stage01.input_glob,
         project.paths.stage01_output_dir,
         plan=plan,
-        identifiers_map_path=map_path,
-        sidecar_fields=list(project.stage01.sidecar_fields) or None,
     )
-    click.echo(f"Manifest written to {manifest_path}")
+    click.echo(f"Render manifest written to {manifest_path}")
+    click.echo(
+        "Identifiers manifest written to "
+        f"{project.paths.stage01_output_dir / IDENTIFIERS_MANIFEST_NAME}"
+    )
 
 
 @cli.command("stage-02")
@@ -149,30 +150,63 @@ def stage_02(
 ) -> None:
     """Combine intermediates into final stars.octree output using project config."""
     from foundinspace.octree.combine import CombinePlan, combine_octree
-    from foundinspace.octree.combine.manifest import manifest_has_meta
+    from foundinspace.octree.combine.records import PackedDescriptorFields
+    from foundinspace.octree.identifiers_order import combine_identifiers_order
 
     project = _load_project_or_die(project_path)
-    manifest_path = project.stage02.manifest_path
+    render_manifest_path = project.paths.stage01_output_dir / RENDER_MANIFEST_NAME
+    identifiers_manifest_path = project.paths.stage01_output_dir / IDENTIFIERS_MANIFEST_NAME
     output_path = project.paths.stage02_output_path
+    identifiers_order_path = project.paths.identifiers_order_output_path
+    dataset_uuid = uuid4()
     plan = CombinePlan(
         max_open_files=project.stage02.max_open_files,
         retain_relocation_files=retain_relocation_files,
     )
-    combine_octree(manifest_path, output_path, plan=plan)
+    combine_octree(
+        render_manifest_path,
+        output_path,
+        plan=plan,
+        descriptor=PackedDescriptorFields(
+            artifact_kind="render",
+            dataset_uuid=dataset_uuid,
+        ),
+    )
     click.echo(f"Wrote {output_path}")
+    combine_identifiers_order(
+        identifiers_manifest_path,
+        identifiers_order_path,
+        parent_dataset_uuid=dataset_uuid,
+        artifact_uuid=uuid4(),
+    )
+    click.echo(f"Wrote {identifiers_order_path}")
 
-    do_meta = project.stage02.meta_mode == "on"
-    if project.stage02.meta_mode == "auto":
-        do_meta = manifest_has_meta(manifest_path)
 
-    if do_meta:
-        meta_out = project.stage02.meta_output_path
-        combine_octree(
-            manifest_path, meta_out, plan=plan, payload_kind="meta"
-        )
-        click.echo(f"Wrote {meta_out}")
-    elif project.stage02.meta_mode == "auto":
-        click.echo("No metadata sidecar in manifest; skipping meta combine.")
+@cli.command("stage-03")
+@click.option(
+    "--project",
+    "project_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Path to octree project TOML.",
+)
+@click.option(
+    "--family",
+    "family_name",
+    type=str,
+    default=None,
+    help="Optional single sidecar family to build.",
+)
+def stage_03(
+    project_path: Path,
+    family_name: str | None,
+) -> None:
+    """Build named sidecars from the render octree and identifiers/order artifact."""
+    from foundinspace.octree.stage3 import build_stage03_sidecars
+
+    project = _load_project_or_die(project_path)
+    manifest_path = build_stage03_sidecars(project, family_name=family_name)
+    click.echo(f"Stage 03 manifest written to {manifest_path}")
 
 
 def _parse_point(value: str) -> Point:
@@ -273,23 +307,6 @@ def _resolve_octree_source(source: str) -> OctreeSource:
         )
     return octree_path
 
-
-def _infer_meta_octree_url(octree_url: str) -> str | None:
-    parts = urlsplit(octree_url)
-    if not parts.path.endswith(".octree"):
-        return None
-    stem, suffix = parts.path.rsplit(".", 1)
-    return urlunsplit(
-        (
-            parts.scheme,
-            parts.netloc,
-            f"{stem}.meta.{suffix}",
-            parts.query,
-            parts.fragment,
-        )
-    )
-
-
 def _resolve_meta_octree_source(
     octree_source: OctreeSource,
     meta_octree_opt: str | None,
@@ -300,13 +317,7 @@ def _resolve_meta_octree_source(
             raise click.ClickException(f"Metadata octree not found: {meta_source}")
         return meta_source
 
-    if isinstance(octree_source, Path):
-        inferred = octree_source.parent / f"{octree_source.stem}.meta{octree_source.suffix}"
-        if inferred.is_file():
-            return inferred
-        return None
-
-    return _infer_meta_octree_url(octree_source)
+    return None
 
 
 def _format_source_label(source: OctreeSource) -> str:
@@ -435,14 +446,11 @@ def _render_stats(console: Console, report: StatsReport, nearest_n: int) -> None
     help="Number of nearest stars to print.",
 )
 @click.option(
-    "--meta-octree",
-    type=str,
-    default=None,
-    help=(
-        "Optional metadata octree path or URL for nearest-star identifiers "
-        "(default: infer a local .meta sidecar for paths and a sibling .meta.octree URL for URLs)."
-    ),
-)
+        "--meta-octree",
+        type=str,
+        default=None,
+        help="Optional metadata octree path or URL for the Stage 03 `meta` sidecar.",
+    )
 def stats(
     octree_source: str,
     point: str,

@@ -14,19 +14,36 @@ from .formats import (
 from .types import EncodedCell, ShardKey
 
 
-def shard_filenames(shard: ShardKey) -> tuple[str, str]:
+def _shard_base_name(shard: ShardKey) -> str:
     if shard.prefix_bits == 0:
-        base = f"level-{shard.level:02d}"
-    else:
-        base = f"level-{shard.level:02d}-p{shard.prefix_bits}-{shard.prefix}"
+        return f"level-{shard.level:02d}"
+    return f"level-{shard.level:02d}-p{shard.prefix_bits}-{shard.prefix}"
+
+
+def shard_filenames(shard: ShardKey) -> tuple[str, str]:
+    base = _shard_base_name(shard)
     return f"{base}.index", f"{base}.payload"
 
 
+def identifiers_shard_filenames(shard: ShardKey) -> tuple[str, str]:
+    base = _shard_base_name(shard)
+    return f"{base}.ident-index", f"{base}.ident-payload"
+
+
+def sidecar_shard_filenames(kind: str):
+    normalized = kind.strip()
+    if not normalized:
+        raise ValueError("sidecar kind must not be empty")
+
+    def _filenames(shard: ShardKey) -> tuple[str, str]:
+        base = _shard_base_name(shard)
+        return f"{base}.{normalized}.index", f"{base}.{normalized}.payload"
+
+    return _filenames
+
+
 def meta_shard_filenames(shard: ShardKey) -> tuple[str, str]:
-    idx, pay = shard_filenames(shard)
-    return idx.replace(".index", ".meta-index"), pay.replace(
-        ".payload", ".meta-payload"
-    )
+    return sidecar_shard_filenames("meta")(shard)
 
 
 def belongs_to_shard(node_id: int, shard: ShardKey) -> bool:

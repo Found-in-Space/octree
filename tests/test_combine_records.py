@@ -1,21 +1,28 @@
 from __future__ import annotations
 
+from uuid import UUID
+
 from foundinspace.octree.combine.records import (
+    DESCRIPTOR_SIZE,
     FRONTIER_REF_SIZE,
     HAS_CHILDREN,
     HAS_PAYLOAD,
     HEADER_SIZE,
     IS_FRONTIER,
+    PackedDescriptorFields,
     SHARD_HDR_SIZE,
     SHARD_NODE_SIZE,
+    pack_descriptor,
     PackedHeaderFields,
     pack_top_level_header,
+    unpack_descriptor,
     unpack_top_level_header,
 )
 
 
 def test_record_sizes_are_pinned() -> None:
     assert HEADER_SIZE == 64
+    assert DESCRIPTOR_SIZE == 128
     assert SHARD_HDR_SIZE == 80
     assert SHARD_NODE_SIZE == 20
     assert FRONTIER_REF_SIZE == 8
@@ -47,3 +54,23 @@ def test_pack_unpack_top_level_header_round_trip() -> None:
     assert fields[4] == 5678
     assert fields[9] == 16
     assert fields[10] == 13
+
+
+def test_pack_unpack_descriptor_round_trip() -> None:
+    packed = pack_descriptor(
+        PackedDescriptorFields(
+            artifact_kind="sidecar",
+            dataset_uuid=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            parent_dataset_uuid=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+            sidecar_uuid=UUID("cccccccc-cccc-cccc-cccc-cccccccccccc"),
+            sidecar_kind="meta",
+        )
+    )
+
+    assert len(packed) == DESCRIPTOR_SIZE
+    fields = unpack_descriptor(packed)
+    assert fields.artifact_kind == "sidecar"
+    assert fields.dataset_uuid == UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    assert fields.parent_dataset_uuid == UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+    assert fields.sidecar_uuid == UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+    assert fields.sidecar_kind == "meta"

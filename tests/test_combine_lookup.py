@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from combine_helpers import PayloadNode, build_intermediates
+from foundinspace.octree.assembly.formats import INDEX_FILE_HDR, INDEX_MAGIC, INDEX_RECORD
 from foundinspace.octree.combine.lookup import (
     FileHandleCache,
     FixedRecordFile,
@@ -27,9 +28,9 @@ def test_fixed_record_find_and_range(tmp_path) -> None:
     index_path = tmp_path / "level-01.index"
     fr = FixedRecordFile(
         index_path,
-        header_struct=RELOC_HEADER_FMT,
-        record_struct=RELOC_RECORD_FMT,
-        magic=b"OIDX",
+        header_struct=INDEX_FILE_HDR,
+        record_struct=INDEX_RECORD,
+        magic=INDEX_MAGIC,
     )
     try:
         assert fr.find_u64_key(0) is not None

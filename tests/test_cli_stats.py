@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import struct
 from pathlib import Path
+from uuid import UUID
 
 from click.testing import CliRunner
 import pytest
 import foundinspace.octree.reader.source as reader_source
 
-from combine_helpers import PayloadNode, build_intermediates
+from combine_helpers import PayloadNode, build_intermediates, build_sidecar_intermediates
 from foundinspace.octree._cli import _format_identifiers, cli
 from foundinspace.octree.combine import CombinePlan, combine_octree
+from foundinspace.octree.combine.records import PackedDescriptorFields
+
+DATASET_UUID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+SIDECAR_UUID = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
 
 STAR_RECORD_FMT = struct.Struct("<fffhBB")
 
@@ -49,11 +54,19 @@ def _build_small_octree(tmp_path: Path) -> Path:
         mag_limit=6.5,
     )
     output = tmp_path / "stars.octree"
-    combine_octree(manifest_path, output, plan=CombinePlan(max_open_files=2))
+    combine_octree(
+        manifest_path,
+        output,
+        plan=CombinePlan(max_open_files=2),
+        descriptor=PackedDescriptorFields(
+            artifact_kind="render",
+            dataset_uuid=DATASET_UUID,
+        ),
+    )
     return output
 
 
-def _build_small_octree_with_meta(tmp_path: Path) -> Path:
+def _build_small_octree_with_meta(tmp_path: Path) -> tuple[Path, Path]:
     payload = b"".join(
         [
             _encode_star(x_rel=0.0, y_rel=0.0, z_rel=0.0, abs_mag=4.8, teff_log8=128),
@@ -63,7 +76,13 @@ def _build_small_octree_with_meta(tmp_path: Path) -> Path:
             _encode_star(x_rel=5.0e-5, y_rel=0.0, z_rel=0.0, abs_mag=5.0, teff_log8=255),
         ]
     )
-    manifest_path = build_intermediates(
+    render_manifest_path = build_intermediates(
+        tmp_path / "intermediates",
+        [PayloadNode(level=0, node_id=0, star_count=3, raw_payload=payload)],
+        max_level=0,
+        mag_limit=6.5,
+    )
+    sidecar_manifest_path = build_sidecar_intermediates(
         tmp_path / "intermediates_meta",
         [
             PayloadNode(
@@ -80,18 +99,30 @@ def _build_small_octree_with_meta(tmp_path: Path) -> Path:
         ],
         max_level=0,
         mag_limit=6.5,
-        with_meta=True,
     )
     output = tmp_path / "stars.octree"
     meta_output = tmp_path / "stars.meta.octree"
-    combine_octree(manifest_path, output, plan=CombinePlan(max_open_files=2))
     combine_octree(
-        manifest_path,
+        render_manifest_path,
+        output,
+        plan=CombinePlan(max_open_files=2),
+        descriptor=PackedDescriptorFields(
+            artifact_kind="render",
+            dataset_uuid=DATASET_UUID,
+        ),
+    )
+    combine_octree(
+        sidecar_manifest_path,
         meta_output,
         plan=CombinePlan(max_open_files=2),
-        payload_kind="meta",
+        descriptor=PackedDescriptorFields(
+            artifact_kind="sidecar",
+            parent_dataset_uuid=DATASET_UUID,
+            sidecar_uuid=SIDECAR_UUID,
+            sidecar_kind="meta",
+        ),
     )
-    return output
+    return output, meta_output
 
 
 class _FakeHttpResponse:
@@ -152,8 +183,8 @@ def test_cli_stats_output_sections(tmp_path: Path) -> None:
     assert "Nearest 2 stars" in result.output
 
 
-def test_cli_stats_uses_inferred_meta_and_stars_alias(tmp_path: Path) -> None:
-    octree_path = _build_small_octree_with_meta(tmp_path)
+def test_cli_stats_uses_explicit_meta_octree_and_stars_alias(tmp_path: Path) -> None:
+    octree_path, meta_path = _build_small_octree_with_meta(tmp_path)
     runner = CliRunner()
     result = runner.invoke(
         cli,
@@ -168,6 +199,8 @@ def test_cli_stats_uses_inferred_meta_and_stars_alias(tmp_path: Path) -> None:
             "3.0",
             "--stars",
             "2",
+            "--meta-octree",
+            str(meta_path),
         ],
     )
 

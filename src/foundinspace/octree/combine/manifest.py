@@ -1,16 +1,10 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..assembly.formats import (
-    INDEX_FILE_HDR,
-    INDEX_RECORD,
-    MANIFEST_FORMAT,
-    PAYLOAD_CODEC,
-)
-from ..assembly.manifest import validate_shard
+from ..assembly.formats import INDEX_FILE_HDR, INDEX_RECORD, MANIFEST_FORMAT, PAYLOAD_CODEC
+from ..assembly.manifest import read_manifest_file, validate_shard
 from ..assembly.types import ShardKey
 
 
@@ -26,6 +20,8 @@ class ShardEntry:
 class CombineManifest:
     manifest_path: Path
     root_dir: Path
+    artifact_kind: str
+    index_magic: bytes
     max_level: int
     world_center: tuple[float, float, float]
     world_half_size_pc: float
@@ -40,24 +36,8 @@ def _parse_world_center(raw: object) -> tuple[float, float, float]:
     return (float(raw[0]), float(raw[1]), float(raw[2]))
 
 
-def manifest_has_meta(manifest_path: Path) -> bool:
-    """True only when the manifest has shards AND every shard has meta paths."""
-    raw = json.loads(manifest_path.read_text())
-    has_any = False
-    for level_entry in raw.get("levels", []):
-        for shard in level_entry.get("shards", []):
-            has_any = True
-            if "meta_index_path" not in shard:
-                return False
-    return has_any
-
-
-def read_combine_manifest(
-    manifest_path: Path,
-    *,
-    payload_kind: str = "render",
-) -> CombineManifest:
-    raw = json.loads(manifest_path.read_text())
+def read_combine_manifest(manifest_path: Path) -> CombineManifest:
+    raw = read_manifest_file(manifest_path)
     got_format = str(raw.get("format", ""))
     if got_format != MANIFEST_FORMAT:
         raise ValueError(
@@ -76,6 +56,13 @@ def read_combine_manifest(
             f"{got_index_rec!r} != {INDEX_RECORD.format!r}"
         )
     root_dir = manifest_path.parent
+    artifact_kind = str(raw.get("artifact_kind", "")).strip()
+    if not artifact_kind:
+        raise ValueError("Manifest is missing required field: artifact_kind")
+    index_magic_raw = str(raw.get("index_magic", "")).strip()
+    if len(index_magic_raw) != 4:
+        raise ValueError("Manifest is missing valid field: index_magic")
+    index_magic = index_magic_raw.encode("ascii")
     max_level = int(raw["max_level"])
     world_center = _parse_world_center(raw["world_center"])
     world_half_size_pc = float(raw["world_half_size_pc"])
@@ -100,31 +87,17 @@ def read_combine_manifest(
                 "payload_path": str(shard["payload_path"]),
                 "record_count": int(shard["record_count"]),
             }
-            if "meta_index_path" in shard:
-                entry_dict["meta_index_path"] = str(shard["meta_index_path"])
-                entry_dict["meta_payload_path"] = str(shard["meta_payload_path"])
-            validate_shard(root_dir, entry_dict)
+            validate_shard(root_dir, entry_dict, expected_magic=index_magic)
             key = ShardKey(
                 level=level,
                 prefix_bits=entry_dict["prefix_bits"],
                 prefix=entry_dict["prefix"],
             )
-            if payload_kind == "meta":
-                if "meta_index_path" not in entry_dict:
-                    raise ValueError(
-                        f"Shard at level {level} prefix={shard['prefix']} "
-                        "missing meta paths for meta combine"
-                    )
-                idx_path = root_dir / entry_dict["meta_index_path"]
-                pay_path = root_dir / entry_dict["meta_payload_path"]
-            else:
-                idx_path = root_dir / entry_dict["index_path"]
-                pay_path = root_dir / entry_dict["payload_path"]
             shards.append(
                 ShardEntry(
                     key=key,
-                    index_path=idx_path,
-                    payload_path=pay_path,
+                    index_path=root_dir / entry_dict["index_path"],
+                    payload_path=root_dir / entry_dict["payload_path"],
                     record_count=entry_dict["record_count"],
                 )
             )
@@ -133,6 +106,8 @@ def read_combine_manifest(
     return CombineManifest(
         manifest_path=manifest_path,
         root_dir=root_dir,
+        artifact_kind=artifact_kind,
+        index_magic=index_magic,
         max_level=max_level,
         world_center=world_center,
         world_half_size_pc=world_half_size_pc,

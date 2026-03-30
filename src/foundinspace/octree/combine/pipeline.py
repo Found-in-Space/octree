@@ -5,11 +5,11 @@ from pathlib import Path
 import time
 from typing import BinaryIO
 
-from ..assembly.formats import INDEX_MAGIC, META_INDEX_MAGIC
 from .dfs import iter_cells_dfs
 from .lookup import IntermediateLookup, RelocationLookup
 from .manifest import read_combine_manifest
 from .records import (
+    DESCRIPTOR_SIZE,
     FRONTIER_REF_FMT,
     HAS_CHILDREN,
     HAS_PAYLOAD,
@@ -22,7 +22,9 @@ from .records import (
     RELOC_RECORD_FMT,
     RELOC_RECORD_SIZE,
     SHARD_NODE_FMT,
+    PackedDescriptorFields,
     PackedHeaderFields,
+    pack_descriptor,
     pack_shard_header,
     pack_top_level_header,
 )
@@ -147,11 +149,13 @@ def combine_octree(
     output_path: Path,
     *,
     plan: CombinePlan = DEFAULT_COMBINE_PLAN,
-    payload_kind: str = "render",
+    descriptor: PackedDescriptorFields | None = None,
 ) -> None:
     t0 = time.perf_counter()
     plan.validate()
-    manifest = read_combine_manifest(manifest_path, payload_kind=payload_kind)
+    manifest = read_combine_manifest(manifest_path)
+    if descriptor is None:
+        descriptor = PackedDescriptorFields(artifact_kind=manifest.artifact_kind)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     print(
         (
@@ -174,8 +178,9 @@ def combine_octree(
                 )
             )
         )
+        out_fp.write(pack_descriptor(descriptor))
         payload_result = relocate_payloads_dfs(
-            manifest_path, out_fp, plan=plan, payload_kind=payload_kind
+            manifest_path, out_fp, plan=plan
         )
         print(
             (
@@ -193,7 +198,6 @@ def combine_octree(
             payload_result.relocation_files,
             out_fp,
             plan=plan,
-            payload_kind=payload_kind,
         )
         print(
             (
@@ -240,9 +244,8 @@ def relocate_payloads_dfs(
     output_fp: BinaryIO,
     *,
     plan: CombinePlan,
-    payload_kind: str = "render",
 ) -> PayloadPassResult:
-    manifest = read_combine_manifest(manifest_path, payload_kind=payload_kind)
+    manifest = read_combine_manifest(manifest_path)
     shard_by_key = {
         (s.key.level, s.key.prefix_bits, s.key.prefix): s for s in manifest.shards
     }
@@ -257,7 +260,6 @@ def relocate_payloads_dfs(
     for cell in iter_cells_dfs(
         manifest_path,
         max_open_files=plan.max_open_files,
-        payload_kind=payload_kind,
     ):
         key = (cell.shard.level, cell.shard.prefix_bits, cell.shard.prefix)
         shard = shard_by_key[key]
@@ -459,13 +461,9 @@ def write_final_shard_index(
     output_fp: BinaryIO,
     *,
     plan: CombinePlan,
-    payload_kind: str = "render",
 ) -> IndexPassResult:
-    manifest = read_combine_manifest(manifest_path, payload_kind=payload_kind)
-    index_magic = META_INDEX_MAGIC if payload_kind == "meta" else INDEX_MAGIC
-    existence = IntermediateLookup(
-        manifest, max_open_files=plan.max_open_files, index_magic=index_magic
-    )
+    manifest = read_combine_manifest(manifest_path)
+    existence = IntermediateLookup(manifest, max_open_files=plan.max_open_files)
     relocation = RelocationLookup(
         relocation_files, max_open_files=plan.max_open_files
     )
@@ -636,7 +634,7 @@ class _IndexWriter:
             first_frontier_index=first_frontier_index,
             node_table_offset=node_table_offset,
             frontier_table_offset=frontier_table_offset,
-            payload_base_offset=HEADER_SIZE,
+            payload_base_offset=HEADER_SIZE + DESCRIPTOR_SIZE,
         )
 
         end = self._out.tell()
