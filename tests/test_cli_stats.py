@@ -249,3 +249,44 @@ def test_cli_stats_accepts_http_range_urls(
 def test_format_identifiers_falls_back_to_primary_key() -> None:
     assert _format_identifiers((("source", "gaia"), ("source_id", "123"))) == "Gaia 123"
     assert _format_identifiers((("source", "hip"), ("source_id", "42"))) == "HIP 42"
+
+
+def test_format_identifiers_bayer_used_directly() -> None:
+    # bayer already includes constellation abbreviation — must not be doubled
+    assert (
+        _format_identifiers(
+            (
+                ("bayer", "alpha Cen"),
+                ("constellation", "Cen"),
+                ("hip_id", 71683),
+            )
+        )
+        == "HIP 71683 | alpha Cen"
+    )
+
+    # bayer without constellation field present
+    assert _format_identifiers((("bayer", "beta Ori"),)) == "beta Ori"
+
+    # flamsteed + constellation still joined (flamsteed is just a number)
+    assert (
+        _format_identifiers(
+            (
+                ("flamsteed", 42),
+                ("constellation", "Ori"),
+            )
+        )
+        == "42 Ori"
+    )
+
+    # proper_name takes priority in label, bayer still appended
+    assert (
+        _format_identifiers(
+            (
+                ("proper_name", "Rigil Kentaurus"),
+                ("bayer", "alpha Cen"),
+                ("constellation", "Cen"),
+                ("hip_id", 71683),
+            )
+        )
+        == "Rigil Kentaurus | HIP 71683 | alpha Cen"
+    )

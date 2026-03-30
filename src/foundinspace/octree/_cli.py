@@ -266,10 +266,7 @@ def _format_identifiers(identifiers: tuple[tuple[str, object], ...]) -> str:
     constellation = by_key.get("constellation")
     flamsteed = by_key.get("flamsteed")
     if bayer is not None:
-        if constellation is not None:
-            parts.append(f"{bayer} {constellation}")
-        else:
-            parts.append(str(bayer))
+        parts.append(str(bayer))
     elif flamsteed is not None and constellation is not None:
         parts.append(f"{flamsteed} {constellation}")
     elif flamsteed is not None:
