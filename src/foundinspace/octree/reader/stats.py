@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import Any
 from typing import Iterator
 
+import numpy as np
+
 from .header import OctreeHeader, read_header
 from .index import IndexNavigator, NodeEntry, Point
 from .payload import decode_payload
@@ -22,6 +24,11 @@ class LevelStats:
     stars_loaded: int
     stars_rendered: int
     payload_bytes: int
+    mag_min: float
+    mag_p25: float
+    mag_p50: float
+    mag_p75: float
+    mag_max: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +65,7 @@ class _MutableLevelStats:
     stars_loaded: int = 0
     stars_rendered: int = 0
     payload_bytes: int = 0
+    magnitudes: list[float] | None = None
 
 
 @dataclass(slots=True)
@@ -107,15 +115,28 @@ def collect_stats(
             stars_loaded=stats.stars_loaded,
             stars_rendered=stats.stars_rendered,
             payload_bytes=stats.payload_bytes,
+            mag_min=_quantile_or_nan(stats.magnitudes, 0.0),
+            mag_p25=_quantile_or_nan(stats.magnitudes, 0.25),
+            mag_p50=_quantile_or_nan(stats.magnitudes, 0.5),
+            mag_p75=_quantile_or_nan(stats.magnitudes, 0.75),
+            mag_max=_quantile_or_nan(stats.magnitudes, 1.0),
         )
         for level, stats in sorted(by_level.items())
     )
+    all_magnitudes = [
+        mag for stats in by_level.values() for mag in (stats.magnitudes or [])
+    ]
     totals = LevelStats(
         level=-1,
         nodes=sum(row.nodes for row in level_rows),
         stars_loaded=sum(row.stars_loaded for row in level_rows),
         stars_rendered=sum(row.stars_rendered for row in level_rows),
         payload_bytes=sum(row.payload_bytes for row in level_rows),
+        mag_min=_quantile_or_nan(all_magnitudes, 0.0),
+        mag_p25=_quantile_or_nan(all_magnitudes, 0.25),
+        mag_p50=_quantile_or_nan(all_magnitudes, 0.5),
+        mag_p75=_quantile_or_nan(all_magnitudes, 0.75),
+        mag_max=_quantile_or_nan(all_magnitudes, 1.0),
     )
     coalesced = coalesce_payload_ranges(
         touched_ranges,
@@ -196,10 +217,20 @@ def _collect_shell_level_stats(
                 for star in stars
                 if star.apparent_magnitude_at(point) <= limiting_magnitude
             )
+            if level_stats.magnitudes is None:
+                level_stats.magnitudes = []
+            level_stats.magnitudes.extend(star.magnitude for star in stars)
             level_stats.payload_bytes += node.payload_length
             payload_ranges.append((node.payload_offset, node.payload_length))
         _push_children(nav, stack, node)
     return by_level, payload_ranges
+
+
+def _quantile_or_nan(values: list[float] | None, q: float) -> float:
+    if not values:
+        return float("nan")
+    arr = np.asarray(values, dtype=np.float64)
+    return float(np.quantile(arr, q))
 
 
 def _collect_nearest(

@@ -337,6 +337,20 @@ def _format_kb(value: int) -> str:
     return f"{value / 1024.0:,.0f} KB"
 
 
+def _format_mag_spread(row: object) -> str:
+    mag_min = getattr(row, "mag_min", float("nan"))
+    mag_p25 = getattr(row, "mag_p25", float("nan"))
+    mag_p50 = getattr(row, "mag_p50", float("nan"))
+    mag_p75 = getattr(row, "mag_p75", float("nan"))
+    mag_max = getattr(row, "mag_max", float("nan"))
+    if any(math.isnan(v) for v in (mag_min, mag_p25, mag_p50, mag_p75, mag_max)):
+        return "-"
+    return (
+        f"{mag_min:.1f}/{mag_p25:.1f}/{mag_p50:.1f}/"
+        f"{mag_p75:.1f}/{mag_max:.1f}"
+    )
+
+
 def _format_compact_mb(value: int) -> str:
     mb = value / (1024.0 * 1024.0)
     return f"{mb:.1f} MB"
@@ -476,6 +490,7 @@ def _render_stats(console: Console, report: StatsReport, nearest_n: int) -> None
     shell_table.add_column("Nodes", justify="right")
     shell_table.add_column("Stars loaded", justify="right")
     shell_table.add_column("Stars rendered", justify="right")
+    shell_table.add_column("Mag abs min/p25/p50/p75/max", justify="right")
     shell_table.add_column("Payload size", justify="right")
 
     for row in report.by_level:
@@ -484,6 +499,7 @@ def _render_stats(console: Console, report: StatsReport, nearest_n: int) -> None
             f"{row.nodes:,}",
             f"{row.stars_loaded:,}",
             f"{row.stars_rendered:,}",
+            _format_mag_spread(row),
             _format_kb(row.payload_bytes),
         )
     shell_table.add_section()
@@ -492,6 +508,7 @@ def _render_stats(console: Console, report: StatsReport, nearest_n: int) -> None
         f"{report.totals.nodes:,}",
         f"{report.totals.stars_loaded:,}",
         f"{report.totals.stars_rendered:,}",
+        _format_mag_spread(report.totals),
         _format_kb(report.totals.payload_bytes),
     )
     console.print(shell_table)
@@ -532,7 +549,10 @@ def _render_stats(console: Console, report: StatsReport, nearest_n: int) -> None
     type=str,
 )
 @click.option(
+    "--center",
+    "--centre",
     "--point",
+    "point",
     type=str,
     default="0,0,0",
     show_default=True,
@@ -599,7 +619,8 @@ def stats(
     )
     console = Console()
     console.print(
-        f"File: {_format_source_label(resolved_octree_source)} | center={report.header.world_center} "
+        f"File: {_format_source_label(resolved_octree_source)} | query_point=({query_point.x:.1f}, {query_point.y:.1f}, {query_point.z:.1f}) "
+        f"| world_center={report.header.world_center} "
         f"| half_size={report.header.world_half_size:.1f} pc "
         f"| max_level={report.header.max_level} "
         f"| mag_limit={report.header.mag_limit:.2f}"
