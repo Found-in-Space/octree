@@ -11,7 +11,11 @@ from foundinspace.octree.assembly.formats import (
     INDEX_MAGIC,
     RENDER_ARTIFACT_KIND,
 )
-from foundinspace.octree.assembly.manifest import manifest_entries, validate_shard, write_manifest
+from foundinspace.octree.assembly.manifest import (
+    manifest_entries,
+    validate_shard,
+    write_manifest,
+)
 from foundinspace.octree.assembly.types import CellKey, EncodedCell, ShardKey
 from foundinspace.octree.assembly.writer import (
     IntermediateShardWriter,

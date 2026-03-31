@@ -155,7 +155,9 @@ def stage_02(
 
     project = _load_project_or_die(project_path)
     render_manifest_path = project.paths.stage01_output_dir / RENDER_MANIFEST_NAME
-    identifiers_manifest_path = project.paths.stage01_output_dir / IDENTIFIERS_MANIFEST_NAME
+    identifiers_manifest_path = (
+        project.paths.stage01_output_dir / IDENTIFIERS_MANIFEST_NAME
+    )
     output_path = project.paths.stage02_output_path
     identifiers_order_path = project.paths.identifiers_order_output_path
     dataset_uuid = uuid4()
@@ -232,10 +234,7 @@ def _format_mag_spread(row: object) -> str:
     mag_max = getattr(row, "mag_max", float("nan"))
     if any(math.isnan(v) for v in (mag_min, mag_p25, mag_p50, mag_p75, mag_max)):
         return "-"
-    return (
-        f"{mag_min:.1f}/{mag_p25:.1f}/{mag_p50:.1f}/"
-        f"{mag_p75:.1f}/{mag_max:.1f}"
-    )
+    return f"{mag_min:.1f}/{mag_p25:.1f}/{mag_p50:.1f}/{mag_p75:.1f}/{mag_max:.1f}"
 
 
 def _format_compact_mb(value: int) -> str:
@@ -252,7 +251,7 @@ def _format_teff(teff: float) -> str:
 def _format_identifiers(identifiers: tuple[tuple[str, object], ...]) -> str:
     if not identifiers:
         return "-"
-    by_key = {k: v for k, v in identifiers}
+    by_key = dict(identifiers)
     parts: list[str] = []
     proper_name = by_key.get("proper_name")
     if isinstance(proper_name, str) and proper_name.strip():
@@ -306,6 +305,7 @@ def _resolve_octree_source(source: str) -> OctreeSource:
             f"Octree file not found: {octree_path}. Run stage-02 first."
         )
     return octree_path
+
 
 def _resolve_meta_octree_source(
     octree_source: OctreeSource,
@@ -446,11 +446,11 @@ def _render_stats(console: Console, report: StatsReport, nearest_n: int) -> None
     help="Number of nearest stars to print.",
 )
 @click.option(
-        "--meta-octree",
-        type=str,
-        default=None,
-        help="Optional metadata octree path or URL for the Stage 03 `meta` sidecar.",
-    )
+    "--meta-octree",
+    type=str,
+    default=None,
+    help="Optional metadata octree path or URL for the Stage 03 `meta` sidecar.",
+)
 def stats(
     octree_source: str,
     point: str,

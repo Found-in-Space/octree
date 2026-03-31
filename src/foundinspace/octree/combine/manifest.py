@@ -3,7 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..assembly.formats import INDEX_FILE_HDR, INDEX_RECORD, MANIFEST_FORMAT, PAYLOAD_CODEC
+from ..assembly.formats import (
+    INDEX_FILE_HDR,
+    INDEX_RECORD,
+    MANIFEST_FORMAT,
+    PAYLOAD_CODEC,
+)
 from ..assembly.manifest import read_manifest_file, validate_shard
 from ..assembly.types import ShardKey
 

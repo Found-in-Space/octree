@@ -5,9 +5,17 @@ from uuid import UUID
 
 import pytest
 
-from combine_helpers import PayloadNode, build_intermediates, build_sidecar_intermediates
+from combine_helpers import (
+    PayloadNode,
+    build_intermediates,
+    build_sidecar_intermediates,
+)
 from foundinspace.octree.combine import CombinePlan, combine_octree
-from foundinspace.octree.combine.records import HEADER_FMT, HEADER_SIZE, PackedDescriptorFields
+from foundinspace.octree.combine.records import (
+    HEADER_FMT,
+    HEADER_SIZE,
+    PackedDescriptorFields,
+)
 from foundinspace.octree.reader import read_header
 
 
@@ -29,8 +37,12 @@ def test_combine_octree_is_deterministic(tmp_path) -> None:
         dataset_uuid=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
     )
 
-    combine_octree(manifest_path, out1, plan=CombinePlan(max_open_files=2), descriptor=descriptor)
-    combine_octree(manifest_path, out2, plan=CombinePlan(max_open_files=2), descriptor=descriptor)
+    combine_octree(
+        manifest_path, out1, plan=CombinePlan(max_open_files=2), descriptor=descriptor
+    )
+    combine_octree(
+        manifest_path, out2, plan=CombinePlan(max_open_files=2), descriptor=descriptor
+    )
 
     assert out1.read_bytes() == out2.read_bytes()
 
@@ -74,7 +86,15 @@ def test_manifest_identifier_mismatch_fails_fast(tmp_path) -> None:
 def test_combine_sidecar_writes_descriptor_metadata(tmp_path) -> None:
     manifest_path = build_sidecar_intermediates(
         tmp_path / "sidecar-intermediates",
-        [PayloadNode(level=0, node_id=0, star_count=1, raw_payload=b"", meta_entries=[{"source": "gaia", "source_id": "1"}])],
+        [
+            PayloadNode(
+                level=0,
+                node_id=0,
+                star_count=1,
+                raw_payload=b"",
+                meta_entries=[{"source": "gaia", "source_id": "1"}],
+            )
+        ],
         max_level=0,
     )
     out = tmp_path / "meta.octree"

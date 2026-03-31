@@ -5,7 +5,10 @@ from pathlib import Path
 from click.testing import CliRunner
 
 from foundinspace.octree._cli import cli
-from foundinspace.octree.assembly.formats import IDENTIFIERS_MANIFEST_NAME, RENDER_MANIFEST_NAME
+from foundinspace.octree.assembly.formats import (
+    IDENTIFIERS_MANIFEST_NAME,
+    RENDER_MANIFEST_NAME,
+)
 
 
 def _write_project(
@@ -21,13 +24,13 @@ def _write_project(
 format_version = 1
 
 [paths]
-merged_healpix_dir = "{(project_path.parent / 'merged').as_posix()}"
-identifiers_map_path = "{(project_path.parent / 'identifiers_map.parquet').as_posix()}"
-stage00_output_dir = "{(project_path.parent / 'stage00').as_posix()}"
+merged_healpix_dir = "{(project_path.parent / "merged").as_posix()}"
+identifiers_map_path = "{(project_path.parent / "identifiers_map.parquet").as_posix()}"
+stage00_output_dir = "{(project_path.parent / "stage00").as_posix()}"
 stage01_output_dir = "{stage01_dir.as_posix()}"
 stage02_output_path = "{output.as_posix()}"
 identifiers_order_output_path = "{identifiers_output.as_posix()}"
-stage03_output_dir = "{(project_path.parent / 'stage03').as_posix()}"
+stage03_output_dir = "{(project_path.parent / "stage03").as_posix()}"
 
 [stage00]
 batch_size = 1000000
@@ -35,7 +38,7 @@ v_mag = 6.5
 max_level = 14
 
 [stage01]
-input_glob = "{(project_path.parent / 'stage00' / '**' / '*.parquet').as_posix()}"
+input_glob = "{(project_path.parent / "stage00" / "**" / "*.parquet").as_posix()}"
 batch_size = 100000
 deep_shard_from_level = 99
 deep_prefix_bits = 3
@@ -69,7 +72,9 @@ def test_stage02_requires_project() -> None:
     assert "--project" in result.output
 
 
-def test_stage02_invokes_render_and_identifiers_outputs(monkeypatch, tmp_path: Path) -> None:
+def test_stage02_invokes_render_and_identifiers_outputs(
+    monkeypatch, tmp_path: Path
+) -> None:
     stage01_dir = tmp_path / "stage01"
     stage01_dir.mkdir()
     (stage01_dir / RENDER_MANIFEST_NAME).write_text("{}")
@@ -144,4 +149,7 @@ def test_stage02_invokes_render_and_identifiers_outputs(monkeypatch, tmp_path: P
     assert render_calls[0]["retain"] is True
     assert ident_calls[0]["manifest"] == stage01_dir / IDENTIFIERS_MANIFEST_NAME
     assert ident_calls[0]["output"] == identifiers_output
-    assert ident_calls[0]["parent_dataset_uuid"] == render_calls[0]["descriptor"].dataset_uuid
+    assert (
+        ident_calls[0]["parent_dataset_uuid"]
+        == render_calls[0]["descriptor"].dataset_uuid
+    )

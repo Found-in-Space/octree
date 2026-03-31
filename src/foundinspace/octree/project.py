@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import tomllib
 
 from .config import DEFAULT_DEEP_SHARD_FROM_LEVEL, DEFAULT_MAG_VIS, DEFAULT_MAX_LEVEL
 
@@ -26,7 +27,12 @@ _PATH_KEYS = {
     "stage03_output_dir",
 }
 _STAGE00_KEYS = {"batch_size", "v_mag", "max_level"}
-_STAGE01_KEYS = {"input_glob", "batch_size", "deep_shard_from_level", "deep_prefix_bits"}
+_STAGE01_KEYS = {
+    "input_glob",
+    "batch_size",
+    "deep_shard_from_level",
+    "deep_prefix_bits",
+}
 _STAGE02_KEYS = {"max_open_files"}
 _STAGE03_KEYS = {"sidecars"}
 _STAGE03_SIDECAR_KEYS = {"name", "fields"}
@@ -135,7 +141,9 @@ def _resolve_glob(project_dir: Path, value: str, *, field_name: str) -> str:
     return (project_dir / raw_path).as_posix()
 
 
-def _reject_unknown_keys(raw: dict[str, Any], *, allowed: set[str], table_name: str) -> None:
+def _reject_unknown_keys(
+    raw: dict[str, Any], *, allowed: set[str], table_name: str
+) -> None:
     unknown = sorted(set(raw) - allowed)
     if unknown:
         raise ValueError(f"Unknown key(s) in [{table_name}]: {', '.join(unknown)}")
@@ -296,12 +304,12 @@ def render_project_template() -> str:
         f'identifiers_order_output_path = "{identifiers_order_output_path}"\n'
         f'stage03_output_dir = "{stage03_output_dir}"\n\n'
         "[stage00]\n"
-        'batch_size = 1000000\n'
+        "batch_size = 1000000\n"
         f"v_mag = {DEFAULT_MAG_VIS}\n"
         f"max_level = {DEFAULT_MAX_LEVEL}\n\n"
         "[stage01]\n"
         f'input_glob = "{stage00_input_glob}"\n'
-        'batch_size = 100000\n'
+        "batch_size = 100000\n"
         f"deep_shard_from_level = {DEFAULT_DEEP_SHARD_FROM_LEVEL}\n"
         "deep_prefix_bits = 3\n\n"
         "[stage02]\n"

@@ -6,11 +6,16 @@ import pytest
 from click.testing import CliRunner
 
 from foundinspace.octree._cli import cli
-from foundinspace.octree.project import FORMAT_VERSION, load_project, render_project_template
+from foundinspace.octree.project import (
+    FORMAT_VERSION,
+    load_project,
+    render_project_template,
+)
 
 
 def _project_text(project_dir: Path) -> str:
-    return f"""
+    return (
+        """
 format_version = 1
 
 [paths]
@@ -41,7 +46,9 @@ max_open_files = 32
 [[stage03.sidecars]]
 name = "meta"
 fields = ["proper_name"]
-""".strip() + "\n"
+""".strip()
+        + "\n"
+    )
 
 
 def test_load_project_resolves_relative_paths_from_project_file_dir(

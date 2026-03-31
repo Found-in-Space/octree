@@ -1,148 +1,141 @@
 # found-in-space-octree
 
-CLI tools for building octree pipeline artifacts from parquet star catalogs.
+Part of [Found in Space](https://foundin.space/), a project that turns real astronomical measurements into interactive explorations of the solar neighbourhood.
 
-## CLI entrypoint
+This repository is the **spatial indexing pipeline**: it takes the merged star catalogue produced by [found-in-space-pipeline](https://github.com/Found-in-Space/pipeline) and converts it into streamable binary octree artifacts for use by the [SkyKit](https://github.com/Found-in-Space/skykit) viewer runtime.
 
-Use the installed CLI command:
+## Overview
+
+The pipeline runs in four stages:
+
+| Stage | Input | Output | Purpose |
+|-------|-------|--------|---------|
+| **Stage 00** | HEALPix-partitioned merged parquet | Enriched parquet with `morton_code`, `render`, `level` | Per-row enrichment; isolates the expensive computation |
+| **Stage 01** | Stage 00 parquet | Render + identifiers-order shard pairs and manifests | Converts row-oriented data into bounded-memory intermediates |
+| **Stage 02** | Stage 01 manifests | `stars.octree` + `identifiers.order` | Assembles the final base dataset package |
+| **Stage 03** | Stage 02 outputs | Named sidecar files (e.g. `meta`) | Enriches the base dataset with optional sidecar families |
+
+Each render octree carries a `dataset_uuid`. Sidecars carry a `parent_dataset_uuid` so readers can validate the pairing before opening them.
+
+## Installation
+
+Requires Python ≥ 3.13. From the project root:
+
+```bash
+uv sync
+```
+
+## CLI
+
+Entry point: **`fis-octree`** (or `python -m foundinspace.octree`).
 
 ```bash
 uv run fis-octree --help
 ```
 
-## Stage 00: per-pixel streaming enrichment
+### Project configuration
 
-Stage 00 reads HEALPix-sharded merge output and writes enriched parquet for Stage 01.
+All build stages require an explicit TOML project file:
 
-For each HEALPix pixel directory, Stage 00:
+```bash
+uv run fis-octree project init project.toml
+uv run fis-octree stage-00 --project project.toml
+uv run fis-octree stage-01 --project project.toml
+uv run fis-octree stage-02 --project project.toml
+uv run fis-octree stage-03 --project project.toml
+```
 
-1. Streams input rows in batches (default `1_000_000`)
-2. Computes `morton_code`, `render`, and `level`
-3. Writes locally sorted (by `morton_code, mag_abs`) parquet shards (~1 GB each)
-
-Input files are never modified in-place.
-
-**Stage 00 contract at a glance**
-
-- **Input**: HEALPix-sharded merged parquet (configured in the project file)
-- **Required columns**: `x_icrs_pc`, `y_icrs_pc`, `z_icrs_pc`, `mag_abs`
-- **Output**: enriched parquet in the project-configured Stage 00 output directory with `morton_code`, `render`, `level` added
-- **Why it exists**: isolate expensive per-row enrichment into a streaming pass before cell/shard assembly
-
-### Project bootstrap
+Generate a starter config:
 
 ```bash
 uv run fis-octree project init project.toml
 ```
 
-`project init` writes a complete starter TOML using built-in defaults. It does not read environment variables or expand them into the generated file.
+Paths in the project file may be absolute or relative to the project file's directory. Environment variable expansion is not supported in TOML values.
 
-### Basic usage
+### Querying an octree
 
-```bash
-uv run fis-octree stage-00 --project project.toml
-```
+The `stats` command reads a finished `stars.octree` — either from a local path or a URL — and reports level-by-level statistics and the nearest stars to any query point:
 
 ```bash
-uv run fis-octree stage-00 --project project.toml --force
+uv run fis-octree stats path/to/stars.octree
+uv run fis-octree stats https://example.com/stars.octree --nearest 20 --radius 25
+uv run fis-octree stats stars.octree --meta-octree meta.octree --point "8.6,0,0"
 ```
 
-## Stage 01: build intermediates
+## Runtime configuration
 
-Stage 01 reads Stage 00 parquet files and produces:
+DuckDB memory and threading behaviour can be tuned at runtime via environment variables (or a `.env` file in the project root). All are optional:
 
-- render shard `.index` / `.payload` files
-- identifiers-order shard `.index` / `.payload` files
-- `render-manifest.json`
-- `identifiers-manifest.json`
+| Variable | DuckDB setting | Example |
+|---|---|---|
+| `DUCKDB_TEMP_DIR` | `temp_directory` | `/mnt/scratch/duckdb` |
+| `DUCKDB_MAX_TEMP_DIRECTORY_SIZE` | `max_temp_directory_size` | `50GB` |
+| `DUCKDB_MEMORY_LIMIT` | `memory_limit` | `16GB` |
+| `DUCKDB_THREADS` | `threads` | `4` |
+| `DUCKDB_PRESERVE_INSERTION_ORDER` | `preserve_insertion_order` | `false` |
 
-**Stage 01 contract at a glance**
+## Code layout
 
-- **Input**: Stage 00 parquet with precomputed `morton_code`, `render`, `level`, `mag_abs`
-- **Core operation**: stream rows grouped by target cell and encode both render bytes and canonical `(source, source_id)` ordering per `(level, node_id)`
-- **Output layout**: append-only shard pairs for render and identifiers/order plus authoritative paired manifests
-- **Why it exists**: convert row-oriented parquet into bounded-memory intermediates used by Stage 02 render assembly and Stage 02 `identifiers/order` assembly
+```
+src/foundinspace/octree/
+  _cli.py             # Click root; stage-00, stage-01, stage-02, stage-03, stats, project subcommands
+  project.py          # TOML project file loading and validation
+  config.py           # Build defaults (world size, Morton bits, max level)
+  mag_levels.py       # Magnitude/level threshold calculations
+  duckdb_util.py      # Shared DuckDB connection helper with env-variable tuning
+  sources/            # Stage 00 — per-pixel enrichment (Morton code, render level)
+  assembly/           # Stage 01 — shard assembly, manifests, build plan
+  combine/            # Stage 02 — octree combine (DFS traversal, lookup, records)
+  identifiers_order.py # Stage 02 — identifiers.order artifact assembly
+  stage3.py           # Stage 03 — named sidecar families
+  encoding/           # Morton code and Teff encoding utilities
+  reader/             # Binary octree reader (header, index, payload, stats)
+```
 
-### Basic usage
+## Detailed stage documentation
+
+Full specifications, invariants, and binary layouts:
+
+- [`docs/stage-00.md`](docs/stage-00.md)
+- [`docs/stage-01.md`](docs/stage-01.md)
+- [`docs/stage-02.md`](docs/stage-02.md)
+- [`docs/stage-03.md`](docs/stage-03.md)
+- [`docs/sidecars.md`](docs/sidecars.md)
+- [`docs/identifiers-order.md`](docs/identifiers-order.md)
+- [`docs/reader.md`](docs/reader.md)
+- [`docs/glow.md`](docs/glow.md)
+- [`docs/roadmap.md`](docs/roadmap.md)
+
+## Tests
 
 ```bash
-uv run fis-octree stage-01 --project project.toml
+uv run pytest
 ```
 
-Project-file paths may be absolute or relative to the project file location. Build commands do not expand environment variables from TOML values.
+Tests live under `tests/` and cover stage CLIs, assembly, combine phases, reader stats, and binary format encoding.
 
-### Shard tuning
+## Development
+
+Install the development dependencies and git hooks:
 
 ```bash
-# edit project.toml:
-# [stage01]
-# deep_shard_from_level = 8
-# deep_prefix_bits = 3
+uv sync
+uv run pre-commit install
 ```
 
-## Stage 02: package the base dataset
-
-Stage 02 reads Stage 01’s paired manifests and writes the base dataset package:
-
-- `stars.octree`
-- `identifiers.order`
-
-**Stage 02 contract at a glance**
-
-- **Input**: `render-manifest.json`, `identifiers-manifest.json`, and all referenced shard files
-- **Core operation**: assemble the render octree, emit a matching `dataset_uuid`, and combine the canonical identifiers/order companion artifact for the same dataset
-- **Output**: final `stars.octree` plus `identifiers.order`
-- **Why it exists**: publish one UUID-bound base dataset package without global in-memory materialization
+Run the linter and formatter manually:
 
 ```bash
-uv run fis-octree stage-02 --project project.toml
+uv run pre-commit run --all-files
 ```
 
-## Stage 03: named sidecars
+## Related repositories
 
-Stage 03 reads the Stage 02 base dataset package and builds one or more named sidecar families.
+- [found-in-space-pipeline](https://github.com/Found-in-Space/pipeline) — data pipeline producing the merged parquet input for this repo
+- [skykit](https://github.com/Found-in-Space/skykit) — viewer runtime that streams and renders the octree artifacts
+- [Found in Space](https://foundin.space/) — the interactive astronomy explorer this all feeds into
 
-The first implemented family is `meta`.
+## License
 
-```bash
-uv run fis-octree stage-03 --project project.toml
-uv run fis-octree stage-03 --project project.toml --family meta
-```
-
-Each final octree now carries a mandatory descriptor block immediately after the STAR header:
-
-- render octrees carry `dataset_uuid`
-- sidecars carry `parent_dataset_uuid`, `sidecar_uuid`, and `sidecar_kind`
-
-This lets readers validate sidecars by dataset identity before falling back to geometry checks.
-
-## Project configuration
-
-Operational octree build commands now use an explicit TOML project file via `--project path/to/project.toml`.
-
-Project-file paths may be absolute or relative to the project file directory. TOML values do not support environment-variable expansion.
-
-## Detailed stage docs
-
-For full specifications, invariants, and binary layouts:
-
-- `docs/stage-00.md`
-- `docs/stage-01.md`
-- `docs/stage-02.md`
-- `docs/stage-03.md`
-- `docs/sidecars.md`
-- `docs/identifiers-order.md`
-- `docs/reader.md` (query/read behavior for `stars.octree`)
-- `docs/roadmap.md`
-
-## Help
-
-Show command help:
-
-```bash
-uv run fis-octree --help
-uv run fis-octree stage-00 --help
-uv run fis-octree stage-01 --help
-uv run fis-octree stage-02 --help
-uv run fis-octree stage-03 --help
-```
+MIT — see [LICENSE](LICENSE).

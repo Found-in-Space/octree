@@ -73,9 +73,7 @@ def _make_project(tmp_path: Path) -> OctreeProject:
     payload = b"".join(
         [
             _encode_star(x_rel=0.0, y_rel=0.0, z_rel=0.0, abs_mag=4.8, teff_log8=128),
-            _encode_star(
-                x_rel=1.0e-5, y_rel=0.0, z_rel=0.0, abs_mag=5.0, teff_log8=80
-            ),
+            _encode_star(x_rel=1.0e-5, y_rel=0.0, z_rel=0.0, abs_mag=5.0, teff_log8=80),
         ]
     )
     node = PayloadNode(
@@ -169,7 +167,9 @@ def _make_project(tmp_path: Path) -> OctreeProject:
     )
 
 
-def test_build_stage03_sidecars_writes_meta_sidecar_and_manifest(tmp_path: Path) -> None:
+def test_build_stage03_sidecars_writes_meta_sidecar_and_manifest(
+    tmp_path: Path,
+) -> None:
     project = _make_project(tmp_path)
 
     manifest_path = build_stage03_sidecars(project)
@@ -204,11 +204,15 @@ def test_build_stage03_sidecars_writes_meta_sidecar_and_manifest(tmp_path: Path)
     assert second.get("hip_id") == 71683
 
 
-def test_build_stage03_sidecars_rebuilds_with_fresh_sidecar_uuid(tmp_path: Path) -> None:
+def test_build_stage03_sidecars_rebuilds_with_fresh_sidecar_uuid(
+    tmp_path: Path,
+) -> None:
     project = _make_project(tmp_path)
 
     build_stage03_sidecars(project)
-    first_uuid = read_header(project.paths.stage03_output_dir / "meta.octree").sidecar_uuid
+    first_uuid = read_header(
+        project.paths.stage03_output_dir / "meta.octree"
+    ).sidecar_uuid
 
     build_stage03_sidecars(project, family_name="meta")
     second_uuid = read_header(

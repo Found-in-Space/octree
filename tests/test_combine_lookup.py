@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from combine_helpers import PayloadNode, build_intermediates
-from foundinspace.octree.assembly.formats import INDEX_FILE_HDR, INDEX_MAGIC, INDEX_RECORD
+from foundinspace.octree.assembly.formats import (
+    INDEX_FILE_HDR,
+    INDEX_MAGIC,
+    INDEX_RECORD,
+)
 from foundinspace.octree.combine.lookup import (
     FileHandleCache,
     FixedRecordFile,

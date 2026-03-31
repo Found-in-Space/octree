@@ -130,13 +130,16 @@ class IdentifiersOrderReader:
             if len(payload) != payload_length:
                 raise ValueError("Identifiers/order payload truncated")
             identities = decode_identity_rows(payload, star_count=star_count)
-            yield IdentifiersOrderRecord(
-                level=level,
-                node_id=node_id,
-                star_count=star_count,
-                payload_offset=payload_offset,
-                payload_length=payload_length,
-            ), identities
+            yield (
+                IdentifiersOrderRecord(
+                    level=level,
+                    node_id=node_id,
+                    star_count=star_count,
+                    payload_offset=payload_offset,
+                    payload_length=payload_length,
+                ),
+                identities,
+            )
             next_dir_offset = (
                 self.header.directory_offset + (idx + 1) * DIRECTORY_RECORD_SIZE
             )
@@ -170,7 +173,12 @@ def combine_identifiers_order(
                 )
                 try:
                     with open(shard.payload_path, "rb") as shard_payload_fp:
-                        for node_id, pay_off, pay_len, star_count in index_file.iter_records():
+                        for (
+                            node_id,
+                            pay_off,
+                            pay_len,
+                            star_count,
+                        ) in index_file.iter_records():
                             shard_payload_fp.seek(pay_off)
                             compressed = shard_payload_fp.read(pay_len)
                             if len(compressed) != pay_len:

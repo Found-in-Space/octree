@@ -54,7 +54,9 @@ def read_header_from_reader(fp: SeekableBinaryReader) -> OctreeHeader:
         _reserved,
     ) = HEADER_FMT.unpack(header_bytes)
     if magic != HEADER_MAGIC:
-        raise ValueError(f"Invalid STAR magic: expected {HEADER_MAGIC!r}, got {magic!r}")
+        raise ValueError(
+            f"Invalid STAR magic: expected {HEADER_MAGIC!r}, got {magic!r}"
+        )
     if version != HEADER_VERSION:
         raise ValueError(
             f"Unsupported STAR version: expected {HEADER_VERSION}, got {version}"

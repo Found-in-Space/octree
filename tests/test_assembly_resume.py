@@ -14,11 +14,14 @@ from foundinspace.octree.assembly.formats import (
     RENDER_ARTIFACT_KIND,
     RENDER_MANIFEST_NAME,
 )
-from foundinspace.octree.assembly.manifest import write_manifest
 from foundinspace.octree.assembly.identity_encoder import encode_identity_rows
+from foundinspace.octree.assembly.manifest import write_manifest
 from foundinspace.octree.assembly.plan import BuildPlan
 from foundinspace.octree.assembly.types import CellKey, EncodedCell, ShardKey
-from foundinspace.octree.assembly.writer import IntermediateShardWriter, identifiers_shard_filenames
+from foundinspace.octree.assembly.writer import (
+    IntermediateShardWriter,
+    identifiers_shard_filenames,
+)
 
 
 def _make_entry(tmp_path, *, level: int, prefix_bits: int, prefix: int) -> dict:
@@ -36,7 +39,9 @@ def _make_entry(tmp_path, *, level: int, prefix_bits: int, prefix: int) -> dict:
     return entry
 
 
-def _make_identifiers_entry(tmp_path, *, level: int, prefix_bits: int, prefix: int) -> dict:
+def _make_identifiers_entry(
+    tmp_path, *, level: int, prefix_bits: int, prefix: int
+) -> dict:
     shard = ShardKey(level=level, prefix_bits=prefix_bits, prefix=prefix)
     writer = IntermediateShardWriter(
         shard,

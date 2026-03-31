@@ -39,10 +39,14 @@ def test_relocate_payloads_writes_payloads_and_relocation(tmp_path) -> None:
 
     with open(out, "wb") as fp:
         fp.write(b"\x00" * 64)
-        result = relocate_payloads_dfs(manifest_path, fp, plan=CombinePlan(max_open_files=2))
+        result = relocate_payloads_dfs(
+            manifest_path, fp, plan=CombinePlan(max_open_files=2)
+        )
 
     payload_bytes = out.read_bytes()[64 : result.payload_end_offset]
-    expected = b"".join(gzip.compress(n.raw_payload) for n in [nodes[0], nodes[1], nodes[2]])
+    expected = b"".join(
+        gzip.compress(n.raw_payload) for n in [nodes[0], nodes[1], nodes[2]]
+    )
     assert payload_bytes == expected
     assert len(result.relocation_files) == 2
 

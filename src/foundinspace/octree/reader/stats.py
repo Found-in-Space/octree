@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import gzip
 import json
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
-from typing import Iterator
 
 import numpy as np
 
@@ -351,9 +351,10 @@ def _open_meta_reader(
             f"({metadata_path})"
         )
 
-    with IndexNavigator(metadata_path, meta_header) as nav, open_octree_source(
-        metadata_path
-    ) as fp:
+    with (
+        IndexNavigator(metadata_path, meta_header) as nav,
+        open_octree_source(metadata_path) as fp,
+    ):
         yield _MetaReader(nav=nav, fp=fp)
 
 
@@ -387,7 +388,9 @@ def _decode_meta_entries(
     return out
 
 
-def _push_children(nav: IndexNavigator, stack: list[NodeEntry], node: NodeEntry) -> None:
+def _push_children(
+    nav: IndexNavigator, stack: list[NodeEntry], node: NodeEntry
+) -> None:
     for octant in range(7, -1, -1):
         if (node.child_mask & (1 << octant)) == 0:
             continue

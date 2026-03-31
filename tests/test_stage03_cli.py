@@ -13,13 +13,13 @@ def _write_project(project_path: Path) -> None:
 format_version = 1
 
 [paths]
-merged_healpix_dir = "{(project_path.parent / 'merged').as_posix()}"
-identifiers_map_path = "{(project_path.parent / 'identifiers_map.parquet').as_posix()}"
-stage00_output_dir = "{(project_path.parent / 'stage00').as_posix()}"
-stage01_output_dir = "{(project_path.parent / 'stage01').as_posix()}"
-stage02_output_path = "{(project_path.parent / 'stars.octree').as_posix()}"
-identifiers_order_output_path = "{(project_path.parent / 'identifiers.order').as_posix()}"
-stage03_output_dir = "{(project_path.parent / 'stage03').as_posix()}"
+merged_healpix_dir = "{(project_path.parent / "merged").as_posix()}"
+identifiers_map_path = "{(project_path.parent / "identifiers_map.parquet").as_posix()}"
+stage00_output_dir = "{(project_path.parent / "stage00").as_posix()}"
+stage01_output_dir = "{(project_path.parent / "stage01").as_posix()}"
+stage02_output_path = "{(project_path.parent / "stars.octree").as_posix()}"
+identifiers_order_output_path = "{(project_path.parent / "identifiers.order").as_posix()}"
+stage03_output_dir = "{(project_path.parent / "stage03").as_posix()}"
 
 [stage00]
 batch_size = 1000000
@@ -27,7 +27,7 @@ v_mag = 6.5
 max_level = 14
 
 [stage01]
-input_glob = "{(project_path.parent / 'stage00' / '**' / '*.parquet').as_posix()}"
+input_glob = "{(project_path.parent / "stage00" / "**" / "*.parquet").as_posix()}"
 batch_size = 100000
 deep_shard_from_level = 99
 deep_prefix_bits = 3
@@ -75,7 +75,9 @@ def test_stage03_invokes_sidecar_builder(monkeypatch, tmp_path: Path) -> None:
         )
         return tmp_path / "stage03" / "manifest.json"
 
-    monkeypatch.setattr("foundinspace.octree.stage3.build_stage03_sidecars", _fake_build)
+    monkeypatch.setattr(
+        "foundinspace.octree.stage3.build_stage03_sidecars", _fake_build
+    )
 
     runner = CliRunner()
     result = runner.invoke(

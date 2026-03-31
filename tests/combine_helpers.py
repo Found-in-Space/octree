@@ -94,7 +94,11 @@ def build_sidecar_intermediates(
             filename_fn=sidecar_shard_filenames(sidecar_kind),
         )
         for node in sorted(level_nodes, key=lambda n: n.node_id):
-            meta_entries = node.meta_entries if node.meta_entries is not None else [{}] * node.star_count
+            meta_entries = (
+                node.meta_entries
+                if node.meta_entries is not None
+                else [{}] * node.star_count
+            )
             writer.write_cell(
                 EncodedCell(
                     key=CellKey(level=node.level, node_id=node.node_id),

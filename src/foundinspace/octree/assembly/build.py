@@ -11,9 +11,9 @@ from .formats import (
     IDENTIFIERS_ARTIFACT_KIND,
     IDENTIFIERS_INDEX_MAGIC,
     IDENTIFIERS_MANIFEST_NAME,
+    INDEX_MAGIC,
     RENDER_ARTIFACT_KIND,
     RENDER_MANIFEST_NAME,
-    INDEX_MAGIC,
 )
 from .identity_encoder import iter_encoded_cells_with_identities
 from .manifest import manifest_entries, read_manifest, validate_shard, write_manifest
@@ -50,10 +50,14 @@ def _load_existing_manifest_entries(
 
     if render_manifest is None and identifiers_manifest is None:
         if any(out_dir.iterdir()):
-            raise FileExistsError(f"Output directory is not empty and has no manifest: {out_dir}")
+            raise FileExistsError(
+                f"Output directory is not empty and has no manifest: {out_dir}"
+            )
         return [], [], set()
     if render_manifest is None or identifiers_manifest is None:
-        raise ValueError("Stage 01 resume requires both render and identifiers manifests")
+        raise ValueError(
+            "Stage 01 resume requires both render and identifiers manifests"
+        )
 
     render_entries_list = manifest_entries(render_manifest)
     identifiers_entries_list = manifest_entries(identifiers_manifest)
@@ -82,7 +86,9 @@ def _load_existing_manifest_entries(
         for entry in identifiers_entries_list
     }
     if set(render_by_shard) != set(identifiers_by_shard):
-        raise ValueError("Render and identifiers manifests contain different completed shards")
+        raise ValueError(
+            "Render and identifiers manifests contain different completed shards"
+        )
 
     completed_shards: set[tuple[int, int, int]] = set()
     for shard_key in sorted(render_by_shard):
@@ -195,7 +201,10 @@ def build_intermediates(
                         raise ValueError(
                             "Render / identifiers shard presence mismatch during Stage 01"
                         )
-                    if render_manifest["record_count"] != identifiers_manifest["record_count"]:
+                    if (
+                        render_manifest["record_count"]
+                        != identifiers_manifest["record_count"]
+                    ):
                         raise ValueError(
                             "Render / identifiers shard record_count mismatch: "
                             f"{render_manifest['record_count']} != "

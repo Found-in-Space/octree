@@ -29,7 +29,9 @@ def test_write_final_shard_index_writes_shard_block(tmp_path) -> None:
     out = tmp_path / "out.octree"
     with open(out, "wb") as fp:
         fp.write(b"\x00" * 64)
-        phase_a = relocate_payloads_dfs(manifest_path, fp, plan=CombinePlan(max_open_files=2))
+        phase_a = relocate_payloads_dfs(
+            manifest_path, fp, plan=CombinePlan(max_open_files=2)
+        )
         phase_b = write_final_shard_index(
             manifest_path,
             phase_a.relocation_files,
@@ -71,7 +73,9 @@ def test_write_final_shard_index_node_count_limit(monkeypatch, tmp_path) -> None
             payload=None,
             children=(),
         )
-        monkeypatch.setattr(p, "_build_shard_nodes", lambda *args, **kwargs: [fake_node] * 65536)
+        monkeypatch.setattr(
+            p, "_build_shard_nodes", lambda *args, **kwargs: [fake_node] * 65536
+        )
         with pytest.raises(ValueError, match="node_count exceeds u16"):
             p.write_final_shard_index(
                 manifest_path,
@@ -129,7 +133,9 @@ def test_shard_node_ordering_is_deterministic_and_path_sorted(tmp_path) -> None:
     out = tmp_path / "out.octree"
     with open(out, "wb") as fp:
         fp.write(b"\x00" * 64)
-        phase_a = relocate_payloads_dfs(manifest_path, fp, plan=CombinePlan(max_open_files=2))
+        phase_a = relocate_payloads_dfs(
+            manifest_path, fp, plan=CombinePlan(max_open_files=2)
+        )
         phase_b = write_final_shard_index(
             manifest_path,
             phase_a.relocation_files,
@@ -142,7 +148,9 @@ def test_shard_node_ordering_is_deterministic_and_path_sorted(tmp_path) -> None:
     node_table_offset = shard_hdr[22]
     keys: list[tuple[int, int]] = []
     for i in range(node_count):
-        rec = SHARD_NODE_FMT.unpack_from(data, node_table_offset + i * SHARD_NODE_FMT.size)
+        rec = SHARD_NODE_FMT.unpack_from(
+            data, node_table_offset + i * SHARD_NODE_FMT.size
+        )
         local_path = rec[1]
         local_depth = rec[3]
         keys.append((local_depth, local_path))

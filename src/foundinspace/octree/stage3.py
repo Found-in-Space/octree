@@ -6,15 +6,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from .assembly.formats import SIDECAR_ARTIFACT_KIND, SIDECAR_INDEX_MAGIC, SIDECAR_MANIFEST_FORMAT
+from .assembly.formats import (
+    SIDECAR_ARTIFACT_KIND,
+    SIDECAR_INDEX_MAGIC,
+    SIDECAR_MANIFEST_FORMAT,
+)
 from .assembly.manifest import write_manifest
 from .assembly.meta_encoder import IdentifiersMap, build_meta_payload
 from .assembly.plan import BuildPlan
 from .assembly.types import CellKey, EncodedCell
-from .assembly.writer import IntermediateShardWriter, belongs_to_shard, sidecar_shard_filenames
+from .assembly.writer import (
+    IntermediateShardWriter,
+    belongs_to_shard,
+    sidecar_shard_filenames,
+)
 from .combine import CombinePlan, combine_octree
 from .combine.records import PackedDescriptorFields
-from .identifiers_order import IdentifiersOrderReader, read_header as read_identifiers_order_header
+from .identifiers_order import IdentifiersOrderReader
+from .identifiers_order import read_header as read_identifiers_order_header
 from .project import OctreeProject, SidecarProjectConfig
 from .reader import read_header
 
@@ -24,7 +33,9 @@ class _MetaBuilder:
     ident_map: IdentifiersMap
 
     @classmethod
-    def from_project(cls, project: OctreeProject, config: SidecarProjectConfig) -> _MetaBuilder:
+    def from_project(
+        cls, project: OctreeProject, config: SidecarProjectConfig
+    ) -> _MetaBuilder:
         return cls(
             ident_map=IdentifiersMap(
                 project.paths.identifiers_map_path,

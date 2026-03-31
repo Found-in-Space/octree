@@ -14,7 +14,9 @@ from foundinspace.octree.sources.add_shard_columns import run_enrich_healpix
 
 def _write_parquet(df: pd.DataFrame, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), str(path), compression="zstd")
+    pq.write_table(
+        pa.Table.from_pandas(df, preserve_index=False), str(path), compression="zstd"
+    )
 
 
 def _build_input_tree(root: Path) -> None:
@@ -90,10 +92,14 @@ def test_run_enrich_healpix_per_pixel_non_destructive_and_resumable(tmp_path: Pa
         assert {"morton_code", "render", "level", "mag_abs"}.issubset(out_df.columns)
         assert out_df["render"].map(len).eq(16).all()
 
-        sorted_index = out_df[["morton_code", "mag_abs"]].sort_values(
-            ["morton_code", "mag_abs"],
-            kind="mergesort",
-        ).index.to_numpy()
+        sorted_index = (
+            out_df[["morton_code", "mag_abs"]]
+            .sort_values(
+                ["morton_code", "mag_abs"],
+                kind="mergesort",
+            )
+            .index.to_numpy()
+        )
         assert np.array_equal(sorted_index, np.arange(len(out_df)))
 
     # Rerun should skip completed pixels.

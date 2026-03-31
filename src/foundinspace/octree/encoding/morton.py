@@ -16,7 +16,7 @@ def _spread21(v: np.ndarray) -> np.ndarray:
     Expand 21 low bits of v so they occupy every 3rd bit in a uint64.
     Result uses bit positions 0,3,6,9,...
 
-    Note: _spread21 still assumes 21-bit spreading (the bit-magic constants are fixed for that depth). 
+    Note: _spread21 still assumes 21-bit spreading (the bit-magic constants are fixed for that depth).
     If MORTON_BITS is changed, this function must be updated.
     """
     mask = np.uint64((1 << DEPTH) - 1)

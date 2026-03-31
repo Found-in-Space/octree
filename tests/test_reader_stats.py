@@ -6,16 +6,20 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
-import foundinspace.octree.reader.source as reader_source
 
-from combine_helpers import PayloadNode, build_intermediates, build_sidecar_intermediates
+import foundinspace.octree.reader.source as reader_source
+from combine_helpers import (
+    PayloadNode,
+    build_intermediates,
+    build_sidecar_intermediates,
+)
 from foundinspace.octree.combine import CombinePlan, combine_octree
 from foundinspace.octree.combine.records import (
     DESCRIPTOR_SIZE,
     HEADER_SIZE,
+    SHARD_MAGIC,
     PackedDescriptorFields,
     PackedHeaderFields,
-    SHARD_MAGIC,
     pack_descriptor,
     pack_top_level_header,
 )
@@ -53,7 +57,9 @@ def _build_small_octree(tmp_path: Path) -> Path:
             _encode_star(
                 x_rel=1.0e-5, y_rel=0.0, z_rel=0.0, abs_mag=12.0, teff_log8=80
             ),
-            _encode_star(x_rel=5.0e-5, y_rel=0.0, z_rel=0.0, abs_mag=5.0, teff_log8=255),
+            _encode_star(
+                x_rel=5.0e-5, y_rel=0.0, z_rel=0.0, abs_mag=5.0, teff_log8=255
+            ),
         ]
     )
     manifest_path = build_intermediates(
@@ -82,7 +88,9 @@ def _build_small_octree_with_meta(tmp_path: Path) -> tuple[Path, Path]:
             _encode_star(
                 x_rel=1.0e-5, y_rel=0.0, z_rel=0.0, abs_mag=12.0, teff_log8=80
             ),
-            _encode_star(x_rel=5.0e-5, y_rel=0.0, z_rel=0.0, abs_mag=5.0, teff_log8=255),
+            _encode_star(
+                x_rel=5.0e-5, y_rel=0.0, z_rel=0.0, abs_mag=5.0, teff_log8=255
+            ),
         ]
     )
     render_manifest_path = build_intermediates(

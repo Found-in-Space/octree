@@ -9,6 +9,7 @@ Stage 00 processes one HEALPix pixel directory at a time:
 
 Input files are never modified in place.
 """
+
 from __future__ import annotations
 
 import shutil
@@ -34,15 +35,18 @@ from foundinspace.octree.encoding.teff import encode_teff
 from foundinspace.octree.mag_levels import MagLevelConfig
 
 # Numpy dtypes for vectorized pack/unpack (16-byte render, 10-byte meta)
-_RENDER_DT = np.dtype([
-    ("x", "<f4"),
-    ("y", "<f4"),
-    ("z", "<f4"),
-    ("mag", "<i2"),
-    ("teff", "u1"),
-    ("pad", "u1"),
-])
+_RENDER_DT = np.dtype(
+    [
+        ("x", "<f4"),
+        ("y", "<f4"),
+        ("z", "<f4"),
+        ("mag", "<i2"),
+        ("teff", "u1"),
+        ("pad", "u1"),
+    ]
+)
 assert _RENDER_DT.itemsize == 16
+
 
 def _compute_render_and_level(
     morton_code: np.ndarray,
@@ -100,7 +104,9 @@ def _compute_render_and_level(
         render_out[indices_level] = rec
 
     render_bytes = np.ascontiguousarray(render_out.view(np.uint8).reshape(n, 16))
-    assert render_bytes.flags["C_CONTIGUOUS"], "render buffer must be C-contiguous for pa.py_buffer"
+    assert render_bytes.flags["C_CONTIGUOUS"], (
+        "render buffer must be C-contiguous for pa.py_buffer"
+    )
     return render_bytes, level_arr
 
 
@@ -110,9 +116,7 @@ def _make_fixed_size_binary_column(render: np.ndarray) -> pa.Array:
     """
     n = len(render)
     ty = pa.binary(16)
-    return pa.FixedSizeBinaryArray.from_buffers(
-        ty, n, [None, pa.py_buffer(render)]
-    )
+    return pa.FixedSizeBinaryArray.from_buffers(ty, n, [None, pa.py_buffer(render)])
 
 
 def _compression_from_metadata(file_meta) -> str:
@@ -146,7 +150,9 @@ def _resolve_mag_config(
 
 
 def _is_pixel_complete(pixel_output_dir: Path) -> bool:
-    return (pixel_output_dir / ".complete").exists() or any(pixel_output_dir.glob("*.parquet"))
+    return (pixel_output_dir / ".complete").exists() or any(
+        pixel_output_dir.glob("*.parquet")
+    )
 
 
 def _pixel_dirs(src_root: Path) -> list[Path]:
@@ -194,7 +200,9 @@ def _sort_and_write_pixel_runs(
     tmp_output_dir.rename(pixel_output_dir)
     out_files = len(list(pixel_output_dir.glob("*.parquet")))
     if verbose:
-        print(f"  merged {len(list(pixel_tmp_dir.glob('*.parquet')))} runs -> {out_files} shard(s)")
+        print(
+            f"  merged {len(list(pixel_tmp_dir.glob('*.parquet')))} runs -> {out_files} shard(s)"
+        )
     return out_files
 
 

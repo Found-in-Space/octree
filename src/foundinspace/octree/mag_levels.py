@@ -3,11 +3,12 @@
 Derived from v_mag (indexing magnitude) and world_half_size (root half-width).
 Replaces the former mag_levels.yaml and R_vis formula paths.
 """
+
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator
 
 import numpy as np
 
@@ -19,7 +20,7 @@ class Level:
     id: int
     m_min: float
     m_max: float
-    
+
     @property
     def steps_at_level(self) -> int:
         """Return the number of steps per axis at this level."""
@@ -63,21 +64,19 @@ class MagLevelConfig:
         if self._levels_cache is not None:
             return self._levels_cache
         levels: list[Level] = []
-        L = 0
+        level_id = 0
         m_prev = -math.inf
         while True:
-            m_curr = _mag_threshold_at_level(
-                self.v_mag, self.world_half_size, L
-            )
-            if self.max_level is not None and L == self.max_level:
-                levels.append(Level(id=L, m_min=m_prev, m_max=math.inf))
+            m_curr = _mag_threshold_at_level(self.v_mag, self.world_half_size, level_id)
+            if self.max_level is not None and self.max_level == level_id:
+                levels.append(Level(id=level_id, m_min=m_prev, m_max=math.inf))
                 break
             if self.max_level is None and m_curr > _FAINT_MAG_LIMIT:
-                levels.append(Level(id=L, m_min=m_prev, m_max=math.inf))
+                levels.append(Level(id=level_id, m_min=m_prev, m_max=math.inf))
                 break
-            levels.append(Level(id=L, m_min=m_prev, m_max=m_curr))
+            levels.append(Level(id=level_id, m_min=m_prev, m_max=m_curr))
             m_prev = m_curr
-            L += 1
+            level_id += 1
         self._levels_cache = levels
         return levels
 

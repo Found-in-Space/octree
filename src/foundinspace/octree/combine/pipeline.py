@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from pathlib import Path
-import time
 from typing import BinaryIO
 
 from .dfs import iter_cells_dfs
@@ -120,7 +120,10 @@ class _RelocAppender:
         with open(self.path, "ab") as fp:
             fp.write(
                 RELOC_RECORD_FMT.pack(
-                    int(node_id), int(output_offset), int(payload_length), int(star_count)
+                    int(node_id),
+                    int(output_offset),
+                    int(payload_length),
+                    int(star_count),
                 )
             )
         self.count += 1
@@ -179,9 +182,7 @@ def combine_octree(
             )
         )
         out_fp.write(pack_descriptor(descriptor))
-        payload_result = relocate_payloads_dfs(
-            manifest_path, out_fp, plan=plan
-        )
+        payload_result = relocate_payloads_dfs(manifest_path, out_fp, plan=plan)
         print(
             (
                 "Combine: Phase A complete "
@@ -231,7 +232,10 @@ def combine_octree(
             flush=True,
         )
     else:
-        print("Combine: retained relocation files (--retain-relocation-files).", flush=True)
+        print(
+            "Combine: retained relocation files (--retain-relocation-files).",
+            flush=True,
+        )
 
     print(
         f"Combine: done in {time.perf_counter() - t0:.1f}s.",
@@ -279,7 +283,10 @@ def relocate_payloads_dfs(
         copied_cells += 1
         copied_bytes += int(cell.payload_length)
         now = time.perf_counter()
-        if copied_cells >= next_report_cell or now - last_report_t >= progress_every_seconds:
+        if (
+            copied_cells >= next_report_cell
+            or now - last_report_t >= progress_every_seconds
+        ):
             print(
                 (
                     "Combine: Phase A progress "
@@ -464,10 +471,10 @@ def write_final_shard_index(
 ) -> IndexPassResult:
     manifest = read_combine_manifest(manifest_path)
     existence = IntermediateLookup(manifest, max_open_files=plan.max_open_files)
-    relocation = RelocationLookup(
-        relocation_files, max_open_files=plan.max_open_files
+    relocation = RelocationLookup(relocation_files, max_open_files=plan.max_open_files)
+    writer = _IndexWriter(
+        output_fp, existence, relocation, max_level=manifest.max_level
     )
-    writer = _IndexWriter(output_fp, existence, relocation, max_level=manifest.max_level)
     try:
         index_offset = output_fp.tell()
         writer.write_root()
@@ -531,7 +538,9 @@ class _IndexWriter:
         self._out.write(b"\x00" * 80)
         node_table_offset = self._out.tell()
 
-        index_by_key = {(n.local_depth, n.local_path): i + 1 for i, n in enumerate(nodes)}
+        index_by_key = {
+            (n.local_depth, n.local_path): i + 1 for i, n in enumerate(nodes)
+        }
 
         entry_nodes = [0] * 8
         frontier_indices: list[int] = []
@@ -611,7 +620,9 @@ class _IndexWriter:
             self._out.seek(end)
 
         first_frontier_index = frontier_indices[0] if frontier_indices else 0
-        parent_grid_x, parent_grid_y, parent_grid_z = _decode_grid(parent_level, parent_node_id)
+        parent_grid_x, parent_grid_y, parent_grid_z = _decode_grid(
+            parent_level, parent_node_id
+        )
         header = pack_shard_header(
             shard_id=shard_id,
             parent_shard_id=parent_shard_id,

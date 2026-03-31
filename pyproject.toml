@@ -5,8 +5,9 @@ build-backend = "hatchling.build"
 [project]
 name = "found-in-space-octree"
 version = "0.1.0"
-description = "Add your description here"
+description = "Octree spatial index pipeline for Found in Space — converts merged star catalogue parquet into streamable binary octree artifacts."
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.13"
 dependencies = [
     "astropy>=7.2.0",
@@ -19,6 +20,10 @@ dependencies = [
     "rich>=14.3.3",
     "votpipe>=0.1.0",
 ]
+
+[project.urls]
+Homepage = "https://foundin.space/"
+Repository = "https://github.com/Found-in-Space/octree"
 
 [project.scripts]
 fis-octree = "foundinspace.octree._cli:cli"
