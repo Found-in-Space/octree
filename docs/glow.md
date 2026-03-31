@@ -1,131 +1,289 @@
-# Proposal: integrated glow / render-distance luminosity contribution
+# Glow Octree
 
-## Summary
+## Purpose
 
-This proposal adds a second octree product alongside `stars.octree`: a **glow octree** for unresolved stellar light.
+The glow octree is a spatial aggregate index carried alongside `stars.octree`. Each node stores additive summary statistics — star count, integrated luminosity, luminosity-weighted colour, and estimated mass — so that the renderer can treat unresolved cells as emissive volumes and downstream tools can query aggregate physical properties per spatial region.
 
-The existing `stars.octree` is a discrete-source structure. It is built around per-star payloads and queried using point-based spatial logic, especially the current visible-stars “shell loader” and nearby-stars query. That model is appropriate for rendering individual stars, but it is not the right abstraction for diffuse background light at distance. The current reader contract is explicitly star-centric and point-centric. :contentReference[oaicite:0]{index=0}
+`stars.octree` is a discrete-source structure: per-star payloads, magnitude-driven level assignment, point-based shell-loader query. It is the right representation for rendering individual stars but not for diffuse unresolved light at distance, nor for representing aggregate physical properties like total mass or luminosity in a volume.
 
-The proposed glow octree reuses the same staged octree infrastructure and the same shard/index model, but changes two things:
+The glow octree uses the same world geometry and shard/index infrastructure but changes two things:
 
-1. **Payload semantics**: each node stores integrated unresolved light rather than a list of individual stars.
-2. **Query semantics**: traversal is driven by **view frustum + projected node size**, not by apparent-magnitude shell distance.
+1. **Payload semantics**: each node stores additive aggregate statistics, not a list of individual stars.
+2. **Build model**: pure spatial binning with bottom-up reduction, not magnitude-driven level assignment.
 
-This should live in the **same project and repository** as the existing octree pipeline, as a sibling product rather than a separate implementation. Stage 01 already produces one payload blob per cell, and Stage 02 already assembles a payload-addressed indexed octree; that is a good architectural fit for a second payload type. :contentReference[oaicite:1]{index=1} :contentReference[oaicite:2]{index=2} The separate uploaded shard spec also matches this direction: it treats the shard structure as an index over payload regions rather than something inherently star-specific. :contentReference[oaicite:3]{index=3}
+### One-sentence definition
+
+The glow octree is a sibling octree product that stores aggregate stellar statistics per spatial cell — luminosity, colour, mass, and count — enabling unresolved integrated emission rendering and volumetric physical queries.
+
+---
 
 ## Goal
 
-The goal is to support a smooth transition from:
+Support a smooth transition from resolved individual sources (nearby) to integrated aggregate emission (distant), and provide a lightweight volumetric representation of stellar mass and luminosity density.
 
-- **resolved sources** nearby and at larger apparent size, to
-- **unresolved integrated emission** when a node is too small on screen to justify rendering its contents as individual stars.
+Specific use cases:
+
+- **Unresolved glow rendering**: stop octree traversal when a node is small enough on screen; render its integrated colour and intensity as a single emissive element.
+- **Emissivity fields**: treat the octree as a volumetric luminosity density field for path tracing or volume rendering.
+- **Mass density**: use aggregate mass per cell for gravitational lensing approximations, n-body seeding, or educational visualisation.
 
 In practical terms:
 
-- nearby structure continues to refine to child nodes and eventually to stars
+- nearby structure continues to refine to child nodes and eventually to individual stars (from `stars.octree`)
 - distant structure is rendered as integrated glow from coarser nodes
-- bright stars that already appear higher in the tree may still render as explicit sources, while deeper unresolved structure contributes only a faint local background
+- bright stars that already appear higher in the star octree may still render as explicit sources, while deeper unresolved structure contributes only a faint local background
 
-This is not a replacement for the star octree. It is a complementary representation for the unresolved-light regime.
+---
 
-## Core definition: render-distance luminosity contribution
+## Relationship to existing products
 
-A node’s **render-distance luminosity contribution** is the integrated light of the stellar population represented by that node, used when the node is small enough on screen that its contents should be treated as unresolved.
+The glow octree is a **sibling product** of `stars.octree`, not a sidecar or extension:
 
-Traversal rule:
+- It consumes the same merged HEALPix parquet input.
+- It uses the same world geometry (`WORLD_CENTER`, `WORLD_HALF_SIZE_PC`).
+- It reuses shared Morton/grid helpers and the Stage 02 combine infrastructure.
+- It produces a separate `glow.octree` file.
 
-1. Start from root entries using the existing octree/shard navigation model.
-2. Reject nodes outside the camera frustum.
-3. Estimate projected node size in screen space.
-4. If the node is still large on screen, descend to children.
-5. If the node is at or below the glow threshold, stop descending and render the node’s integrated glow payload.
+It is **not** a sidecar because its spatial structure differs from the star octree. The glow octree uses pure spatial binning (all stars assigned to leaf cells at `max_level`), while `stars.octree` uses magnitude-driven level assignment. The cell sets are therefore different, and sidecar alignment is not possible.
 
-A simple first threshold is:
+| Property | `stars.octree` | `glow.octree` |
+|---|---|---|
+| Payload | per-star 16-byte records | per-node 32-byte aggregate |
+| Level assignment | magnitude-driven | pure spatial (all stars at `max_level`) |
+| Parent semantics | no parent aggregation | parent = sum of children |
+| Query model | shell loader (apparent magnitude) | frustum + projected size |
 
-- render glow when projected node diameter is approximately `1–2 px` or less
+---
 
-This gives the intended behaviour:
+## Upstream pipeline changes
 
-- **near camera**: deeper traversal, more structure, more explicit stars
-- **far from camera**: coarser traversal, aggregated glow
+### Required: add `log_g` to merged output
 
-## Ownership and double counting
+The Gaia pipeline already computes `log_g` from the ESP-HS / GSP-Spec / GSP-Phot cascade (`compute_log_g_gaia` in `gaia/photometry.py`), but the call is currently commented out in `gaia/pipeline.py` and `log_g` is absent from `OUTPUT_COLS`.
 
-The intended ownership rule is:
+To enable surface-gravity-based mass estimation in the glow octree, the following changes are needed:
 
-- a node is rendered either as **aggregate glow**
-- or by traversing its descendants
-- but not both for the same ordinary stellar population
+1. **`pipeline/constants.py`**: add `"log_g"` to `OUTPUT_COLS`.
+2. **`pipeline/gaia/pipeline.py`**: uncomment `work = compute_log_g_gaia(work)`.
+3. **`pipeline/hipparcos/pipeline.py`**: ensure `compute_log_g_hip(work)` runs (it sets `log_g = NaN` for all HIP rows; safe and consistent).
 
-So when a node is accepted as a glow node, ordinary descendants from that node are not rendered separately.
+Hipparcos has no spectroscopic log_g source, so HIP stars carry `log_g = NaN` and fall back to the mass-luminosity relation at glow-build time.
 
-Bright stars represented at higher levels may still render as explicit sources. This is acceptable and often desirable: the direct source dominates visually, while the glow node contributes only faint local unresolved structure around it.
+This is a small, low-risk change. `log_g` is also independently useful beyond glow (HR diagrams, spectral classification, evolutionary state identification).
 
-## Relationship to the current star octree
+### No other pipeline changes needed
 
-The current `stars.octree` is based on a magnitude-driven level assignment and point-based query logic. Stage 00 currently enriches rows with `morton_code`, `render`, and `level`, and Stage 01 consumes that contract to write one payload blob per cell. :contentReference[oaicite:4]{index=4} :contentReference[oaicite:5]{index=5}
+Luminosity, colour weights, and the mass-luminosity fallback can all be derived at glow-build time from existing merged columns (`mag_abs`, `teff`) plus the newly added `log_g`.
 
-The glow octree should **not** inherit the current shell-loader query semantics. It should use the same index topology but a different reader contract:
+Gaia FLAME parameters (`mass_flame`, `lum_flame`) would improve mass and luminosity estimates for a subset of stars but would require changing the upstream TAP query. This is not required for V1 and can be revisited once the glow octree is operational.
 
-- `stars.octree`: “which nodes might contain visible or nearby stars from this point?”
-- `glow.octree`: “which nodes are the correct screen-space resolution to approximate unresolved light in this view?”
+---
 
-So this is a **shared infrastructure, different query policy** design.
+## Per-star derived quantities
 
-## Build model
+The glow build computes four derived quantities per star from the merged parquet columns. These are computed at build time, not stored in the merge output.
 
-Recommended structure:
+### Luminosity
 
-- keep the existing star pipeline unchanged
-- add a sibling glow pipeline and output artifact, e.g. `glow.octree`
-- reuse shared octree/shard/index code where possible
-- keep the glow reader and payload definitions separate from the star reader
+Bolometric luminosity in solar units:
 
-At a high level:
+```
+BC     = bolometric_correction(teff)
+M_bol  = mag_abs + BC
+L_star = 10^((M_bol_sun - M_bol) / 2.5)
+```
 
-### Shared pieces
-- Morton/grid helpers
-- shard planning
-- Stage 02-style final assembly
-- shard/index reader/navigation
+Where `M_bol_sun = 4.74` (IAU 2015 Resolution B2).
 
-### Glow-specific pieces
-- per-star light/colour inputs for aggregation
-- node-level aggregation payload format
-- frustum + projected-size traversal policy
-- glow payload decode/render path
+The bolometric correction `BC(Teff)` uses a polynomial fit such as Torres (2010) or Flower (1996), evaluated from the pipeline's `teff` column. When `teff` is the 5800 K default (unknown temperature), `BC ≈ −0.07`, and the resulting luminosity is a reasonable approximation for solar-type stars.
 
-## Glow payload
+Stars with non-finite `mag_abs` are excluded from aggregation.
 
-A first glow payload should be compact and deterministic. Recommended contents per node:
+### Colour weight
 
-- `sum_flux`
-- `sum_r`
-- `sum_g`
-- `sum_b`
-- optional `count`
-- optional flux-weighted centroid `(cx, cy, cz)`
-- optional compactness/spread term for tuning sprite size or falloff
+Luminosity-weighted linear RGB triplet:
 
-This is enough to render a coloured emissive blob for a node without storing individual stars.
+```
+r_lin, g_lin, b_lin = teff_to_linear_rgb(teff)
+lum_r = L_star * r_lin
+lum_g = L_star * g_lin
+lum_b = L_star * b_lin
+```
+
+The `teff_to_linear_rgb` function must produce values in **linear light space** (not sRGB gamma-encoded). The existing `teff_to_rgb` in `pipeline/common/photometry.py` returns sRGB 0-255 values using the Tanner Helland algorithm. The glow build must apply sRGB-to-linear conversion:
+
+```
+linear = (srgb / 255.0)^2.2
+```
+
+or use the piecewise sRGB transfer function for precision. The glow build and the discrete-star renderer must use the same underlying Teff-to-colour mapping to ensure visual continuity at the transition between resolved and unresolved rendering.
+
+### Mass estimate
+
+Estimated stellar mass in solar units, using a two-tier approach:
+
+**Tier 1 — surface gravity (when `log_g` is finite and in [0, 9])**:
+
+```
+R_star = sqrt(L_star * L_sun / (4π σ T_eff⁴))
+M_star = 10^(log_g) * R_star² / G
+```
+
+Where σ is the Stefan-Boltzmann constant and G is the gravitational constant, all in consistent CGS units. This gives physically grounded mass estimates for the tens of millions of Gaia stars with spectroscopic parameters.
+
+**Tier 2 — mass-luminosity relation (fallback)**:
+
+For stars without valid `log_g`:
+
+```
+M_star ≈ (L_star / L_sun)^(1/α)
+```
+
+Where α varies by luminosity regime:
+
+| L / L_sun | α | Notes |
+|---|---|---|
+| < 0.033 | 2.3 | very low mass / M dwarfs |
+| 0.033 – 16 | 4.0 | low to solar mass |
+| 16 – 10⁵ | 3.5 | intermediate to high mass |
+| > 10⁵ | 1.0 | very luminous; cap at ~150 M_sun |
+
+This is known to overestimate mass for giant and subgiant stars (which have high luminosity for their mass). For aggregate mass in a cell, the error is bounded: most stars are main-sequence dwarfs, and the few giants dominate luminosity but not mass.
+
+The mass estimate is clamped to `[0.08, 150]` M_sun to avoid unphysical values from noisy photometry.
+
+---
+
+## Node payload format
+
+### Binary layout
+
+Each node carries one fixed-size payload record:
+
+```python
+GLOW_PAYLOAD_FMT = struct.Struct("<I f fff f f I")
+GLOW_PAYLOAD_SIZE = 32
+```
+
+| Offset | Field | Type | Unit | Description |
+|--------|-------|------|------|-------------|
+| 0 | `count` | u32 | — | number of stars in subtree |
+| 4 | `sum_luminosity` | f32 | L_sun | total bolometric luminosity |
+| 8 | `sum_lum_r` | f32 | — | luminosity-weighted linear red |
+| 12 | `sum_lum_g` | f32 | — | luminosity-weighted linear green |
+| 16 | `sum_lum_b` | f32 | — | luminosity-weighted linear blue |
+| 20 | `sum_mass` | f32 | M_sun | estimated total stellar mass |
+| 24 | `sum_lum_teff` | f32 | K · L_sun | Σ(L_i · Teff_i) for mean Teff derivation |
+| 28 | `reserved` | u32 | — | must be 0 in version 1 |
+
+### Additivity
+
+All non-reserved fields are strictly additive: the parent value is exactly the sum of its children's values. This is the fundamental invariant of the glow octree.
+
+### Derived quantities at read time
+
+Readers derive:
+
+```
+colour      = (sum_lum_r, sum_lum_g, sum_lum_b) / sum_luminosity
+intensity   = sum_luminosity
+mean_teff   = sum_lum_teff / sum_luminosity
+mean_mass   = sum_mass / count
+```
+
+### Possible future extension: luminosity-weighted centroid
+
+A luminosity-weighted centroid (`centroid_x`, `centroid_y`, `centroid_z` as cell-relative f32 in [-1, 1]) would allow renderers to place glow sprites at the light-weighted center of each cell rather than the geometric center. This improves rendering quality for partially filled cells.
+
+The centroid is **not** directly additive (it is a weighted mean), but the underlying accumulation (`Σ L_i · x_world_i`) is additive and can be used during the bottom-up pass with f64 precision. Cell-relative conversion happens on output.
+
+This is deferred to a later version. The `reserved` field (4 bytes) is not sufficient for a 3-component centroid (12 bytes), so adding it would require a payload format version bump (e.g. 44 or 48 bytes).
+
+### Note: add mass centroid alongside luminosity centroid
+
+If centroid support is added, include a **mass-weighted centroid** in the same format pass, not only a luminosity-weighted centroid. Comparing them is a useful diagnostic:
+
+- similar centroids imply light roughly traces mass in that cell
+- larger offsets indicate luminosity skew (for example, a few bright giants or young massive stars displacing the luminosity center from the bulk stellar mass)
+
+To preserve strict additivity, store additive moments during build:
+
+- luminosity moments: `sum_lx = Σ(L_i · x_i)`, `sum_ly`, `sum_lz`
+- mass moments: `sum_mx = Σ(M_i · x_i)`, `sum_my`, `sum_mz`
+
+Then derive centroids at read time:
+
+```
+c_lum  = (sum_lx, sum_ly, sum_lz) / sum_luminosity
+c_mass = (sum_mx, sum_my, sum_mz) / sum_mass
+```
+
+A useful per-node comparison metric is:
+
+```
+delta_centroid = ||c_lum - c_mass||
+```
+
+optionally normalized by node half-size:
+
+```
+delta_centroid_norm = delta_centroid / cell_half_size
+```
+
+---
+
+## Aggregation
+
+### Leaf cell accumulation
+
+Every star with finite `mag_abs` is assigned to a leaf cell at `max_level` based purely on its spatial position (`x_icrs_pc`, `y_icrs_pc`, `z_icrs_pc`). There is no magnitude-based level assignment.
+
+For each star assigned to a leaf cell:
+
+```
+cell.count         += 1
+cell.sum_luminosity += L_star
+cell.sum_lum_r     += L_star * r_lin
+cell.sum_lum_g     += L_star * g_lin
+cell.sum_lum_b     += L_star * b_lin
+cell.sum_mass      += M_star
+cell.sum_lum_teff  += L_star * teff
+```
+
+### Bottom-up parent reduction
+
+For each level from `max_level − 1` down to `0`, each parent cell is the sum of its up-to-eight children:
+
+```
+parent.count         = Σ child.count
+parent.sum_luminosity = Σ child.sum_luminosity
+parent.sum_lum_r     = Σ child.sum_lum_r
+parent.sum_lum_g     = Σ child.sum_lum_g
+parent.sum_lum_b     = Σ child.sum_lum_b
+parent.sum_mass      = Σ child.sum_mass
+parent.sum_lum_teff  = Σ child.sum_lum_teff
+```
+
+Empty parent cells (no occupied children) are not written.
+
+This is the complete aggregation specification. The additivity invariant guarantees that every level is self-consistent and that no information is lost or double-counted.
+
+---
 
 ## Colour model
 
-The current star pipeline already uses `teff` as a core part of render encoding, with a default of `5800 K` when temperature is absent. :contentReference[oaicite:6]{index=6} The glow octree should preserve that same physical/visual basis.
-
 ### Principle
 
-**Do not aggregate temperature directly.**  
-A glow node should not be coloured by averaging `Teff` and then converting once to colour.
+**Do not aggregate temperature directly.**
 
-Instead:
+A glow node must not be coloured by averaging `Teff` and then converting once to colour. Instead:
 
-1. Convert each star’s `Teff` to a linear colour representation using the same colour model as the discrete-star renderer.
-2. Convert the star’s brightness to a linear light weight.
+1. Convert each star's `Teff` to a linear colour representation using the same colour model as the discrete-star renderer.
+2. Convert the star's brightness to a linear light weight (bolometric luminosity).
 3. Multiply colour by that weight.
 4. Sum those weighted colour channels per node.
 
-So aggregation happens in **linear light space**, not in temperature space and not in display-space sRGB.
+Aggregation happens in **linear light space**, not in temperature space and not in display-space sRGB.
 
 ### Why
 
@@ -135,49 +293,193 @@ Averaging `Teff` is wrong for mixed populations because colour perception and RG
 
 For each star:
 
-- derive a linear RGB triplet from `Teff`
-- derive a scalar light weight from magnitude / luminosity proxy
-- accumulate:
+```
+r_lin, g_lin, b_lin = teff_to_linear_rgb(teff)
+L_star              = bolometric_luminosity(mag_abs, teff)
 
-```text
-sum_r += w * r_lin
-sum_g += w * g_lin
-sum_b += w * b_lin
-sum_flux += w
-````
+sum_lum_r += L_star * r_lin
+sum_lum_g += L_star * g_lin
+sum_lum_b += L_star * b_lin
+sum_luminosity += L_star
+```
 
 At render time:
 
-```text
-node_colour = (sum_r, sum_g, sum_b) / sum_flux
-node_intensity = sum_flux
+```
+node_colour    = (sum_lum_r, sum_lum_g, sum_lum_b) / sum_luminosity
+node_intensity = sum_luminosity
 ```
 
-This preserves continuity between the discrete-star renderer and the glow renderer, because both are driven by the same per-star colour theory.
+The renderer converts `node_colour` to the output colour space (sRGB or equivalent) and scales by `node_intensity` adjusted for distance.
 
-### Practical note
+### Mean Teff
 
-For visual continuity, the glow pipeline should use the **same Teff→colour function** as the star-render path. The only difference is that stars are summed before rendering rather than drawn one by one.
+`sum_lum_teff / sum_luminosity` gives the luminosity-weighted mean effective temperature of the node's stellar population. This is available for analytical use (HR diagrams, comparison with models) but must not be used for rendering colour. Use the linear RGB aggregate for rendering.
 
-## Recommended first implementation
+### Consistency requirement
 
-Version 1 should aim for simplicity:
+The `teff_to_linear_rgb` function used by the glow build must be the same function used by the discrete-star renderer. This ensures visual continuity at the transition between resolved and unresolved rendering.
 
-* keep `stars.octree` unchanged
-* add `glow.octree` as a parallel product
-* use view-frustum + projected-size traversal
-* use per-node aggregate linear RGB + intensity
-* do not initially subtract bright stars from node aggregates
-* tune thresholds visually after end-to-end testing
+---
 
-If later testing shows objectionable halos or energy inflation around very bright stars, bright-source subtraction can be added as a second-pass refinement. It is not required for the first implementation.
+## Build pipeline
 
-## Proposed one-sentence definition
+### Overview
 
-The glow octree is a sibling octree product that renders **unresolved integrated stellar emission** by stopping traversal when a node becomes sufficiently small in screen space and using that node’s aggregate colour-weighted light contribution instead of rendering its descendants as individual stars.
+The glow build is a separate pipeline from the star Stage 00/01/02 flow. It consumes the same merged HEALPix parquet and produces `glow.octree` as a sibling artifact.
 
 ```
+merged HEALPix parquet ──→ glow-build ──→ glow.octree
+```
 
-This should be consistent with the current stage docs and reader split: Stage 00 enriches rows for Stage 01, Stage 01 writes one payload per cell, Stage 02 assembles the final octree, and the reader currently defines the existing star-specific query semantics. :contentReference[oaicite:7]{index=7} :contentReference[oaicite:8]{index=8} :contentReference[oaicite:9]{index=9} :contentReference[oaicite:10]{index=10}
+### Phase 1 — leaf aggregation
 
-If you want a tighter repo-style version next, the natural follow-on would be a `docs/glow-octree.md` with sections for payload format, traversal contract, and acceptance criteria.
+Stream merged parquet in bounded-memory batches. For each batch:
+
+1. Compute `morton_code` at `max_level` from `x_icrs_pc`, `y_icrs_pc`, `z_icrs_pc` (reuse `morton3d_u64_from_xyz_arrays`).
+2. Derive `node_id` at `max_level`: `morton_code >> (3 * (MORTON_BITS - max_level))`.
+3. Compute per-star `L_star`, `(lum_r, lum_g, lum_b)`, `M_star` from `mag_abs`, `teff`, `log_g`.
+4. GROUP BY `node_id` and SUM all aggregate fields.
+5. Write partial leaf aggregates to temporary intermediate files.
+
+After all batches are processed, merge partial aggregates for each leaf cell (sum across batches for the same `node_id`).
+
+This phase can be implemented with DuckDB for efficient GROUP BY aggregation, consistent with the existing Stage 00 approach.
+
+### Phase 2 — bottom-up reduction
+
+For each level from `max_level − 1` down to `0`:
+
+1. Read child-level cell records.
+2. Derive parent `node_id` = child `node_id >> 3`.
+3. Sum child records into parent records.
+4. Write parent-level cell records.
+
+This pass is bounded-memory: only two adjacent levels need to be in memory at once (children as input, parents as output). For levels with many occupied cells, DuckDB can handle the GROUP BY.
+
+### Phase 3 — intermediate write
+
+Write all cell records (all levels) as intermediate shard files using the same format as Stage 01: one payload file + one index file per shard.
+
+The payload for each cell is the 32-byte `GLOW_PAYLOAD_FMT` record, gzip-compressed for format compatibility with the existing combine pipeline.
+
+Shard planning (prefix sharding for deep levels) reuses the same `BuildPlan` parameters as the star pipeline.
+
+### Phase 4 — combine
+
+Reuse the existing Stage 02 combine pipeline (`combine_octree`) to assemble `glow.octree` from the intermediate shards.
+
+The final `glow.octree` uses the same file-level structure as `stars.octree`:
+
+- STAR header (magic `b"STAR"`, with `payload_record_size = 32`)
+- ODSC descriptor block (`artifact_kind = "glow"`, dedicated `dataset_uuid`)
+- Payload section in DFS order
+- Shard index section
+
+### Memory model
+
+The build must remain bounded-memory:
+
+- Phase 1: streaming batches + partial aggregates on disk.
+- Phase 2: one level at a time in memory (occupied cells only, which is a small fraction of the theoretical 8^max_level).
+- Phase 3/4: reuse existing bounded-memory Stage 01/02 machinery.
+
+---
+
+## Query and traversal
+
+### Traversal rule
+
+1. Start from root entries using the existing octree/shard navigation.
+2. Reject nodes outside the camera frustum.
+3. Estimate projected node size in screen space.
+4. If the node is large on screen, descend to children.
+5. If the node is at or below the glow threshold, stop descending and render the node's aggregate payload.
+
+A simple first threshold: render glow when projected node diameter is approximately 1-2 pixels or less.
+
+This gives:
+
+- **Near camera**: deeper traversal, more spatial detail, eventually resolved to individual stars (from `stars.octree`).
+- **Far from camera**: coarser traversal, integrated aggregate glow.
+
+### Ownership and double counting
+
+A node is rendered either as **aggregate glow** or by traversing its descendants — not both for the same ordinary stellar population. When a node is accepted as a glow node, its descendants are not rendered separately.
+
+Bright stars rendered as discrete sources from `stars.octree` may overlap spatially with glow nodes. This is acceptable and often desirable: the direct source dominates visually, while the glow node contributes only faint unresolved background structure. If energy conservation is needed, bright-source subtraction from glow can be added as a later refinement. It is not required for V1.
+
+---
+
+## File format
+
+The glow octree reuses the existing `stars.octree` binary format:
+
+- Same STAR header structure (64 bytes).
+- Same ODSC descriptor block (128 bytes) with `artifact_kind = "glow"`.
+- Same shard/index layout (shard headers, node tables, frontier references).
+- Same DFS payload ordering.
+
+The differences are:
+
+- `payload_record_size = 32` (instead of 16).
+- Each node's payload is a single 32-byte `GLOW_PAYLOAD_FMT` record (gzip-compressed for intermediate compatibility).
+- `artifact_kind = "glow"` in the descriptor (requires a new descriptor kind code, e.g. `GLOW_DESCRIPTOR_KIND = 3`).
+
+Readers distinguish `glow.octree` from `stars.octree` by the descriptor's `artifact_kind` field.
+
+### Code changes required
+
+- `combine/records.py`: add `GLOW_DESCRIPTOR_KIND = 3` and update `_descriptor_kind_code` / `_descriptor_kind_name`.
+- `combine/records.py`: `pack_top_level_header` currently hardcodes `PAYLOAD_RECORD_SIZE = 16`. This must be parameterised so the glow build can pass `payload_record_size = 32`.
+
+---
+
+## Configuration
+
+The glow build reads from the octree project file:
+
+```toml
+[glow]
+max_level = 13
+batch_size = 1_000_000
+```
+
+Required project-file paths:
+
+- `paths.merged_healpix_dir` (same input as Stage 00)
+- `paths.glow_output_path` (e.g. `"output/glow.octree"`)
+- `paths.glow_intermediate_dir` (e.g. `"output/glow-intermediates"`)
+
+### CLI
+
+```bash
+uv run fis-octree glow --project path/to/project.toml
+```
+
+---
+
+## Non-goals
+
+- The glow octree does not replace `stars.octree` for individual star rendering.
+- The glow octree does not support per-star lookup or identity queries.
+- Bright-source subtraction for energy conservation is not required in V1.
+- Bolometric correction precision beyond ~0.1 mag is not required for V1.
+- The glow octree does not store spectral data beyond broadband RGB.
+- The glow octree does not use magnitude-driven level assignment. Stars are never assigned to multiple levels.
+
+---
+
+## Implementation order
+
+1. Add `log_g` to pipeline merged output (uncomment existing code, add to `OUTPUT_COLS`).
+2. Implement bolometric correction function `BC(Teff)` (polynomial fit).
+3. Implement `teff_to_linear_rgb` (linearise existing `teff_to_rgb` from `pipeline/common/photometry.py`).
+4. Implement mass estimation (log_g tier + mass-luminosity fallback).
+5. Add `GLOW_DESCRIPTOR_KIND` and parameterise `payload_record_size` in `combine/records.py`.
+6. Implement leaf aggregation pass (streaming, DuckDB-backed).
+7. Implement bottom-up reduction pass.
+8. Write intermediates using existing shard writer.
+9. Assemble final `glow.octree` using existing combine pipeline.
+10. Add `fis-octree glow` CLI command and project config.
+11. Add reader/stats support for glow octree inspection.
