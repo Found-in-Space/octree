@@ -1,8 +1,8 @@
-# found-in-space-octree
+# Found in Space — Octree
 
-Part of [Found in Space](https://foundin.space/), a project that turns real astronomical measurements into interactive explorations of the solar neighbourhood.
+Part of [Found in Space](https://foundin.space/), a project that turns real astronomical measurements into interactive explorations of the solar neighbourhood. See all repositories at [github.com/Found-in-Space](https://github.com/Found-in-Space).
 
-This repository is the **spatial indexing pipeline**: it takes the merged star catalogue produced by [found-in-space-pipeline](https://github.com/Found-in-Space/pipeline) and converts it into streamable binary octree artifacts for use by the [SkyKit](https://github.com/Found-in-Space/skykit) viewer runtime.
+This repository is the **spatial indexing pipeline**: it takes the merged star catalogue produced by [Found-in-Space/pipeline](https://github.com/Found-in-Space/pipeline) and converts it into streamable binary octree artifacts for use by the [Found-in-Space/skykit](https://github.com/Found-in-Space/skykit) viewer runtime.
 
 ## Overview
 
@@ -129,12 +129,6 @@ Run the linter and formatter manually:
 ```bash
 uv run pre-commit run --all-files
 ```
-
-## Related repositories
-
-- [found-in-space-pipeline](https://github.com/Found-in-Space/pipeline) — data pipeline producing the merged parquet input for this repo
-- [skykit](https://github.com/Found-in-Space/skykit) — viewer runtime that streams and renders the octree artifacts
-- [Found in Space](https://foundin.space/) — the interactive astronomy explorer this all feeds into
 
 ## License
 
