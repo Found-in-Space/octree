@@ -4,9 +4,15 @@ Part of [Found in Space](https://foundin.space/), a project that turns real astr
 
 This repository is the **spatial indexing pipeline**: it takes the merged star catalogue produced by [Found-in-Space/pipeline](https://github.com/Found-in-Space/pipeline) and converts it into streamable binary octree artifacts for use by the [Found-in-Space/skykit](https://github.com/Found-in-Space/skykit) viewer runtime.
 
-## Overview
+## How it works
 
-The pipeline runs in four stages:
+The octree divides 3D space into nested cells across up to 14 levels (0–13). Each star is assigned to a level based on its absolute magnitude, not its position: the brightest stars go into the shallowest levels (largest cells), the faintest into the deepest (smallest cells). The placement threshold at each level is derived from `v_mag` (default 6.5, roughly the naked-eye limit) — a star is placed at the level whose cell half-size matches the distance from which that star would just be visible to the human eye.
+
+At runtime, the viewer computes a visibility radius for each level. Bright-star cells have large visibility radii and are loaded from anywhere in the scene; faint-star cells have small radii and load only when the observer is nearby. This gives progressive, distance-dependent detail that mirrors how real starlight works.
+
+## Build stages
+
+The build pipeline runs in four stages:
 
 | Stage | Input | Output | Purpose |
 |-------|-------|--------|---------|
