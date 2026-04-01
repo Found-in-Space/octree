@@ -1,0 +1,9 @@
+# Copy to terraform.tfvars and edit.
+
+bucket_name = "foundinspace"
+
+# Set to true to create a new bucket, false to use an existing one.
+create_bucket = false
+
+aws_region             = "eu-central-1"
+cloudfront_price_class = "PriceClass_100"
