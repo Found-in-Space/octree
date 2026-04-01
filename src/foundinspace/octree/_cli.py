@@ -476,11 +476,19 @@ def stats(
         nearest_n=nearest,
     )
     console = Console()
-    console.print(
-        f"File: {_format_source_label(resolved_octree_source)} | query_point=({query_point.x:.1f}, {query_point.y:.1f}, {query_point.z:.1f}) "
+    header_line = (
+        f"File: {_format_source_label(resolved_octree_source)} "
+        f"| query_point=({query_point.x:.1f}, {query_point.y:.1f}, {query_point.z:.1f}) "
         f"| world_center={report.header.world_center} "
         f"| half_size={report.header.world_half_size:.1f} pc "
         f"| max_level={report.header.max_level} "
         f"| mag_limit={report.header.mag_limit:.2f}"
     )
+    if report.header.dataset_uuid is not None:
+        header_line += f" | octree_uuid={report.header.dataset_uuid}"
+    if report.header.parent_dataset_uuid is not None:
+        header_line += f" | parent_uuid={report.header.parent_dataset_uuid}"
+    if report.header.sidecar_uuid is not None:
+        header_line += f" | sidecar_uuid={report.header.sidecar_uuid}"
+    console.print(header_line)
     _render_stats(console, report, nearest)
