@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Protocol
@@ -119,8 +121,16 @@ class HttpRangeReader:
                 "Range": f"bytes={start}-{end}",
             },
         )
+        t0 = time.perf_counter()
         with urlopen(request) as response:
             block = response.read()
+        elapsed = time.perf_counter() - t0
+        mib_s = (len(block) / (1024 * 1024)) / elapsed if elapsed > 0 else float("inf")
+        print(
+            f"octree http range bytes={start}-{end} size={len(block)} "
+            f"time={elapsed * 1000:.1f}ms throughput={mib_s:.2f} MiB/s url={self.url}",
+            file=sys.stderr,
+        )
 
         self._cache[block_index] = block
         self._cache.move_to_end(block_index)
