@@ -211,6 +211,110 @@ def stage_03(
     click.echo(f"Stage 03 manifest written to {manifest_path}")
 
 
+
+@cli.command("stage-04")
+@click.option(
+    "--project",
+    "project_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Path to octree project TOML.",
+)
+@click.option(
+    "--output",
+    "output_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Optional output path for the identifiers bigfile.",
+)
+@click.option(
+    "--target-block-bytes",
+    type=int,
+    default=256 * 1024,
+    show_default=True,
+    help="Target block size for the range-friendly identifier payload blocks.",
+)
+def stage_04(project_path: Path, output_path: Path | None, target_block_bytes: int) -> None:
+    """Build a range-friendly identifiers bigfile for client-side string lookup."""
+    from foundinspace.octree.identifier_bigfile import build_identifier_bigfile
+
+    project = _load_project_or_die(project_path)
+    out = output_path or (project.paths.stage03_output_dir / "identifiers.bigfile")
+    build_identifier_bigfile(
+        identifiers_order_path=project.paths.identifiers_order_output_path,
+        identifiers_map_path=project.paths.identifiers_map_path,
+        output_path=out,
+        target_block_bytes=target_block_bytes,
+    )
+    click.echo(f"Wrote {out}")
+
+
+@cli.command("stage-04-query")
+@click.option(
+    "--bigfile",
+    "bigfile_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Local identifiers bigfile path to query.",
+)
+@click.option(
+    "--url",
+    "bigfile_url",
+    type=str,
+    default=None,
+    help="HTTP URL to query via Range requests.",
+)
+@click.option(
+    "--query",
+    "query_text",
+    required=True,
+    type=str,
+    help="Query text (will be normalized to [a-z0-9]).",
+)
+@click.option(
+    "--limit",
+    type=int,
+    default=50,
+    show_default=True,
+    help="Maximum number of matches to return.",
+)
+@click.option(
+    "--exact/--prefix",
+    "exact",
+    default=False,
+    show_default=True,
+    help="Use exact-match mode instead of prefix mode.",
+)
+def stage_04_query(
+    bigfile_path: Path | None,
+    bigfile_url: str | None,
+    query_text: str,
+    limit: int,
+    exact: bool,
+) -> None:
+    """Run local or HTTP-range query tests against an identifiers bigfile."""
+    from foundinspace.octree.identifier_bigfile import query_identifier_bigfile
+
+    try:
+        matches, stats = query_identifier_bigfile(
+            query=query_text,
+            path=bigfile_path,
+            url=bigfile_url,
+            limit=limit,
+            exact=exact,
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(
+        f"Query metrics: requests={stats.requests}, bytes={stats.bytes_fetched}, elapsed_ms={stats.elapsed_ms:.2f}"
+    )
+    for match in matches:
+        click.echo(
+            f"{match.term}\tflag={match.flag}\tlevel={match.level}\tnode={match.node_id}\tordinal={match.ordinal}"
+        )
+
+
 def _parse_point(value: str) -> Point:
     try:
         parts = [p.strip() for p in value.split(",")]
