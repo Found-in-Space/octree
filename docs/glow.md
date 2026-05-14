@@ -41,7 +41,7 @@ The glow octree is a **sibling product** of `stars.octree`, not a sidecar or ext
 
 - It consumes the same merged HEALPix parquet input.
 - It uses the same world geometry (`WORLD_CENTER`, `WORLD_HALF_SIZE_PC`).
-- It reuses shared Morton/grid helpers and the Stage 02 combine infrastructure.
+- It reuses shared Morton/grid helpers and the final combine infrastructure.
 - It produces a separate `glow.octree` file.
 
 It is **not** a sidecar because its spatial structure differs from the star octree. The glow octree uses pure spatial binning (all stars assigned to leaf cells at `max_level`), while `stars.octree` uses magnitude-driven level assignment. The cell sets are therefore different, and sidecar alignment is not possible.
@@ -326,7 +326,7 @@ The `teff_to_linear_rgb` function used by the glow build must be the same functi
 
 ### Overview
 
-The glow build is a separate pipeline from the star Stage 00/01/02 flow. It consumes the same merged HEALPix parquet and produces `glow.octree` as a sibling artifact.
+The glow build is a separate pipeline from the star octree flow. It consumes the same merged HEALPix parquet and produces `glow.octree` as a sibling artifact.
 
 ```
 merged HEALPix parquet ──→ glow-build ──→ glow.octree
@@ -359,7 +359,7 @@ This pass is bounded-memory: only two adjacent levels need to be in memory at on
 
 ### Phase 3 — intermediate write
 
-Write all cell records (all levels) as intermediate shard files using the same format as Stage 01: one payload file + one index file per shard.
+Write all cell records (all levels) as intermediate shard files using the same shard format as the star build: one payload file + one index file per shard.
 
 The payload for each cell is the 32-byte `GLOW_PAYLOAD_FMT` record, gzip-compressed for format compatibility with the existing combine pipeline.
 
@@ -367,7 +367,7 @@ Shard planning (prefix sharding for deep levels) reuses the same `BuildPlan` par
 
 ### Phase 4 — combine
 
-Reuse the existing Stage 02 combine pipeline (`combine_octree`) to assemble `glow.octree` from the intermediate shards.
+Reuse the existing combine pipeline (`combine_octree`) to assemble `glow.octree` from the intermediate shards.
 
 The final `glow.octree` uses the same file-level structure as `stars.octree`:
 
@@ -382,7 +382,7 @@ The build must remain bounded-memory:
 
 - Phase 1: streaming batches + partial aggregates on disk.
 - Phase 2: one level at a time in memory (occupied cells only, which is a small fraction of the theoretical 8^max_level).
-- Phase 3/4: reuse existing bounded-memory Stage 01/02 machinery.
+- Phase 3/4: reuse existing bounded-memory shard and combine machinery.
 
 ---
 

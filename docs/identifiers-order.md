@@ -2,7 +2,7 @@
 
 ## Status
 
-`identifiers.order` is part of the implemented Stage 02 base dataset package.
+`identifiers.order` is part of the base dataset package.
 
 Its job is to preserve the canonical ordered star identities for one render octree dataset so later sidecar families can be rebuilt without reopening earlier pipeline stages.
 
@@ -11,9 +11,11 @@ Its job is to preserve the canonical ordered star identities for one render octr
 The current pipeline is:
 
 - Stage 00: packed octree staging
-- Stage 01: render intermediates plus identifiers-order intermediates
-- Stage 02: final `stars.octree` plus final `identifiers.order`
-- Stage 03: named sidecar families and derived indices
+- Stage 01: in-place staging sort and compaction
+- Stage 02: optional payload re-encoding
+- Stage 03: canonical payload-order materialization
+- Stage 04: final `stars.octree` plus final `identifiers.order`
+- Stage 05: named sidecar families and derived indices
 
 ## Primary Mapping
 
@@ -91,7 +93,7 @@ This artifact lets the base dataset package be archived as:
 - `stars.octree`
 - `identifiers.order`
 
-Stage 03 can then rebuild sidecars from that package plus fresh enrichment inputs, without depending on Stage 00 or Stage 01 outputs.
+Stage 05 can then rebuild sidecars from that package plus fresh enrichment inputs, without depending on Stage 00 or Stage 01 outputs.
 
 ## Validation And Cache Identity
 
@@ -110,7 +112,7 @@ Consumers and builders must treat `parent_dataset_uuid` as the primary compatibi
 
 It is a foundational companion artifact for the render dataset.
 
-The first implemented Stage 03 family is `meta`, but the same artifact can support additional sidecar families later.
+The first implemented sidecar family is `meta`, but the same artifact can support additional sidecar families later.
 
 ## Related Docs
 

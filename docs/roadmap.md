@@ -2,14 +2,18 @@
 
 ## Status
 
-The clean-break Stage 02 / Stage 03 architecture is now implemented.
+The clean-break base-dataset / sidecar architecture is implemented. Stage
+numbering is being revised around the packed staging tree described in
+`docs/stages.md`.
 
 The current pipeline is:
 
-- Stage 00: packed octree staging
-- Stage 01: render intermediates plus identifiers-order intermediates
-- Stage 02: `stars.octree` plus `identifiers.order`
-- Stage 03: named sidecar families
+- Stage 00: `(node, healpix)` staging partition
+- Stage 01: in-place staging sort and compaction
+- Stage 02: optional payload re-encoding
+- Stage 03: canonical payload-order materialization
+- Stage 04: `stars.octree` plus identity/order packaging
+- Stage 05: named sidecar families
 
 The current format also includes UUID-backed descriptor metadata:
 
@@ -37,13 +41,15 @@ Rebuilding a sidecar family for the same render dataset produces a new `sidecar_
 
 ### Named Sidecar Registry
 
-Stage 03 now builds sidecars by family name via `[[stage03.sidecars]]`.
+Sidecar builds are configured by family name via `[[stage03.sidecars]]` in the
+current implementation. In the revised stage model this responsibility moves to
+Stage 05.
 
 `meta` is the first implemented family.
 
 ### Foundational Identifiers / Order Artifact
 
-Stage 02 now emits `identifiers.order` as part of the base dataset package.
+The base dataset package emits `identifiers.order` alongside the render octree.
 
 Its primary mapping is:
 
@@ -62,7 +68,7 @@ Operational build commands now require an explicit project file and reject remov
 
 The new architecture creates room for later extensions without changing the clean stage boundary:
 
-- more Stage 03 sidecar families beyond `meta`
+- more Stage 05 sidecar families beyond `meta`
 - reverse lookup artifacts derived from `identifiers.order`
 - richer provenance metadata for published manifests
 - additional reader helpers for sidecar discovery beyond explicit `--meta-octree`

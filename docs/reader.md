@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Read a `stars.octree` file produced by stage-02 and execute bounded spatial queries against it.
+Read a packaged `stars.octree` file and execute bounded spatial queries against it.
 
 The reader must:
 

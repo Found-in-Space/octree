@@ -19,14 +19,17 @@ At runtime, the viewer computes a visibility radius for each level. Bright-star 
 
 ## Build stages
 
-The build pipeline runs in four stages:
+The stage model is evolving toward a reusable staging tree followed by
+materialization and packaging:
 
 | Stage | Input | Output | Purpose |
 |-------|-------|--------|---------|
-| **Stage 00** | HEALPix-partitioned merged parquet | Packed octree staging tree | Computes octree row fields and lays out rows for node construction |
-| **Stage 01** | Stage 00 staging tree | Render + identifiers-order shard pairs and manifests | Converts row-oriented data into bounded-memory intermediates |
-| **Stage 02** | Stage 01 manifests | `stars.octree` + `identifiers.order` | Assembles the final base dataset package |
-| **Stage 03** | Stage 02 outputs | Named sidecar files (e.g. `meta`) | Enriches the base dataset with optional sidecar families |
+| **Stage 00** | HEALPix-partitioned merged parquet | `(node, healpix)` staging folders | Partitions input rows into the octree staging tree |
+| **Stage 01** | Stage 00 staging folders | Canonical staged parts | Sorts and compacts staged data in place |
+| **Stage 02** | Stage 01 staged parts | Updated payload fragments | Optionally rewrites payload bytes without re-indexing |
+| **Stage 03** | Sorted staged parts | Payload-order byte arrays + identity indexes | Materializes canonical node payload order |
+| **Stage 04** | Stage 03 node outputs | `stars.octree` + identity/order artifacts | Packs the final base dataset package |
+| **Stage 05** | Stage 04 outputs | Named sidecar files (e.g. `meta`) | Builds optional sidecar families |
 
 Each render octree carries a `dataset_uuid`. Sidecars carry a `parent_dataset_uuid` so readers can validate the pairing before opening them.
 
@@ -57,6 +60,10 @@ uv run fis-octree stage-01 --project project.toml
 uv run fis-octree stage-02 --project project.toml
 uv run fis-octree stage-03 --project project.toml
 ```
+
+The implementation is currently being migrated toward the stage model described
+in [`docs/stages.md`](docs/stages.md), so the available commands may temporarily
+lag the planned stage numbering.
 
 Generate a starter config:
 
@@ -98,10 +105,10 @@ src/foundinspace/octree/
   mag_levels.py       # Magnitude/level threshold calculations
   duckdb_util.py      # Shared DuckDB connection helper with env-variable tuning
   sources/            # Stage 00 — packed octree staging
-  assembly/           # Stage 01 — shard assembly, manifests, build plan
-  combine/            # Stage 02 — octree combine (DFS traversal, lookup, records)
-  identifiers_order.py # Stage 02 — identifiers.order artifact assembly
-  stage3.py           # Stage 03 — named sidecar families
+  assembly/           # Shard assembly, manifests, build plan
+  combine/            # Final octree combine (DFS traversal, lookup, records)
+  identifiers_order.py # identifiers.order artifact assembly
+  stage3.py           # Current named sidecar family builder
   encoding/           # Morton code and Teff encoding utilities
   reader/             # Binary octree reader (header, index, payload, stats)
 ```

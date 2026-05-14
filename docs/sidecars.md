@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Define named sidecar artifacts built in Stage 03.
+Define named sidecar artifacts built after the base render dataset package.
 
 Sidecars add per-star identity and enrichment data without changing the render payload format in `stars.octree`.
 
@@ -13,11 +13,13 @@ Sidecars add per-star identity and enrichment data without changing the render p
 The current pipeline is:
 
 - Stage 00: packed octree staging
-- Stage 01: render intermediates plus identifiers-order intermediates
-- Stage 02: `stars.octree` plus `identifiers.order`
-- Stage 03: named sidecar families
+- Stage 01: in-place staging sort and compaction
+- Stage 02: optional payload re-encoding
+- Stage 03: canonical payload-order materialization
+- Stage 04: `stars.octree` plus `identifiers.order`
+- Stage 05: named sidecar families
 
-Stage 03 consumes the Stage 02 base dataset package for one `dataset_uuid` and emits one or more sidecars for that same dataset.
+Stage 05 consumes the Stage 04 base dataset package for one `dataset_uuid` and emits one or more sidecars for that same dataset.
 
 ## Core Invariants
 
@@ -32,7 +34,7 @@ Each sidecar payload entry corresponds to exactly one render cell identified by:
 
 Within a cell, sidecar star order must match render star order exactly.
 
-The canonical ordering carried forward from Stage 01 and Stage 02 is:
+The canonical ordering carried forward from Stage 03 and Stage 04 is:
 
 - `node_id`
 - `mag_abs`
@@ -84,7 +86,7 @@ For `meta`, `fields = [...]` limits which enrichment columns are emitted. `sourc
 
 ## Intermediate Files
 
-Stage 03 builds per-family intermediate shard files under:
+Stage 05 builds per-family intermediate shard files under:
 
 - `paths.stage03_output_dir/intermediates/<family>/`
 
@@ -110,9 +112,9 @@ For sidecars the descriptor carries:
 - `sidecar_uuid`
 - `sidecar_kind`
 
-## Stage 03 Manifest
+## Sidecar Manifest
 
-Stage 03 writes:
+The sidecar build writes:
 
 - `paths.stage03_output_dir/manifest.json`
 
@@ -136,8 +138,8 @@ Sidecars are immutable derived artifacts.
 
 When enrichment inputs change:
 
-1. keep the Stage 02 render octree unchanged
-2. keep the Stage 02 `identifiers.order` artifact unchanged
+1. keep the Stage 04 render octree unchanged
+2. keep the Stage 04 `identifiers.order` artifact unchanged
 3. rebuild the affected sidecar family
 4. publish a new `sidecar_uuid`
 
