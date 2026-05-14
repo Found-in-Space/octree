@@ -6,7 +6,7 @@ The clean-break Stage 02 / Stage 03 architecture is now implemented.
 
 The current pipeline is:
 
-- Stage 00: enriched parquet
+- Stage 00: packed octree staging
 - Stage 01: render intermediates plus identifiers-order intermediates
 - Stage 02: `stars.octree` plus `identifiers.order`
 - Stage 03: named sidecar families
@@ -69,8 +69,6 @@ The new architecture creates room for later extensions without changing the clea
 
 ## Related Docs
 
-- `docs/stage-01.md`
-- `docs/stage-02.md`
-- `docs/stage-03.md`
+- `docs/stages.md`
 - `docs/identifiers-order.md`
 - `docs/sidecars.md`

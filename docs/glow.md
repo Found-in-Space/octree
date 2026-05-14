@@ -344,7 +344,7 @@ Stream merged parquet in bounded-memory batches. For each batch:
 
 After all batches are processed, merge partial aggregates for each leaf cell (sum across batches for the same `node_id`).
 
-This phase can be implemented with DuckDB for efficient GROUP BY aggregation, consistent with the existing Stage 00 approach.
+This phase can be implemented with DuckDB for efficient GROUP BY aggregation over parquet inputs.
 
 ### Phase 2 — bottom-up reduction
 

@@ -10,7 +10,7 @@ Its job is to preserve the canonical ordered star identities for one render octr
 
 The current pipeline is:
 
-- Stage 00: row enrichment parquet
+- Stage 00: packed octree staging
 - Stage 01: render intermediates plus identifiers-order intermediates
 - Stage 02: final `stars.octree` plus final `identifiers.order`
 - Stage 03: named sidecar families and derived indices
@@ -114,7 +114,6 @@ The first implemented Stage 03 family is `meta`, but the same artifact can suppo
 
 ## Related Docs
 
-- `docs/stage-02.md`
-- `docs/stage-03.md`
+- `docs/stages.md`
 - `docs/sidecars.md`
 - `docs/roadmap.md`
