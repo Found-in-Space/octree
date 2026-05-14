@@ -22,6 +22,7 @@ format_version = 1
 merged_healpix_dir = "../processed/merged/healpix"
 identifiers_map_path = "../processed/identifiers_map.parquet"
 stage00_output_dir = "artifacts/stage00"
+stage00b_output_dir = "artifacts/stage00b"
 stage01_output_dir = "artifacts/stage01"
 stage02_output_path = "artifacts/stars.octree"
 identifiers_order_output_path = "artifacts/identifiers.order"
@@ -31,6 +32,12 @@ stage03_output_dir = "artifacts/stage03"
 batch_size = 1000000
 v_mag = 6.5
 max_level = 14
+
+[stage00b]
+bucket_size = 1000000
+fragment_target_rows = 100000
+max_open_writers = 128
+compact_after_files = 64
 
 [stage01]
 input_glob = "artifacts/stage00/**/*.parquet"
@@ -63,10 +70,15 @@ def test_load_project_resolves_relative_paths_from_project_file_dir(
     project = load_project(project_path)
 
     assert project.paths.stage00_output_dir == project_dir / "artifacts" / "stage00"
+    assert project.paths.stage00b_output_dir == project_dir / "artifacts" / "stage00b"
     assert project.paths.identifiers_order_output_path == (
         project_dir / "artifacts" / "identifiers.order"
     )
     assert project.paths.stage03_output_dir == project_dir / "artifacts" / "stage03"
+    assert project.stage00b.bucket_size == 1_000_000
+    assert project.stage00b.fragment_target_rows == 100_000
+    assert project.stage00b.max_open_writers == 128
+    assert project.stage00b.compact_after_files == 64
     assert project.stage03.sidecars[0].name == "meta"
     assert project.stage03.sidecars[0].fields == ("proper_name",)
 
@@ -113,12 +125,43 @@ def test_load_project_rejects_removed_stage02_manifest_fields(tmp_path: Path) ->
         load_project(project_path)
 
 
+def test_load_project_defaults_stage00b_for_existing_v1_config(tmp_path: Path) -> None:
+    project_path = tmp_path / "project.toml"
+    legacy_text = _project_text(tmp_path).replace(
+        'stage00b_output_dir = "artifacts/stage00b"\n',
+        "",
+    )
+    legacy_text = legacy_text.replace(
+        "\n[stage00b]\n"
+        "bucket_size = 1000000\n"
+        "fragment_target_rows = 100000\n"
+        "max_open_writers = 128\n"
+        "compact_after_files = 64\n",
+        "",
+    )
+    project_path.write_text(legacy_text, encoding="utf-8")
+
+    project = load_project(project_path)
+
+    assert project.paths.stage00b_output_dir == tmp_path / "artifacts" / "stage00b"
+    assert project.stage00b.bucket_size == 1_000_000
+    assert project.stage00b.fragment_target_rows == 100_000
+    assert project.stage00b.max_open_writers == 128
+    assert project.stage00b.compact_after_files == 64
+
+
 def test_render_project_template_contains_complete_v1_config() -> None:
     rendered = render_project_template()
 
     assert f"format_version = {FORMAT_VERSION}" in rendered
     assert "[paths]" in rendered
+    assert "[stage00b]" in rendered
     assert "[stage03]" in rendered
+    assert 'stage00b_output_dir = "artifacts/stage00b"' in rendered
+    assert "bucket_size = 1000000" in rendered
+    assert "fragment_target_rows = 100000" in rendered
+    assert "max_open_writers = 128" in rendered
+    assert "compact_after_files = 64" in rendered
     assert 'identifiers_order_output_path = "artifacts/identifiers.order"' in rendered
     assert 'stage03_output_dir = "artifacts/stage03"' in rendered
     assert 'name = "meta"' in rendered
@@ -135,6 +178,7 @@ def test_project_init_writes_complete_toml(tmp_path: Path) -> None:
     rendered = project_path.read_text(encoding="utf-8")
     assert f"format_version = {FORMAT_VERSION}" in rendered
     assert "[stage00]" in rendered
+    assert "[stage00b]" in rendered
     assert "[stage01]" in rendered
     assert "[stage02]" in rendered
     assert "[stage03]" in rendered

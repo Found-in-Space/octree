@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 from uuid import uuid4
@@ -93,6 +94,158 @@ def stage_00(
     click.echo(
         f"Stage 00 summary: processed_pixels={processed}, skipped_pixels={skipped}"
     )
+
+
+@cli.command("stage-00b")
+@click.option(
+    "--project",
+    "project_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Path to octree project TOML.",
+)
+@click.option(
+    "--input-root",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Input HEALPix root. Defaults to Stage 00 output if present, else merged HEALPix.",
+)
+@click.option(
+    "--output-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Experimental Stage 00b output directory.",
+)
+@click.option(
+    "--healpix",
+    "healpix_ids",
+    multiple=True,
+    help="HEALPix pixel directory name to process. May be passed multiple times.",
+)
+@click.option(
+    "--max-pixels",
+    type=int,
+    default=None,
+    help="Process at most this many HEALPix directories.",
+)
+@click.option(
+    "--bucket-size",
+    type=int,
+    default=None,
+    help=(
+        "Rows a packed staging node may hold before it becomes lower-mag limited. "
+        "Defaults to stage00b.bucket_size."
+    ),
+)
+@click.option(
+    "--batch-size",
+    type=int,
+    default=None,
+    help="Parquet batch size. Defaults to stage00.batch_size.",
+)
+@click.option(
+    "--fragment-target-rows",
+    type=int,
+    default=None,
+    help="Rows per physical Stage 00b parquet fragment. Defaults to stage00b.fragment_target_rows.",
+)
+@click.option(
+    "--max-open-writers",
+    type=int,
+    default=None,
+    help="Maximum open Stage 00b parquet writers. Defaults to stage00b.max_open_writers.",
+)
+@click.option(
+    "--compact-after-files",
+    type=int,
+    default=None,
+    help="Compact a node/healpix/kind group after this many files. Defaults to stage00b.compact_after_files.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Replace an existing Stage 00b output directory.",
+)
+def stage_00b(
+    project_path: Path,
+    input_root: Path | None,
+    output_dir: Path | None,
+    healpix_ids: tuple[str, ...],
+    max_pixels: int | None,
+    bucket_size: int | None,
+    batch_size: int | None,
+    fragment_target_rows: int | None,
+    max_open_writers: int | None,
+    compact_after_files: int | None,
+    force: bool,
+) -> None:
+    """Experimentally pack Stage 00 rows into adaptive staging buckets."""
+    from foundinspace.octree.sources.stage00b import Stage00bConfig, run_stage00b
+
+    project = _load_project_or_die(project_path)
+    mag_config = MagLevelConfig(
+        v_mag=project.stage00.v_mag,
+        max_level=project.stage00.max_level,
+    )
+    resolved_input = input_root
+    if resolved_input is None:
+        resolved_input = (
+            project.paths.stage00_output_dir
+            if project.paths.stage00_output_dir.is_dir()
+            else project.paths.merged_healpix_dir
+        )
+    resolved_output = (
+        output_dir if output_dir is not None else project.paths.stage00b_output_dir
+    )
+    config = Stage00bConfig(
+        input_root=resolved_input,
+        output_dir=resolved_output,
+        mag_config=mag_config,
+        max_level=project.stage00.max_level,
+        bucket_size=(
+            bucket_size if bucket_size is not None else project.stage00b.bucket_size
+        ),
+        batch_size=batch_size or project.stage00.batch_size,
+        fragment_target_rows=(
+            fragment_target_rows
+            if fragment_target_rows is not None
+            else project.stage00b.fragment_target_rows
+        ),
+        max_open_writers=(
+            max_open_writers
+            if max_open_writers is not None
+            else project.stage00b.max_open_writers
+        ),
+        compact_after_files=(
+            compact_after_files
+            if compact_after_files is not None
+            else project.stage00b.compact_after_files
+        ),
+        healpix_ids=tuple(healpix_ids),
+        max_pixels=max_pixels,
+        force=force,
+    )
+    click.echo(
+        "Stage 00b — adaptive staging buckets: "
+        f"{config.input_root} -> {config.output_dir}; "
+        f"bucket_size={config.bucket_size:,}; "
+        f"fragment_target_rows={config.fragment_target_rows:,}; "
+        f"max_open_writers={config.max_open_writers:,}; "
+        f"compact_after_files={config.compact_after_files:,}"
+    )
+    report_path = run_stage00b(config)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    click.echo(
+        "Stage 00b summary: "
+        f"healpix={len(report['processed_healpix'])}, "
+        f"rows={report['rows_in']:,}, "
+        f"nodes={report['staging_nodes']:,}, "
+        f"lower_mag_limited={report['lower_mag_limited_nodes']:,}, "
+        f"fragments={report['current_fragment_files']:,}, "
+        f"split_rewrites={report['split_rewrites']:,}, "
+        f"compaction_rewrites={report['compaction_rewrites']:,}"
+    )
+    click.echo(f"Stage 00b report written to {report_path}")
 
 
 @cli.command("stage-01")
