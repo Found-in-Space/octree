@@ -17,9 +17,9 @@ from foundinspace.octree.mag_levels import MagLevelConfig
 
 from .add_shard_columns import _enrich_table
 
-STAGE00B_FORMAT = "foundinspace.octree.stage00b/v0"
+STAGE00_FORMAT = "foundinspace.octree.stage00/v0"
 TREE_DIR_NAME = "tree"
-REPORT_NAME = "stage00b-report.json"
+REPORT_NAME = "stage00-report.json"
 LOWER_MAG_LIMITED_MARKER = "_LOWER_MAG_LIMITED"
 _FRAGMENT_RE = re.compile(r"^hp(?P<hp>.+?)-(?P<kind>pack|lim)-(?P<seq>\d+)\.parquet$")
 _HEALPIX_COLUMN_CANDIDATES = ("healpix", "healpix_id", "hp")
@@ -44,7 +44,7 @@ _COLUMN_TYPES = {
 
 
 @dataclass(frozen=True, slots=True)
-class Stage00bConfig:
+class Stage00Config:
     input_root: Path
     output_dir: Path
     mag_config: MagLevelConfig
@@ -114,8 +114,8 @@ class _OpenFragmentWriter:
     rows: int = 0
 
 
-class _Stage00bBuilder:
-    def __init__(self, config: Stage00bConfig) -> None:
+class _Stage00Builder:
+    def __init__(self, config: Stage00Config) -> None:
         self._config = config
         self._tree_dir = config.output_dir / TREE_DIR_NAME
         self._nodes: dict[tuple[int, ...], _BucketNode] = {}
@@ -180,7 +180,7 @@ class _Stage00bBuilder:
             1 for node in self._nodes.values() if node.lower_mag_limited
         )
         return {
-            "format": STAGE00B_FORMAT,
+            "format": STAGE00_FORMAT,
             "input_root": str(self._config.input_root),
             "output_dir": str(self._config.output_dir),
             "tree_dir": str(self._tree_dir),
@@ -499,11 +499,12 @@ class _Stage00bBuilder:
         self._compaction_rewrites += 1
 
 
-def run_stage00b(config: Stage00bConfig) -> Path:
-    """Build an experimental packed Stage 00b staging tree.
+def run_stage00(config: Stage00Config) -> Path:
+    """Build the packed Stage 00 staging tree.
 
-    The output is intentionally not consumed by Stage 01 yet. It is a probe for
-    adaptive staging buckets and split/rewrite behaviour.
+    Input may be raw merged HEALPix parquet or already enriched parquet. Rows are
+    routed into adaptive staging buckets, with lower magnitude limiting enabled
+    only after a bucket reaches the configured row cap.
     """
     config.validate()
     if config.force and config.output_dir.exists():
@@ -514,7 +515,7 @@ def run_stage00b(config: Stage00bConfig) -> Path:
         )
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
-    builder = _Stage00bBuilder(config)
+    builder = _Stage00Builder(config)
     processed_healpix: list[str] = []
     input_files = 0
 
@@ -541,7 +542,7 @@ def run_stage00b(config: Stage00bConfig) -> Path:
     return report_path
 
 
-def _selected_pixel_dirs(config: Stage00bConfig) -> list[Path]:
+def _selected_pixel_dirs(config: Stage00Config) -> list[Path]:
     if config.healpix_ids:
         dirs = [config.input_root / hp for hp in config.healpix_ids]
         missing = [str(p) for p in dirs if not p.is_dir()]
@@ -562,7 +563,7 @@ def _ensure_stage00_columns(table: pa.Table, mag_config: MagLevelConfig) -> pa.T
     names = set(table.schema.names)
     required = {"morton_code", "render", "level", "mag_abs"}
     if required.issubset(names):
-        return _normalize_stage00b_schema(_drop_healpix_columns(table))
+        return _normalize_stage00_schema(_drop_healpix_columns(table))
 
     raw_required = {"x_icrs_pc", "y_icrs_pc", "z_icrs_pc", "mag_abs"}
     missing = raw_required - names
@@ -577,7 +578,7 @@ def _ensure_stage00_columns(table: pa.Table, mag_config: MagLevelConfig) -> pa.T
         center=WORLD_CENTER.copy(),
         half_size=WORLD_HALF_SIZE_PC,
     )
-    return _normalize_stage00b_schema(_drop_healpix_columns(enriched))
+    return _normalize_stage00_schema(_drop_healpix_columns(enriched))
 
 
 def _drop_healpix_columns(table: pa.Table) -> pa.Table:
@@ -587,7 +588,7 @@ def _drop_healpix_columns(table: pa.Table) -> pa.Table:
     return table.drop(drop)
 
 
-def _normalize_stage00b_schema(table: pa.Table) -> pa.Table:
+def _normalize_stage00_schema(table: pa.Table) -> pa.Table:
     arrays: list[pa.ChunkedArray] = []
     fields: list[pa.Field] = []
     for source_field in table.schema:
@@ -639,12 +640,12 @@ def _safe_healpix_id(value: str) -> str:
 def _healpix_id_from_fragment(path: Path) -> str:
     match = _FRAGMENT_RE.match(path.name)
     if match is None:
-        raise ValueError(f"Invalid Stage 00b fragment filename: {path.name}")
+        raise ValueError(f"Invalid Stage 00 fragment filename: {path.name}")
     return match.group("hp")
 
 
 def _fragment_kind(path: Path) -> str:
     match = _FRAGMENT_RE.match(path.name)
     if match is None:
-        raise ValueError(f"Invalid Stage 00b fragment filename: {path.name}")
+        raise ValueError(f"Invalid Stage 00 fragment filename: {path.name}")
     return match.group("kind")

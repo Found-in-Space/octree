@@ -55,6 +55,10 @@ def test_stage00_help_contains_batch_size():
     result = runner.invoke(cli, ["stage-00", "--help"])
     assert result.exit_code == 0
     assert "--project" in result.output
+    assert "--bucket-size" in result.output
+    assert "--fragment-target-rows" in result.output
+    assert "--max-open-writers" in result.output
+    assert "--compact-after-files" in result.output
     assert "--force" in result.output
     assert "octree project TOML" in result.output
 

@@ -1,56 +1,70 @@
-# Stage 00: Per-Pixel Streaming Enrichment
+# Stage 00: Packed Octree Staging
 
 ## Purpose
 
-Stage 00 prepares merge output for Stage 01 by adding:
+Stage 00 prepares merged HEALPix parquet for octree assembly by computing missing
+octree columns and routing rows into a packed staging tree.
+
+The input is HEALPix-sharded parquet under:
+
+- `.../merged/healpix/{pixel}/*.parquet`
+
+The output is an octree-shaped staging filesystem under:
+
+- `.../octree/stage00/tree/o={octant}/.../*.parquet`
+
+Each fragment filename keeps the source HEALPix pixel, so a pixel can be deleted
+and reprocessed without scanning unrelated pixels:
+
+- `hp448-pack-000001.parquet`
+- `hp448-lim-000001.parquet`
+
+## Packing Semantics
+
+Every row still receives the same final octree `level` from the configured
+magnitude logic. Stage 00 only changes the staging layout.
+
+A staging node starts in packed mode. Rows whose final level is at or below that
+node may be written there until the node reaches `stage00.bucket_size`. Once the
+cap is reached, the node becomes lower-mag limited:
+
+1. Stage 00 writes `_LOWER_MAG_LIMITED` in the node directory.
+2. Existing `pack` fragments in that node are read once and deleted.
+3. Rows whose final level equals the node depth are rewritten as `lim` fragments.
+4. Fainter rows are routed into child octants, which repeat the same process.
+
+This keeps sparse fields shallow while avoiding repeated re-indexing of the same
+node. The cap is intentionally build-defining: changing it mid-run changes the
+intermediate layout.
+
+## Computed Columns
+
+If input parquet is not already enriched, Stage 00 adds:
 
 - `morton_code` (`uint64`)
 - `render` (fixed 16-byte payload)
 - `level` (`int32`)
 
-The input is expected to be HEALPix-sharded parquet under:
+Required raw input columns:
 
-- `.../merged/healpix/{pixel}/*.parquet`
+- `x_icrs_pc`, `y_icrs_pc`, `z_icrs_pc`
+- `mag_abs`
 
-Stage 00 processes one pixel directory at a time and writes enriched parquet to:
+For downstream sidecars and stable identity joins, merged input should also
+include:
 
-- `.../octree/stage00/{pixel}/*.parquet`
+- `source`
+- `source_id`
 
-Each output parquet part is sorted by `morton_code, mag_abs`.
+Optional:
 
-## Stage boundary
+- `teff` (if absent, defaults inside render encoding)
 
-Stage 00 starts from already merged, HEALPix-sharded parquet input.
+All other columns are preserved. HEALPix partition columns such as `healpix`,
+`healpix_id`, or `hp` are dropped because the pixel is encoded in the fragment
+filename.
 
-It does not perform catalog reconciliation tasks such as duplicate resolution, crossmatch decisions, or override policy. Its scope starts at per-row octree enrichment (`morton_code`, `render`, `level`) and file-local ordering for Stage 01.
-
-## Why this design
-
-- **Non-destructive**: source merge files are never modified in-place.
-- **Bounded memory**: rows are processed in project-configured batches.
-- **Disk-efficient**: no full-dataset intermediate copy; only per-pixel temporary run files.
-- **Stage 01-compatible**: output includes `render`, `level`, `morton_code`, and `mag_abs`.
-
-## Execution model
-
-For each pixel directory:
-
-1. Read source parquet in streaming batches.
-2. Compute `morton_code` from `x_icrs_pc`, `y_icrs_pc`, `z_icrs_pc`.
-3. Compute `render` and `level` from Morton/position/magnitude/temperature.
-4. Sort each batch by `morton_code, mag_abs`; write temporary batch runs.
-5. DuckDB merge-sorts the temporary runs and writes final pixel output shards (~1 GB each).
-6. Delete the pixel temporary runs.
-
-This gives local Morton ordering inside every output file, which improves Stage 01 row-group skipping.
-
-## CLI
-
-```bash
-uv run fis-octree stage-00 --project path/to/project.toml [--force]
-```
-
-Build-defining paths and parameters come from the project file.
+## Project Configuration
 
 Required project-file values for Stage 00:
 
@@ -59,6 +73,10 @@ Required project-file values for Stage 00:
 - `stage00.batch_size`
 - `stage00.v_mag`
 - `stage00.max_level`
+- `stage00.bucket_size`
+- `stage00.fragment_target_rows`
+- `stage00.max_open_writers`
+- `stage00.compact_after_files`
 
 Project-file path rules:
 
@@ -66,39 +84,30 @@ Project-file path rules:
 - relative paths are resolved from the project file directory
 - environment-variable expansion is not supported in TOML values
 
-CLI options:
+## CLI
 
-- `--force`: recompute pixels already present in output
+```bash
+uv run fis-octree stage-00 --project path/to/project.toml --force
+```
 
-## Required input columns
+Useful probe options:
 
-- `x_icrs_pc`, `y_icrs_pc`, `z_icrs_pc`
-- `mag_abs`
+- `--healpix 448`: process only one HEALPix directory; may be repeated.
+- `--max-pixels N`: process the first `N` HEALPix directories.
+- `--bucket-size N`: override `stage00.bucket_size` for this run.
+- `--fragment-target-rows N`: roll physical parquet fragments at this row count.
+- `--max-open-writers N`: cap concurrently open parquet writers.
+- `--compact-after-files N`: compact a node/healpix/kind group after this many files.
 
-For downstream sidecars and stable ordering, merged input should also include:
+## Output Report
 
-- `source`
-- `source_id`
+Stage 00 writes `stage00-report.json` with row counts, node counts, lower-mag
+limited node counts, fragment counts, split rewrites, compaction rewrites, and a
+depth summary.
 
-Optional:
+## Non-Goals
 
-- `teff` (if absent, defaults to `5800.0` for encoding)
-
-All other columns are preserved.
-
-## Output contract for Stage 01
-
-Stage 01 expects:
-
-- `render`
-- `level`
-- `morton_code`
-- `mag_abs`
-
-Stage 00 guarantees these columns are present on output parquet.
-
-## Non-goals
-
-- No global sort across all pixels (Stage 01 handles query ordering).
-- No bright/medium/faint directory split at Stage 00.
+- No catalog reconciliation, duplicate resolution, crossmatch policy, or manual
+  override logic.
+- No semantic change to the final magnitude-derived octree level.
 - No mutation of the source merge dataset.

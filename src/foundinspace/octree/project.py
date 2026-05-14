@@ -12,28 +12,28 @@ FORMAT_VERSION = 1
 _DEFAULT_MERGED_HEALPIX_DIR = "../data/processed/merged/healpix"
 _DEFAULT_IDENTIFIERS_MAP_PATH = "../data/processed/identifiers_map.parquet"
 _DEFAULT_STAGE00_OUTPUT_DIR = "artifacts/stage00"
-_DEFAULT_STAGE00B_OUTPUT_DIR = "artifacts/stage00b"
 _DEFAULT_STAGE01_OUTPUT_DIR = "artifacts/stage01"
 _DEFAULT_STAGE02_OUTPUT_PATH = "artifacts/stars.octree"
 _DEFAULT_IDENTIFIERS_ORDER_OUTPUT_PATH = "artifacts/identifiers.order"
 _DEFAULT_STAGE03_OUTPUT_DIR = "artifacts/stage03"
-_DEFAULT_STAGE00B_BUCKET_SIZE = 1_000_000
-_DEFAULT_STAGE00B_FRAGMENT_TARGET_ROWS = 100_000
-_DEFAULT_STAGE00B_MAX_OPEN_WRITERS = 128
-_DEFAULT_STAGE00B_COMPACT_AFTER_FILES = 64
+_DEFAULT_STAGE00_BUCKET_SIZE = 1_000_000
+_DEFAULT_STAGE00_FRAGMENT_TARGET_ROWS = 100_000
+_DEFAULT_STAGE00_MAX_OPEN_WRITERS = 128
+_DEFAULT_STAGE00_COMPACT_AFTER_FILES = 64
 
 _PATH_KEYS = {
     "merged_healpix_dir",
     "identifiers_map_path",
     "stage00_output_dir",
-    "stage00b_output_dir",
     "stage01_output_dir",
     "stage02_output_path",
     "identifiers_order_output_path",
     "stage03_output_dir",
 }
-_STAGE00_KEYS = {"batch_size", "v_mag", "max_level"}
-_STAGE00B_KEYS = {
+_STAGE00_KEYS = {
+    "batch_size",
+    "v_mag",
+    "max_level",
     "bucket_size",
     "fragment_target_rows",
     "max_open_writers",
@@ -55,7 +55,6 @@ class ProjectPaths:
     merged_healpix_dir: Path
     identifiers_map_path: Path
     stage00_output_dir: Path
-    stage00b_output_dir: Path
     stage01_output_dir: Path
     stage02_output_path: Path
     identifiers_order_output_path: Path
@@ -67,10 +66,6 @@ class Stage00ProjectConfig:
     batch_size: int
     v_mag: float
     max_level: int
-
-
-@dataclass(frozen=True, slots=True)
-class Stage00bProjectConfig:
     bucket_size: int
     fragment_target_rows: int
     max_open_writers: int
@@ -106,7 +101,6 @@ class OctreeProject:
     project_path: Path
     paths: ProjectPaths
     stage00: Stage00ProjectConfig
-    stage00b: Stage00bProjectConfig
     stage01: Stage01ProjectConfig
     stage02: Stage02ProjectConfig
     stage03: Stage03ProjectConfig
@@ -154,13 +148,6 @@ def _require_str(raw: dict[str, Any], key: str) -> str:
     return value
 
 
-def _optional_str(raw: dict[str, Any], key: str, default: str) -> str:
-    value = raw.get(key, default)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{key} must be a non-empty string")
-    return value
-
-
 def _resolve_path(project_dir: Path, value: str, *, field_name: str) -> Path:
     _reject_env_expansion(value, field_name=field_name)
     raw_path = Path(value)
@@ -199,16 +186,12 @@ def load_project(project_path: Path) -> OctreeProject:
     project_dir = resolved_project_path.parent
     paths_raw = _require_table(raw, "paths")
     stage00_raw = _require_table(raw, "stage00")
-    stage00b_raw = raw.get("stage00b", {})
-    if not isinstance(stage00b_raw, dict):
-        raise ValueError("stage00b must be a table")
     stage01_raw = _require_table(raw, "stage01")
     stage02_raw = _require_table(raw, "stage02")
     stage03_raw = _require_table(raw, "stage03")
 
     _reject_unknown_keys(paths_raw, allowed=_PATH_KEYS, table_name="paths")
     _reject_unknown_keys(stage00_raw, allowed=_STAGE00_KEYS, table_name="stage00")
-    _reject_unknown_keys(stage00b_raw, allowed=_STAGE00B_KEYS, table_name="stage00b")
     _reject_unknown_keys(stage01_raw, allowed=_STAGE01_KEYS, table_name="stage01")
     _reject_unknown_keys(stage02_raw, allowed=_STAGE02_KEYS, table_name="stage02")
     _reject_unknown_keys(stage03_raw, allowed=_STAGE03_KEYS, table_name="stage03")
@@ -228,15 +211,6 @@ def load_project(project_path: Path) -> OctreeProject:
             project_dir,
             _require_str(paths_raw, "stage00_output_dir"),
             field_name="paths.stage00_output_dir",
-        ),
-        stage00b_output_dir=_resolve_path(
-            project_dir,
-            _optional_str(
-                paths_raw,
-                "stage00b_output_dir",
-                _DEFAULT_STAGE00B_OUTPUT_DIR,
-            ),
-            field_name="paths.stage00b_output_dir",
         ),
         stage01_output_dir=_resolve_path(
             project_dir,
@@ -264,42 +238,39 @@ def load_project(project_path: Path) -> OctreeProject:
         batch_size=_require_int(stage00_raw, "batch_size"),
         v_mag=_require_float(stage00_raw, "v_mag"),
         max_level=_require_int(stage00_raw, "max_level"),
+        bucket_size=_optional_int(
+            stage00_raw,
+            "bucket_size",
+            _DEFAULT_STAGE00_BUCKET_SIZE,
+        ),
+        fragment_target_rows=_optional_int(
+            stage00_raw,
+            "fragment_target_rows",
+            _DEFAULT_STAGE00_FRAGMENT_TARGET_ROWS,
+        ),
+        max_open_writers=_optional_int(
+            stage00_raw,
+            "max_open_writers",
+            _DEFAULT_STAGE00_MAX_OPEN_WRITERS,
+        ),
+        compact_after_files=_optional_int(
+            stage00_raw,
+            "compact_after_files",
+            _DEFAULT_STAGE00_COMPACT_AFTER_FILES,
+        ),
     )
     if stage00.batch_size <= 0:
         raise ValueError("stage00.batch_size must be > 0")
     if stage00.max_level < 0:
         raise ValueError("stage00.max_level must be >= 0")
-
-    stage00b = Stage00bProjectConfig(
-        bucket_size=_optional_int(
-            stage00b_raw,
-            "bucket_size",
-            _DEFAULT_STAGE00B_BUCKET_SIZE,
-        ),
-        fragment_target_rows=_optional_int(
-            stage00b_raw,
-            "fragment_target_rows",
-            _DEFAULT_STAGE00B_FRAGMENT_TARGET_ROWS,
-        ),
-        max_open_writers=_optional_int(
-            stage00b_raw,
-            "max_open_writers",
-            _DEFAULT_STAGE00B_MAX_OPEN_WRITERS,
-        ),
-        compact_after_files=_optional_int(
-            stage00b_raw,
-            "compact_after_files",
-            _DEFAULT_STAGE00B_COMPACT_AFTER_FILES,
-        ),
-    )
-    if stage00b.bucket_size <= 0:
-        raise ValueError("stage00b.bucket_size must be > 0")
-    if stage00b.fragment_target_rows <= 0:
-        raise ValueError("stage00b.fragment_target_rows must be > 0")
-    if stage00b.max_open_writers <= 0:
-        raise ValueError("stage00b.max_open_writers must be > 0")
-    if stage00b.compact_after_files < 0:
-        raise ValueError("stage00b.compact_after_files must be >= 0")
+    if stage00.bucket_size <= 0:
+        raise ValueError("stage00.bucket_size must be > 0")
+    if stage00.fragment_target_rows <= 0:
+        raise ValueError("stage00.fragment_target_rows must be > 0")
+    if stage00.max_open_writers <= 0:
+        raise ValueError("stage00.max_open_writers must be > 0")
+    if stage00.compact_after_files < 0:
+        raise ValueError("stage00.compact_after_files must be >= 0")
 
     stage01 = Stage01ProjectConfig(
         input_glob=_resolve_glob(
@@ -359,7 +330,6 @@ def load_project(project_path: Path) -> OctreeProject:
         project_path=resolved_project_path,
         paths=paths,
         stage00=stage00,
-        stage00b=stage00b,
         stage01=stage01,
         stage02=stage02,
         stage03=Stage03ProjectConfig(sidecars=tuple(sidecars)),
@@ -368,7 +338,6 @@ def load_project(project_path: Path) -> OctreeProject:
 
 def render_project_template() -> str:
     stage00_output_dir = _DEFAULT_STAGE00_OUTPUT_DIR
-    stage00b_output_dir = _DEFAULT_STAGE00B_OUTPUT_DIR
     stage01_output_dir = _DEFAULT_STAGE01_OUTPUT_DIR
     stage02_output_path = _DEFAULT_STAGE02_OUTPUT_PATH
     identifiers_order_output_path = _DEFAULT_IDENTIFIERS_ORDER_OUTPUT_PATH
@@ -381,7 +350,6 @@ def render_project_template() -> str:
         f'merged_healpix_dir = "{_DEFAULT_MERGED_HEALPIX_DIR}"\n'
         f'identifiers_map_path = "{_DEFAULT_IDENTIFIERS_MAP_PATH}"\n'
         f'stage00_output_dir = "{stage00_output_dir}"\n'
-        f'stage00b_output_dir = "{stage00b_output_dir}"\n'
         f'stage01_output_dir = "{stage01_output_dir}"\n'
         f'stage02_output_path = "{stage02_output_path}"\n'
         f'identifiers_order_output_path = "{identifiers_order_output_path}"\n'
@@ -389,12 +357,11 @@ def render_project_template() -> str:
         "[stage00]\n"
         "batch_size = 1000000\n"
         f"v_mag = {DEFAULT_MAG_VIS}\n"
-        f"max_level = {DEFAULT_MAX_LEVEL}\n\n"
-        "[stage00b]\n"
-        f"bucket_size = {_DEFAULT_STAGE00B_BUCKET_SIZE}\n"
-        f"fragment_target_rows = {_DEFAULT_STAGE00B_FRAGMENT_TARGET_ROWS}\n"
-        f"max_open_writers = {_DEFAULT_STAGE00B_MAX_OPEN_WRITERS}\n"
-        f"compact_after_files = {_DEFAULT_STAGE00B_COMPACT_AFTER_FILES}\n\n"
+        f"max_level = {DEFAULT_MAX_LEVEL}\n"
+        f"bucket_size = {_DEFAULT_STAGE00_BUCKET_SIZE}\n"
+        f"fragment_target_rows = {_DEFAULT_STAGE00_FRAGMENT_TARGET_ROWS}\n"
+        f"max_open_writers = {_DEFAULT_STAGE00_MAX_OPEN_WRITERS}\n"
+        f"compact_after_files = {_DEFAULT_STAGE00_COMPACT_AFTER_FILES}\n\n"
         "[stage01]\n"
         f'input_glob = "{stage00_input_glob}"\n'
         "batch_size = 100000\n"

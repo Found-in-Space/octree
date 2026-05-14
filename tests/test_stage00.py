@@ -10,7 +10,7 @@ from click.testing import CliRunner
 from foundinspace.octree._cli import cli
 from foundinspace.octree.config import MORTON_BITS
 from foundinspace.octree.mag_levels import MagLevelConfig
-from foundinspace.octree.sources.stage00b import Stage00bConfig, run_stage00b
+from foundinspace.octree.sources.stage00 import Stage00Config, run_stage00
 
 
 def _morton_for_node(level: int, node_id: int) -> int:
@@ -43,10 +43,10 @@ def _write_stage00_pixel(
     pq.write_table(table, pixel_dir / part_name, compression="zstd")
 
 
-def test_stage00b_rewrites_packed_files_when_node_becomes_lower_mag_limited(
+def test_stage00_rewrites_packed_files_when_node_becomes_lower_mag_limited(
     tmp_path: Path,
 ) -> None:
-    input_root = tmp_path / "stage00"
+    input_root = tmp_path / "input"
     _write_stage00_pixel(
         input_root,
         "123",
@@ -88,9 +88,9 @@ def test_stage00b_rewrites_packed_files_when_node_becomes_lower_mag_limited(
         ],
     )
 
-    out_dir = tmp_path / "stage00b"
-    report_path = run_stage00b(
-        Stage00bConfig(
+    out_dir = tmp_path / "stage00"
+    report_path = run_stage00(
+        Stage00Config(
             input_root=input_root,
             output_dir=out_dir,
             mag_config=MagLevelConfig(v_mag=6.5, max_level=2),
@@ -118,10 +118,10 @@ def test_stage00b_rewrites_packed_files_when_node_becomes_lower_mag_limited(
     assert "healpix_id" not in child_table.schema.names
 
 
-def test_stage00b_rewrites_nested_octant_files_without_partition_columns(
+def test_stage00_rewrites_nested_octant_files_without_partition_columns(
     tmp_path: Path,
 ) -> None:
-    input_root = tmp_path / "stage00"
+    input_root = tmp_path / "input"
     _write_stage00_pixel(
         input_root,
         "448",
@@ -137,9 +137,9 @@ def test_stage00b_rewrites_nested_octant_files_without_partition_columns(
         ],
     )
 
-    out_dir = tmp_path / "stage00b"
-    report_path = run_stage00b(
-        Stage00bConfig(
+    out_dir = tmp_path / "stage00"
+    report_path = run_stage00(
+        Stage00Config(
             input_root=input_root,
             output_dir=out_dir,
             mag_config=MagLevelConfig(v_mag=6.5, max_level=3),
@@ -158,8 +158,8 @@ def test_stage00b_rewrites_nested_octant_files_without_partition_columns(
     assert len(list((tree / "o=0" / "o=0" / "o=0").glob("hp448-lim-*.parquet"))) == 1
 
 
-def test_stage00b_rolls_fragments_by_target_rows(tmp_path: Path) -> None:
-    input_root = tmp_path / "stage00"
+def test_stage00_rolls_fragments_by_target_rows(tmp_path: Path) -> None:
+    input_root = tmp_path / "input"
     _write_stage00_pixel(
         input_root,
         "200",
@@ -175,9 +175,9 @@ def test_stage00b_rolls_fragments_by_target_rows(tmp_path: Path) -> None:
         ],
     )
 
-    out_dir = tmp_path / "stage00b"
-    report_path = run_stage00b(
-        Stage00bConfig(
+    out_dir = tmp_path / "stage00"
+    report_path = run_stage00(
+        Stage00Config(
             input_root=input_root,
             output_dir=out_dir,
             mag_config=MagLevelConfig(v_mag=6.5, max_level=2),
@@ -195,8 +195,8 @@ def test_stage00b_rolls_fragments_by_target_rows(tmp_path: Path) -> None:
     assert [pq.ParquetFile(path).metadata.num_rows for path in files] == [2, 2, 1]
 
 
-def test_stage00b_normalizes_schema_for_rolling_writers(tmp_path: Path) -> None:
-    input_root = tmp_path / "stage00"
+def test_stage00_normalizes_schema_for_rolling_writers(tmp_path: Path) -> None:
+    input_root = tmp_path / "input"
     pixel_dir = input_root / "202"
     pixel_dir.mkdir(parents=True)
     common = {
@@ -216,9 +216,9 @@ def test_stage00b_normalizes_schema_for_rolling_writers(tmp_path: Path) -> None:
         pixel_dir / "part-1.parquet",
     )
 
-    out_dir = tmp_path / "stage00b"
-    report_path = run_stage00b(
-        Stage00bConfig(
+    out_dir = tmp_path / "stage00"
+    report_path = run_stage00(
+        Stage00Config(
             input_root=input_root,
             output_dir=out_dir,
             mag_config=MagLevelConfig(v_mag=6.5, max_level=2),
@@ -238,10 +238,10 @@ def test_stage00b_normalizes_schema_for_rolling_writers(tmp_path: Path) -> None:
     assert table.schema.field("source").type == pa.large_string()
 
 
-def test_stage00b_compacts_repeated_small_fragments_after_lru_churn(
+def test_stage00_compacts_repeated_small_fragments_after_lru_churn(
     tmp_path: Path,
 ) -> None:
-    input_root = tmp_path / "stage00"
+    input_root = tmp_path / "input"
     first_part = [
         {
             "source": "manual",
@@ -296,9 +296,9 @@ def test_stage00b_compacts_repeated_small_fragments_after_lru_churn(
             part_name=f"part-{part_idx}.parquet",
         )
 
-    out_dir = tmp_path / "stage00b"
-    report_path = run_stage00b(
-        Stage00bConfig(
+    out_dir = tmp_path / "stage00"
+    report_path = run_stage00(
+        Stage00Config(
             input_root=input_root,
             output_dir=out_dir,
             mag_config=MagLevelConfig(v_mag=6.5, max_level=2),
@@ -322,13 +322,13 @@ def test_stage00b_compacts_repeated_small_fragments_after_lru_churn(
     assert len(list((tree / "o=1").glob("hp201-pack-*.parquet"))) == 1
 
 
-def test_stage00b_help_contains_experimental_options() -> None:
+def test_stage00_help_contains_packed_options() -> None:
     runner = CliRunner()
-    result = runner.invoke(cli, ["stage-00b", "--help"])
+    result = runner.invoke(cli, ["stage-00", "--help"])
     assert result.exit_code == 0
     assert "--bucket-size" in result.output
     assert "--fragment-target-rows" in result.output
     assert "--max-open-writers" in result.output
     assert "--compact-after-files" in result.output
     assert "--healpix" in result.output
-    assert "adaptive staging buckets" in result.output
+    assert "adaptive Stage 00 staging buckets" in result.output
