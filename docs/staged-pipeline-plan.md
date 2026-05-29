@@ -16,6 +16,7 @@ Implemented on the current work branch:
 - Stage 00 accepts both directory-based HEALPix inputs and root-level parquet
   shard files.
 - Stage 00 preserves the input shard id in output fragment names.
+- Stage 00 reports group-level content checksums for current staged fragments.
 - Stage 00 has been smoke-tested against a 31M-row real parquet shard.
 - The current Stage 01, Stage 02, and Stage 03 commands still use the older
   compatibility path.
@@ -24,7 +25,7 @@ Not implemented yet:
 
 - tree identity manifests
 - mutable stage-state manifests
-- content checksums for staged row groups
+- persisted stage-state checksums for staged row groups
 - replace-one-shard Stage 00 mode
 - rewritten Stage 01 local sort and compaction
 - dirty propagation from Stage 01 into materialized final nodes
@@ -421,7 +422,7 @@ Tasks:
 
 - add tree identity manifest
 - add mutable stage-state manifest
-- add semantic row checksums
+- promote report-level group checksums into stage state
 - implement shard replacement mode
 - add tests for deterministic rebuild of the same shard
 - add tests for changed shard marking only changed groups dirty

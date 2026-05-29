@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -10,6 +11,7 @@ from typing import Any
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.ipc as pa_ipc
 import pyarrow.parquet as pq
 
 from foundinspace.octree.config import MORTON_BITS, WORLD_CENTER, WORLD_HALF_SIZE_PC
@@ -18,6 +20,7 @@ from foundinspace.octree.mag_levels import MagLevelConfig
 from .add_shard_columns import _enrich_table
 
 STAGE00_FORMAT = "foundinspace.octree.stage00/v0"
+STAGE00_GROUP_CHECKSUM_ALGORITHM = "arrow-ipc-sha256/v0"
 TREE_DIR_NAME = "tree"
 REPORT_NAME = "stage00-report.json"
 LOWER_MAG_LIMITED_MARKER = "_LOWER_MAG_LIMITED"
@@ -196,6 +199,7 @@ class _Stage00Builder:
             "max_open_writers": self._config.max_open_writers,
             "compact_after_files": self._config.compact_after_files,
             "max_level": self._config.max_level,
+            "group_checksum_algorithm": STAGE00_GROUP_CHECKSUM_ALGORITHM,
             "processed_healpix": processed_healpix,
             "input_files": input_files,
             "input_batches": self._batches,
@@ -214,7 +218,43 @@ class _Stage00Builder:
             "compaction_output_files": self._compaction_output_files,
             "max_open_writers_seen": self._max_open_writers_seen,
             "by_depth": [by_depth[d] for d in sorted(by_depth)],
+            "groups": self._group_reports(),
         }
+
+    def _group_reports(self) -> list[dict[str, Any]]:
+        groups: dict[tuple[tuple[int, ...], str, str], list[Path]] = {}
+        for node in self._nodes.values():
+            for path in sorted(node.current_files):
+                groups.setdefault(
+                    (
+                        node.path_octants,
+                        _healpix_id_from_fragment(path),
+                        _fragment_kind(path),
+                    ),
+                    [],
+                ).append(path)
+
+        rows: list[dict[str, Any]] = []
+        for (path_octants, healpix_id, kind), files in sorted(groups.items()):
+            checksum, row_count = _stage00_group_checksum(files)
+            rows.append(
+                {
+                    "key": _stage00_group_key(path_octants, healpix_id, kind),
+                    "node_path": _node_path_label(path_octants),
+                    "path_octants": list(path_octants),
+                    "depth": len(path_octants),
+                    "input_shard_id": healpix_id,
+                    "kind": kind,
+                    "file_count": len(files),
+                    "row_count": row_count,
+                    "content_checksum": checksum,
+                    "files": [
+                        path.relative_to(self._config.output_dir).as_posix()
+                        for path in files
+                    ],
+                }
+            )
+        return rows
 
     def _node_for_path(self, path_octants: tuple[int, ...]) -> _BucketNode:
         existing = self._nodes.get(path_octants)
@@ -643,6 +683,58 @@ def _normalize_stage00_schema(table: pa.Table) -> pa.Table:
             fields.append(pa.field(source_field.name, source_field.type))
         arrays.append(column)
     return pa.Table.from_arrays(arrays, schema=pa.schema(fields))
+
+
+def _stage00_group_key(
+    path_octants: tuple[int, ...],
+    healpix_id: str,
+    kind: str,
+) -> str:
+    return f"{_node_path_label(path_octants)}|{healpix_id}|{kind}"
+
+
+def _node_path_label(path_octants: tuple[int, ...]) -> str:
+    return "/".join(f"o={octant}" for octant in path_octants)
+
+
+def _stage00_group_checksum(paths: list[Path]) -> tuple[str, int]:
+    tables = [pq.read_table(path) for path in sorted(paths)]
+    canonical = _align_tables_to_union_schema(tables)
+    sink = pa.BufferOutputStream()
+    with pa_ipc.new_stream(sink, canonical.schema) as writer:
+        writer.write_table(canonical)
+    digest = hashlib.sha256(sink.getvalue()).hexdigest()
+    return f"sha256:{digest}", len(canonical)
+
+
+def _align_tables_to_union_schema(tables: list[pa.Table]) -> pa.Table:
+    fields: dict[str, pa.DataType] = {}
+    field_order: list[str] = []
+    for table in tables:
+        for schema_field in table.schema:
+            existing = fields.get(schema_field.name)
+            if existing is None:
+                fields[schema_field.name] = schema_field.type
+                field_order.append(schema_field.name)
+            elif not existing.equals(schema_field.type):
+                raise ValueError(
+                    "Cannot checksum Stage 00 group with conflicting field types: "
+                    f"{schema_field.name} has both {existing} and {schema_field.type}"
+                )
+
+    schema = pa.schema(pa.field(name, fields[name]) for name in field_order)
+    aligned: list[pa.Table] = []
+    for table in tables:
+        arrays: list[pa.ChunkedArray | pa.Array] = []
+        for schema_field in schema:
+            if schema_field.name in table.schema.names:
+                arrays.append(table.column(schema_field.name))
+            else:
+                arrays.append(pa.nulls(len(table), type=schema_field.type))
+        aligned.append(pa.Table.from_arrays(arrays, schema=schema))
+    if not aligned:
+        return pa.table({})
+    return pa.concat_tables(aligned, promote_options="none").combine_chunks()
 
 
 def _level_array(table: pa.Table) -> np.ndarray:

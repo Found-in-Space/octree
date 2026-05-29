@@ -59,6 +59,16 @@ def _write_stage00_shard_file(root: Path, shard: str, rows: list[dict]) -> None:
     )
 
 
+def _group_checksums(report: dict) -> dict[tuple[str, str, str], tuple[int, str]]:
+    return {
+        (row["node_path"], row["input_shard_id"], row["kind"]): (
+            row["row_count"],
+            row["content_checksum"],
+        )
+        for row in report["groups"]
+    }
+
+
 def test_stage00_rewrites_packed_files_when_node_becomes_lower_mag_limited(
     tmp_path: Path,
 ) -> None:
@@ -132,6 +142,19 @@ def test_stage00_rewrites_packed_files_when_node_becomes_lower_mag_limited(
 
     child_table = pq.read_table(next((tree / "o=0").glob("hp123-pack-*.parquet")))
     assert "healpix_id" not in child_table.schema.names
+    assert report["group_checksum_algorithm"] == "arrow-ipc-sha256/v0"
+    assert {
+        (row["node_path"], row["input_shard_id"], row["kind"])
+        for row in report["groups"]
+    } == {
+        ("", "124", "lim"),
+        ("o=0", "123", "pack"),
+        ("o=1", "124", "pack"),
+    }
+    for row in report["groups"]:
+        assert row["content_checksum"].startswith("sha256:")
+        assert row["row_count"] > 0
+        assert row["file_count"] == len(row["files"])
 
 
 def test_stage00_accepts_root_level_parquet_shards(tmp_path: Path) -> None:
@@ -174,6 +197,55 @@ def test_stage00_accepts_root_level_parquet_shards(tmp_path: Path) -> None:
     assert report["input_files"] == 1
     assert report["rows_current"] == 2
     assert len(list((out_dir / "tree").glob("hpbatch-001-pack-*.parquet"))) == 1
+    assert _group_checksums(report).keys() == {("", "batch-001", "pack")}
+
+
+def test_stage00_group_checksums_do_not_depend_on_fragment_boundaries(
+    tmp_path: Path,
+) -> None:
+    input_root = tmp_path / "input"
+    rows = [
+        {
+            "source": "gaia",
+            "source_id": str(idx),
+            "morton_code": _morton_for_node(2, idx % 2),
+            "level": 2,
+            "mag_abs": 8.0 + idx,
+        }
+        for idx in range(5)
+    ]
+    _write_stage00_pixel(input_root, "200", rows)
+
+    compact_report_path = run_stage00(
+        Stage00Config(
+            input_root=input_root,
+            output_dir=tmp_path / "compact",
+            mag_config=MagLevelConfig(v_mag=6.5, max_level=2),
+            max_level=2,
+            bucket_size=100,
+            batch_size=10,
+            fragment_target_rows=10,
+            compact_after_files=0,
+        )
+    )
+    split_report_path = run_stage00(
+        Stage00Config(
+            input_root=input_root,
+            output_dir=tmp_path / "split",
+            mag_config=MagLevelConfig(v_mag=6.5, max_level=2),
+            max_level=2,
+            bucket_size=100,
+            batch_size=10,
+            fragment_target_rows=2,
+            compact_after_files=0,
+        )
+    )
+
+    compact_report = json.loads(compact_report_path.read_text(encoding="utf-8"))
+    split_report = json.loads(split_report_path.read_text(encoding="utf-8"))
+    assert compact_report["current_fragment_files"] == 1
+    assert split_report["current_fragment_files"] == 3
+    assert _group_checksums(compact_report) == _group_checksums(split_report)
 
 
 def test_stage00_rewrites_nested_octant_files_without_partition_columns(
