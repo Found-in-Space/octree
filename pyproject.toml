@@ -11,6 +11,7 @@ license = "MIT"
 requires-python = ">=3.13"
 dependencies = [
     "astropy>=7.2.0",
+    "boto3>=1.40.0",
     "click>=8.3.1",
     "duckdb>=1.5.1",
     "numpy>=2.4.3",
@@ -27,6 +28,7 @@ Repository = "https://github.com/Found-in-Space/octree"
 
 [project.scripts]
 fis-octree = "foundinspace.octree._cli:cli"
+s3-resume = "foundinspace.octree.s3_resume.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/foundinspace"]
