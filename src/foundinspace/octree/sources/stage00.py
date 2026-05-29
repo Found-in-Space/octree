@@ -803,8 +803,9 @@ def _run_stage00_replacement(
         dirty={
             "stage01_groups": changed_group_keys,
             "deleted_stage00_groups": deleted_group_keys,
-            "stage03_nodes": [],
+            "stage03_nodes": list(state.get("dirty", {}).get("stage03_nodes", [])),
         },
+        stage01_groups=list(state.get("stage01_groups", [])),
     )
     _atomic_write_json(state_path, next_state)
     _atomic_write_json(config.output_dir / REPORT_NAME, report)
@@ -861,8 +862,9 @@ def _stage_state(
     input_shards: list[dict[str, Any]],
     groups: list[dict[str, Any]],
     dirty: dict[str, list[str]],
+    stage01_groups: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    return {
+    state = {
         "format": STAGE_STATE_FORMAT,
         "tree_manifest": TREE_MANIFEST_NAME,
         "tree_identity": _tree_identity(config),
@@ -873,6 +875,9 @@ def _stage_state(
         "stage00_groups": [_state_group(group) for group in groups],
         "dirty": dirty,
     }
+    if stage01_groups is not None:
+        state["stage01_groups"] = stage01_groups
+    return state
 
 
 def _state_group(group: dict[str, Any]) -> dict[str, Any]:

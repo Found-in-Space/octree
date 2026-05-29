@@ -226,32 +226,51 @@ def stage_00(
     type=click.Path(exists=True, dir_okay=False, path_type=Path),
     help="Path to octree project TOML.",
 )
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Replace existing Stage 01 sorted output and rebuild all groups.",
+)
 def stage_01(
     project_path: Path,
+    force: bool,
 ) -> None:
-    """Build intermediate shard files from project-configured Stage 00 parquet."""
-    from foundinspace.octree.assembly import BuildPlan, build_intermediates
+    """Sort and compact Stage 00 groups into deterministic Stage 01 groups."""
+    from foundinspace.octree.sources.stage01 import Stage01Config, run_stage01
 
     project = _load_project_or_die(project_path)
-
-    plan = BuildPlan(
+    config = Stage01Config(
+        stage00_output_dir=project.paths.stage00_output_dir,
+        output_dir=project.paths.stage01_output_dir,
+        mag_config=MagLevelConfig(
+            v_mag=project.stage00.v_mag,
+            max_level=project.stage00.max_level,
+        ),
         max_level=project.stage00.max_level,
-        deep_shard_from_level=project.stage01.deep_shard_from_level,
-        deep_prefix_bits=project.stage01.deep_prefix_bits,
+        bucket_size=project.stage00.bucket_size,
         batch_size=project.stage01.batch_size,
-        mag_limit=project.stage00.v_mag,
+        fragment_target_rows=project.stage00.fragment_target_rows,
+        force=force,
     )
-
-    manifest_path = build_intermediates(
-        project.stage01.input_glob,
-        project.paths.stage01_output_dir,
-        plan=plan,
-    )
-    click.echo(f"Render manifest written to {manifest_path}")
     click.echo(
-        "Identifiers manifest written to "
-        f"{project.paths.stage01_output_dir / IDENTIFIERS_MANIFEST_NAME}"
+        "Stage 01 — sort staged groups: "
+        f"{config.stage00_output_dir} -> {config.output_dir}; "
+        f"fragment_target_rows={config.fragment_target_rows:,}; "
+        f"batch_size={config.batch_size:,}; "
+        f"force={config.force}"
     )
+    report_path = run_stage01(config)
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    click.echo(
+        "Stage 01 summary: "
+        f"processed_groups={report['processed_group_count']:,}, "
+        f"changed_groups={report['changed_group_count']:,}, "
+        f"unchanged_groups={report['unchanged_group_count']:,}, "
+        f"deleted_groups={report['deleted_group_count']:,}, "
+        f"dirty_stage03_nodes={report['dirty_stage03_node_count']:,}, "
+        f"files_written={report['output_files_written']:,}"
+    )
+    click.echo(f"Stage 01 report written to {report_path}")
 
 
 @cli.command("stage-02")

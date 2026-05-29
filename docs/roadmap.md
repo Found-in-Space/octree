@@ -6,19 +6,18 @@ The clean-break base-dataset / sidecar architecture is implemented. Stage
 numbering is being revised around the packed staging tree described in
 `docs/stages.md`.
 
-The current pipeline is:
+The staged pipeline is moving toward:
 
 - Stage 00: `(node, input_shard_id, kind)` staging partition
 - Stage 01: in-place staging sort and compaction
-- Stage 02: optional payload re-encoding
-- Stage 03: canonical payload-order materialization
-- Stage 04: `stars.octree` plus identity/order packaging
-- Stage 05: named sidecar families
+- Stage 03: final output-profile assembly, including `stars.octree`,
+  `identifiers.order`, and sidecar artifacts
 
 The current format also includes UUID-backed descriptor metadata:
 
 - render octrees carry `dataset_uuid`
-- sidecars carry `parent_dataset_uuid`, `sidecar_uuid`, and `sidecar_kind`
+- sidecars carry `parent_dataset_uuid`, `sidecar_uuid`, and embedded schema
+  metadata
 - `identifiers.order` carries `parent_dataset_uuid` plus its own artifact UUID
 
 ## Implemented Requirements
@@ -37,15 +36,16 @@ Readers and stats helpers should reject a sidecar when that UUID does not match 
 
 Sidecars now expose `sidecar_uuid`.
 
-Rebuilding a sidecar family for the same render dataset produces a new `sidecar_uuid`.
+Rebuilding a sidecar artifact for the same render dataset produces a new
+`sidecar_uuid`.
 
-### Named Sidecar Registry
+### Schema-Bearing Sidecar Artifacts
 
-Sidecar builds are configured by family name via `[[stage03.sidecars]]` in the
-current implementation. In the revised stage model this responsibility moves to
-Stage 05.
+Sidecars are independent artifacts with their own embedded schema. Discovery can
+list sidecar names and paths, but runtime decoding should be driven by the
+sidecar's schema metadata rather than a separate family registry.
 
-`meta` is the first implemented family.
+`meta` is the first implemented sidecar definition.
 
 ### Foundational Identifiers / Order Artifact
 
@@ -66,9 +66,10 @@ Operational build commands now require an explicit project file and reject remov
 
 ## Remaining Future Work
 
-The new architecture creates room for later extensions without changing the clean stage boundary:
+The new architecture creates room for later extensions without changing the
+clean stage boundary:
 
-- more Stage 05 sidecar families beyond `meta`
+- more sidecar artifacts beyond `meta`
 - reverse lookup artifacts derived from `identifiers.order`
 - richer provenance metadata for published manifests
 - additional reader helpers for sidecar discovery beyond explicit `--meta-octree`

@@ -19,20 +19,18 @@ Implemented on the current work branch:
 - Stage 00 preserves the input shard id in output fragment names.
 - Stage 00 reports group-level content checksums for current staged fragments.
 - Stage 00 has been smoke-tested against a 31M-row real parquet shard.
-- The current Stage 01, Stage 02, and Stage 03 commands still use the older
-  compatibility path.
+- Stage 00 writes tree identity and mutable stage-state manifests.
+- Stage 00 supports explicit shard replacement and dirty Stage 01 group
+  tracking.
+- Stage 01 sorts and compacts Stage 00 groups into replaceable sorted parquet
+  groups while preserving `(staging_node, input_shard_id, kind)` granularity.
 
 Not implemented yet:
 
-- tree identity manifests
-- mutable stage-state manifests
-- persisted stage-state checksums for staged row groups
-- replace-one-shard Stage 00 mode
-- rewritten Stage 01 local sort and compaction
-- dirty propagation from Stage 01 into materialized final nodes
-- Stage 03 materialized payload-order files
-- Stage 04 packaging from Stage 03 byte ranges
-- partial Stage 04 artifact replacement
+- Stage 03 final octree assembly from Stage 01 sorted groups
+- named Stage 03 output profiles
+- dedicated sidecar builds per Stage 03 output profile
+- removal of the obsolete Stage 02 command and old intermediate-shard pipeline
 
 ## Target Pipeline
 
@@ -40,18 +38,52 @@ Not implemented yet:
 |---|---|---|---|
 | Stage 00 | Partition input shards into staging buckets. | Input shard and staging node. | Raw staged parquet groups. |
 | Stage 01 | Sort and compact staged groups. | Staging node, shard id, and fragment kind. | Canonical sorted staged groups. |
-| Stage 02 | Rewrite payload bytes without changing placement. | Same as Stage 01. | Updated payload columns or fragments. |
-| Stage 03 | Materialize final node payload order. | Final octree node or materialized node group. | Raw payload-order byte arrays plus identity order. |
-| Stage 04 | Pack final base artifacts. | Final package or packable byte ranges. | `stars.octree` and `identifiers.order`. |
-| Stage 05 | Build derived sidecars. | Sidecar family and affected identities. | Sidecar octrees such as `meta.octree`. |
+| Stage 03 | Assemble final output profiles. | Output profile and final octree node. | `stars.octree`, `identifiers.order`, and dedicated sidecars per profile. |
 
 The stage split is intentional:
 
 - Stage 00 does spatial placement once.
 - Stage 01 makes staged input deterministic and compact.
-- Stage 03 is where final renderer order becomes canonical.
-- Stage 04 is packaging, not indexing.
-- Stage 05 depends on stable identity order, not on Stage 00 parquet.
+- Stage 03 is where final renderer order becomes canonical and packaged.
+- Stage 03 builds sidecars against the exact identity order of each output
+  profile.
+
+There is no Stage 02 in the target pipeline. The old Stage 02 command combined
+intermediate shards into `stars.octree`; that responsibility moves into Stage
+03. The old Stage 03 command built sidecars from global Stage 02 artifacts; that
+becomes a per-output-profile Stage 03 subtask.
+
+### Output Profiles
+
+Stage 03 builds one or more named output profiles from the same Stage 01 sorted
+groups. Each profile owns its render octree, identity-order artifact, manifest,
+dataset UUID, and sidecars.
+
+Required profiles:
+
+- `classic`: cap final output at level 14 and preserve today's octree semantics
+  and binary compatibility where practical.
+- `unbounded`: allow final output through `MORTON_BITS` / level 21, relying on
+  magnitude placement and Stage 00 packing so very deep nodes are rare.
+
+Recommended output layout:
+
+```text
+stage03/classic/stars.octree
+stage03/classic/identifiers.order
+stage03/classic/sidecars/meta.octree
+
+stage03/unbounded/stars.octree
+stage03/unbounded/identifiers.order
+stage03/unbounded/sidecars/meta.octree
+```
+
+Sidecar artifacts are never shared between profiles. A profile's node set and
+identity order define the sidecar order, and each sidecar artifact must carry
+that profile's parent dataset UUID. Sidecars are schema-bearing artifacts: a
+reader should be able to open a sidecar, validate its parent dataset UUID when
+joining with a render octree, inspect the embedded schema, and decode typed
+records without knowing a separate sidecar "family" registry.
 
 ## Invariants
 
@@ -100,7 +132,7 @@ fragments.
 Stage 01 is responsible for deterministic local ordering. Stage 03 is
 responsible for deterministic final node ordering.
 
-The provisional Stage 01 sort key is:
+The Stage 01 sort key is:
 
 ```text
 level, final_node_id, mag_abs, source, source_id
@@ -112,8 +144,8 @@ where:
 final_node_id = morton_code >> (3 * (MORTON_BITS - level))
 ```
 
-This key should be reviewed before implementation. If the renderer or sidecar
-builders need a different tie-breaker, the manifest version must change.
+If the renderer or sidecar builders need a different tie-breaker, the Stage 01
+manifest/state version must change.
 
 ### Checksums
 
@@ -124,11 +156,11 @@ Recommended checksum layers:
 - Stage 00 group checksum: canonical row content for one
   `(staging_node, input_shard_id, kind)` group.
 - Stage 01 group checksum: canonical sorted content for that group.
-- Stage 03 node checksum: final payload-order bytes plus identity-order bytes
-  for one final node or materialized node group.
-- Stage 04 artifact checksum: packaged output or packable byte range.
-- Stage 05 sidecar checksum: sidecar family output for the affected identity
-  order.
+- Stage 03 node checksum: final render payload bytes plus identity-order bytes
+  for one profile node.
+- Stage 03 artifact checksum: packaged output for one profile artifact.
+- Stage 03 sidecar checksum: one schema-bearing sidecar artifact for one
+  profile's identity order.
 
 If a stage recomputes the same semantic checksum, dirty propagation stops there.
 
@@ -241,7 +273,14 @@ Sketch:
   "dirty": {
     "stage00_groups": [],
     "stage01_groups": [],
-    "stage03_nodes": []
+    "stage03_profiles": {
+      "classic": {
+        "nodes": []
+      },
+      "unbounded": {
+        "nodes": []
+      }
+    }
   }
 }
 ```
@@ -270,14 +309,6 @@ Modes:
 
 - full rebuild: empty output tree or `--force`
 - shard replace: delete and rebuild one or more input shards
-- dry scan: report which shards would be processed and which settings mismatch
-
-Next implementation tasks:
-
-- write tree identity manifest
-- write stage-state manifest
-- add shard replacement mode
-- persist Stage 00 group content checksums into stage-state
 
 ### Stage 01
 
@@ -292,13 +323,14 @@ Outputs:
 
 - sorted compacted staged groups
 - updated Stage 01 group checksums
-- dirty Stage 03 node set
+- dirty Stage 03 node set, moving to per-profile dirty sets once Stage 03
+  profiles are introduced
 
 Stage 01 should not do a global catalogue sort. It should operate on local
 groups. DuckDB may still be used as a local sorting engine, but the query scope
 should be one group or one staging node, not the full tree.
 
-New Stage 01 MVP:
+Stage 01 behavior:
 
 1. Walk Stage 00 groups.
 2. For each dirty or unsorted group, read all fragment files.
@@ -308,83 +340,52 @@ New Stage 01 MVP:
 6. Atomically swap files.
 7. If checksum changed, mark affected final nodes dirty.
 
-### Stage 02
-
-Stage 02 exists only for payload byte changes that do not affect placement or
-ordering.
-
-It should refuse changes that affect:
-
-- `morton_code`
-- `level`
-- `mag_abs` if used by sort order
-- source identity tie-breakers
-
-This stage can be deferred until Stage 01 and Stage 03 boundaries are stable.
-
 ### Stage 03
 
 Inputs:
 
 - sorted Stage 01 groups
-- dirty final-node set
+- stage-state manifest
+- output profile config
+- sidecar artifact definitions
+- enrichment inputs for sidecars
 
 Outputs:
 
-- raw payload-order byte arrays
-- identity-order byte arrays or side files
-- manifest of final node byte ranges
-- per-node checksums
+- one output directory per profile
+- `stars.octree` per profile
+- `identifiers.order` per profile
+- sidecar octrees per profile, such as `sidecars/meta.octree`
+- profile manifest with node checksums, artifact checksums, dataset UUID,
+  sidecar UUIDs, and sidecar schema descriptors
 
 Stage 03 is where packed staging nodes are expanded into final render nodes.
 Rows in a packed staging node may have deeper final `level` values. Stage 03
-must route those rows to the final node payloads.
+must route those rows to final node payloads for each output profile.
+
+Profile behavior:
+
+- `classic` clamps output to level 14. Rows with deeper final levels are
+  materialized into the corresponding level-14 node using the Stage 03
+  canonical order for that profile.
+- `unbounded` materializes rows at their Stage 00 final levels through level
+  21.
+- Both profiles can use the same sidecar definitions, but each profile writes
+  its own sidecar artifacts because profile identity order can differ.
 
 Dirty propagation:
 
-- If a Stage 01 group checksum changes, map its rows to affected final nodes.
-- Rebuild only those final node ranges.
-- If rebuilt Stage 03 checksums are unchanged, Stage 04 does not need to run for
-  those nodes.
+- If a Stage 01 group checksum changes, map its rows to affected final nodes for
+  each profile.
+- Rebuild only those profile nodes when possible.
+- If rebuilt Stage 03 node checksums are unchanged, the profile artifact can be
+  left untouched.
 
-### Stage 04
+Short-term packaging behavior:
 
-Inputs:
-
-- Stage 03 byte arrays
-- Stage 03 identity order
-- Stage 03 manifest
-
-Outputs:
-
-- `stars.octree`
-- `identifiers.order`
-
-Stage 04 should not read Stage 00 or Stage 01 parquet during a normal build.
-
-Open question:
-
-- Can `stars.octree` support localized replacement, or should Stage 04 always
-  repack the full artifact from Stage 03 outputs?
-
-The short-term answer can be full repack. That still avoids repeating Stage 00
-and Stage 01 work.
-
-### Stage 05
-
-Inputs:
-
-- Stage 04 base dataset
-- `identifiers.order`
-- sidecar family config
-- enrichment inputs
-
-Outputs:
-
-- sidecar octrees such as `meta.octree`
-
-Stage 05 should rebuild by sidecar family. If the base identity order is
-unchanged, sidecars can be rebuilt without touching Stage 00 through Stage 04.
+- Stage 03 may fully repack a profile artifact from Stage 03 node outputs.
+- Partial binary patching can be considered later, after the profile manifest
+  and node checksum model are stable.
 
 ## Change Propagation
 
@@ -398,19 +399,19 @@ Example: edit one star in one input shard.
 6. Stage 01 sorts only dirty groups.
 7. Unchanged Stage 01 checksums stop.
 8. Changed Stage 01 groups mark affected Stage 03 final nodes dirty.
-9. Stage 03 rematerializes dirty final nodes.
+9. Stage 03 rematerializes dirty final nodes for each output profile.
 10. Unchanged Stage 03 node checksums stop.
-11. Stage 04 repacks or patches only if required.
-12. Stage 05 rebuilds sidecars only if their inputs changed.
+11. Stage 03 repacks or patches profile artifacts only if required.
+12. Stage 03 rebuilds sidecar artifacts only for profiles/sidecars whose inputs
+    changed.
 
 Example: change render payload encoding but not placement.
 
 1. Stage 00 is unchanged.
 2. Stage 01 ordering is unchanged.
-3. Stage 02 rewrites payload bytes.
-4. Stage 03 rematerializes affected payload-order ranges.
-5. Stage 04 repacks the base artifact.
-6. Stage 05 sidecars rebuild only if they consume changed values.
+3. Stage 03 rematerializes affected profile nodes from Stage 01 rows.
+4. Stage 03 repacks the profile render artifact.
+5. Stage 03 sidecars rebuild only if they consume changed values.
 
 Example: change magnitude limit or max level.
 
@@ -424,91 +425,84 @@ Example: change magnitude limit or max level.
 
 Goal: make Stage 00 output reusable, replaceable, and comparable.
 
-Tasks:
+Status: implemented.
 
-- add tree identity manifest
-- add mutable stage-state manifest
-- promote report-level group checksums into stage state
-- implement shard replacement mode
-- add tests for deterministic rebuild of the same shard
-- add tests for changed shard marking only changed groups dirty
+Remaining cleanup:
+
+- keep Stage 00 state compatible with Stage 03 profile dirty sets as those are
+  introduced
 
 ### B. Stage 01 Rewrite
 
 Goal: replace global Stage 01 assembly with local sort and compaction.
 
-Tasks:
+Status: implemented.
 
-- define sorted fragment filename convention
-- implement local group scan
-- implement local sort and compact
-- implement sorted checksums
-- mark affected Stage 03 nodes dirty
-- keep current old Stage 01 available under a temporary compatibility path if
-  needed
+Remaining cleanup:
 
-### C. Stage 03 Materialization
+- update Stage 01 dirty output from a single `stage03_nodes` list to per-profile
+  dirty sets once Stage 03 profile configs exist
 
-Goal: materialize final node payload and identity order from sorted staged data.
+### C. Stage 03 Profiles And Final Assembly
+
+Goal: build final render, identity-order, and sidecar artifacts from sorted
+Stage 01 groups for each configured output profile.
 
 Tasks:
 
-- define Stage 03 manifest schema
-- define materialized byte array layout
-- implement merge of sorted `(node, shard, kind)` groups
-- fan out packed staging rows to final nodes
-- write payload ranges and identity ranges
-- compute per-node checksums
+- define output profile config, including `classic` level-14 cap and
+  `unbounded` level-21 output
+- define Stage 03 profile manifest schema
+- map Stage 01 final nodes to profile nodes, including classic level clamping
+- merge sorted `(node, shard, kind)` groups into profile node payload and
+  identity order
+- build profile `stars.octree` and `identifiers.order`
+- build each configured sidecar artifact into the profile directory
+- embed each sidecar's schema/descriptor in the sidecar artifact
+- compute per-node, artifact, identity-order, and sidecar checksums
+- preserve dataset UUID and descriptor metadata per profile
+- verify classic profile reader compatibility against today's output semantics
 
-### D. Stage 04 Packaging
+### D. Deletion And Project Model Cleanup
 
-Goal: package Stage 03 outputs into final base artifacts without re-indexing.
+Goal: remove obsolete old-pipeline concepts and make the new process hard to
+misuse.
 
-Tasks:
+Delete or replace:
 
-- build `stars.octree` from Stage 03 ranges
-- build `identifiers.order` from Stage 03 identity order
-- decide full repack vs partial patching
-- preserve UUID and descriptor metadata
-- verify reader compatibility
-
-### E. Stage 05 Sidecars
-
-Goal: move sidecar builds behind the Stage 04 dataset boundary.
-
-Tasks:
-
-- use `identifiers.order` as the canonical order source
-- build sidecars by family
-- record sidecar manifests and checksums
-- rebuild sidecar families independently
-
-### F. CLI And Project Model
-
-Goal: make the new process operable and hard to misuse.
+- `stage-02` CLI command
+- `[stage02]` project config and `stage02.max_open_files`
+- old Stage 01 intermediate-shard builder path, including `assembly/build.py`
+  and `assembly/row_source.py`
+- old Stage 03 sidecar builder that assumes global `stage02_output_path` and
+  global `identifiers.order`
+- old tests that only cover the removed Stage 02 command
+- old assembly/combine helpers that are not reused by the new Stage 03 packer
 
 Tasks:
 
-- add commands for dirty-only operation
-- add replace-shard options
+- add project output-profile config
+- make `stage-03` build one or all configured profiles
+- make command output report reused vs rebuilt work per profile and sidecar
 - expose plan/dry-run commands
 - keep project config strict about build-defining identity
-- make command output report reused vs rebuilt work
 
 ## Suggested Implementation Order
 
-1. Stage 00 manifests and semantic checksums.
-2. Stage 00 shard replacement.
-3. Stage 01 local sort and compaction MVP.
-4. Stage 01 dirty-only mode.
-5. Stage 03 materialization format and manifest.
-6. Stage 04 full repack from Stage 03.
-7. Stage 05 rebuild from Stage 04 identity order.
-8. Optional Stage 02 payload re-encoding.
-9. Optional Stage 04 partial patching.
+1. Define project output-profile config and default `classic` / `unbounded`
+   profiles.
+2. Define Stage 03 profile manifest and state schema.
+3. Implement profile node mapping from Stage 01 groups, including classic
+   level-14 clamping and unbounded level-21 output.
+4. Implement profile `stars.octree` and `identifiers.order` assembly with full
+   repack.
+5. Implement dedicated sidecar build per profile.
+6. Remove the obsolete Stage 02 CLI/config/tests and old global sidecar path.
+7. Add dirty-only Stage 03 rebuild and per-profile reuse reporting.
+8. Optional: add partial artifact patching after full-repack Stage 03 is stable.
 
-This order keeps each step testable and avoids designing partial artifact
-patching before the reusable staging layers are proven.
+This order keeps each step testable and avoids designing partial binary patching
+before profile manifests and node checksums are proven.
 
 ## Validation Plan
 
@@ -517,34 +511,36 @@ Unit tests:
 - same shard input produces same Stage 00 semantic checksums
 - changed input shard dirties only changed groups
 - unchanged Stage 01 sorted checksum stops propagation
-- Stage 03 maps packed staging rows to final nodes correctly
-- sidecar parent UUID validation continues to work
+- Stage 03 maps packed staging rows to profile nodes correctly
+- classic profile clamps rows deeper than level 14 into level-14 nodes
+- unbounded profile preserves final levels through level 21
+- sidecar parent UUID validation continues to work per profile
 
 Integration tests:
 
 - build one real input shard through Stage 00
 - replace it with identical input and confirm no dirty propagation
 - replace it with one changed row and confirm limited dirty propagation
-- full build from scratch equals build after incremental replacement
+- full classic build from scratch equals classic build after incremental
+  replacement
+- full unbounded build from scratch equals unbounded build after incremental
+  replacement
 
 Operational checks:
 
 - report rows in equals rows current at Stage 00
-- report reused vs rebuilt groups at every stage
+- report reused vs rebuilt groups and profile nodes at every stage
 - report dirty sets before and after each stage
 - fail fast on tree identity mismatch
 
 ## Open Decisions
 
-- Exact Stage 01 sort key.
-- Whether Stage 00 should produce content checksums while writing or in a
-  separate final scan.
-- Whether sorted Stage 01 files replace raw Stage 00 files in place or live in a
-  parallel directory.
-- Stage 03 byte array grouping: one file per final level, per subtree, or per
-  materialized shard.
-- Whether Stage 04 partial patching is worth the complexity for the first new
-  format release.
+- Stage 03 profile manifest shape.
+- Stage 03 intermediate node-output grouping before packaging.
+- Exact sidecar schema descriptor shape and where it lives in the sidecar
+  artifact header/manifest.
+- Whether partial binary patching is worth the complexity after full-repack
+  Stage 03 is stable.
 - Whether the compatibility `--healpix` alias should remain long term once
   `--shard` is the documented option.
 
@@ -562,6 +558,10 @@ Staging node:
 Final node:
 : The renderer-visible octree node determined by a row's final `level` and
   `morton_code`.
+
+Output profile:
+: A named Stage 03 build target with its own max output level, node set,
+  `stars.octree`, `identifiers.order`, sidecars, manifest, and dataset UUID.
 
 Packed group:
 : A Stage 00 group whose rows are held at a staging node shallower than some

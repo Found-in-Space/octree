@@ -2,24 +2,29 @@
 
 ## Purpose
 
-Define named sidecar artifacts built after the base render dataset package.
+Define sidecar artifacts built for a specific render dataset package.
 
-Sidecars add per-star identity and enrichment data without changing the render payload format in `stars.octree`.
+Sidecars add per-star identity and enrichment data without changing the render
+payload format in `stars.octree`.
 
-`meta` is the first implemented sidecar family. It is not the generic name for all sidecars.
+Each sidecar is a schema-bearing artifact. A consumer should be able to open a
+sidecar, validate that it belongs to the active render dataset, inspect its
+embedded schema, and decode typed records. A separate "sidecar family" registry
+is not part of the artifact model; names such as `meta` are sidecar artifact
+names or definitions used for build/discovery.
 
 ## Stage Placement
 
-The current pipeline is:
+The target staged pipeline is:
 
 - Stage 00: packed octree staging
 - Stage 01: in-place staging sort and compaction
-- Stage 02: optional payload re-encoding
-- Stage 03: canonical payload-order materialization
-- Stage 04: `stars.octree` plus `identifiers.order`
-- Stage 05: named sidecar families
+- Stage 03: output-profile assembly, including `stars.octree`,
+  `identifiers.order`, and sidecar artifacts
 
-Stage 05 consumes the Stage 04 base dataset package for one `dataset_uuid` and emits one or more sidecars for that same dataset.
+Stage 03 builds sidecars for one output profile at a time. The `classic` and
+`unbounded` profiles must get separate sidecar artifacts because their node sets
+and identity order can differ.
 
 ## Core Invariants
 
@@ -34,7 +39,7 @@ Each sidecar payload entry corresponds to exactly one render cell identified by:
 
 Within a cell, sidecar star order must match render star order exactly.
 
-The canonical ordering carried forward from Stage 03 and Stage 04 is:
+The canonical ordering carried by the Stage 03 output profile is:
 
 - `node_id`
 - `mag_abs`
@@ -46,17 +51,24 @@ Each sidecar octree must carry:
 
 - `parent_dataset_uuid`
 - `sidecar_uuid`
-- `sidecar_kind`
+- an embedded schema or schema descriptor
 
-Consumers must validate `parent_dataset_uuid` against the active render octree `dataset_uuid` before falling back to geometry checks.
+Consumers must validate `parent_dataset_uuid` against the active render octree
+`dataset_uuid` before falling back to geometry checks.
 
 ### R4. Optionality
 
 Sidecars are optional. Core rendering must continue to work without them.
 
-## Current `meta` Family
+### R5. Embedded Schema
 
-The `meta` family is built from:
+The sidecar artifact must describe its payload schema. Discovery manifests may
+list sidecar names and paths, but decoding should be driven by schema metadata
+embedded in the sidecar artifact itself.
+
+## Current `meta` Sidecar
+
+The `meta` sidecar is built from:
 
 - `identifiers.order`
 - `identifiers_map.parquet`
@@ -80,17 +92,18 @@ Supported enrichment fields are:
 - `constellation`
 - `proper_name`
 
-`[[stage03.sidecars]]` configures families in the project file.
+`[[stage03.sidecars]]` currently configures sidecar definitions in the project
+file.
 
 For `meta`, `fields = [...]` limits which enrichment columns are emitted. `source` and `source_id` are always included.
 
 ## Intermediate Files
 
-Stage 05 builds per-family intermediate shard files under:
+The current implementation builds per-sidecar intermediate shard files under:
 
-- `paths.stage03_output_dir/intermediates/<family>/`
+- `paths.stage03_output_dir/intermediates/<sidecar-name>/`
 
-For the `meta` family, shard filenames end with:
+For the `meta` sidecar, shard filenames end with:
 
 - `.meta.index`
 - `.meta.payload`
@@ -99,9 +112,10 @@ These intermediates use the same shard structure as render intermediates, but wi
 
 ## Final Artifacts
 
-Each final sidecar is written to:
+Each final sidecar is written to a profile-specific path. In the target profile
+layout:
 
-- `paths.stage03_output_dir/<family>.octree`
+- `paths.stage03_output_dir/<profile>/sidecars/<sidecar-name>.octree`
 
 The final sidecar octree keeps the STAR top-level header and adds the mandatory descriptor block immediately after it.
 
@@ -110,7 +124,7 @@ For sidecars the descriptor carries:
 - `artifact_kind = sidecar`
 - `parent_dataset_uuid`
 - `sidecar_uuid`
-- `sidecar_kind`
+- embedded schema or a pointer to an embedded schema block
 
 ## Sidecar Manifest
 
@@ -123,14 +137,15 @@ It records:
 - `render_octree_path`
 - `identifiers_order_path`
 - `parent_dataset_uuid`
-- one descriptor per built family
+- one descriptor per built sidecar artifact
 
-Each family descriptor records:
+Each sidecar descriptor records:
 
 - `name`
 - `output_path`
 - `parent_dataset_uuid`
 - `sidecar_uuid`
+- schema summary or schema block reference
 
 ## Rebuild Policy
 
@@ -138,10 +153,15 @@ Sidecars are immutable derived artifacts.
 
 When enrichment inputs change:
 
-1. keep the Stage 04 render octree unchanged
-2. keep the Stage 04 `identifiers.order` artifact unchanged
-3. rebuild the affected sidecar family
+1. keep the profile render octree unchanged
+2. keep the profile `identifiers.order` artifact unchanged
+3. rebuild the affected sidecar artifact for each affected profile
 4. publish a new `sidecar_uuid`
+
+Sidecar payload data can share build-time caches keyed by stable star identity,
+but packaged sidecar artifacts are profile-specific. Sharing one packaged
+sidecar across `classic` and `unbounded` would require profile-specific node and
+item-order mapping, which defeats the simple sidecar invariant.
 
 ## Related Docs
 

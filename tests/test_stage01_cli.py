@@ -52,6 +52,7 @@ class TestStage01CLI:
         result = runner.invoke(cli, ["stage-01", "--help"])
         assert result.exit_code == 0
         assert "--project" in result.output
+        assert "--force" in result.output
         assert "INPUT_GLOB" not in result.output
         assert "OUT_DIR" not in result.output
 
