@@ -79,7 +79,10 @@ def _load_project_or_die(project_path: Path):
     "--healpix",
     "healpix_ids",
     multiple=True,
-    help="HEALPix pixel directory name to process. May be passed multiple times.",
+    help=(
+        "HEALPix pixel directory or root-level parquet shard to process. "
+        "May be passed multiple times."
+    ),
 )
 @click.option(
     "--max-pixels",

@@ -104,6 +104,12 @@ class _WriterKey:
     kind: str
 
 
+@dataclass(frozen=True, slots=True)
+class _InputShard:
+    shard_id: str
+    parquet_files: tuple[Path, ...]
+
+
 @dataclass(slots=True)
 class _OpenFragmentWriter:
     key: _WriterKey
@@ -519,18 +525,16 @@ def run_stage00(config: Stage00Config) -> Path:
     processed_healpix: list[str] = []
     input_files = 0
 
-    for pixel_dir in _selected_pixel_dirs(config):
-        healpix_id = pixel_dir.name
-        parquet_files = sorted(pixel_dir.glob("*.parquet"))
-        if not parquet_files:
+    for input_shard in _selected_input_shards(config):
+        if not input_shard.parquet_files:
             continue
-        processed_healpix.append(healpix_id)
-        for src_file in parquet_files:
+        processed_healpix.append(input_shard.shard_id)
+        for src_file in input_shard.parquet_files:
             input_files += 1
             parquet_file = pq.ParquetFile(src_file)
             for batch in parquet_file.iter_batches(batch_size=config.batch_size):
                 table = pa.Table.from_batches([batch])
-                builder.process_table(table, healpix_id=healpix_id)
+                builder.process_table(table, healpix_id=input_shard.shard_id)
 
     builder.finish()
     report = builder.report(
@@ -542,21 +546,59 @@ def run_stage00(config: Stage00Config) -> Path:
     return report_path
 
 
-def _selected_pixel_dirs(config: Stage00Config) -> list[Path]:
+def _selected_input_shards(config: Stage00Config) -> list[_InputShard]:
     if config.healpix_ids:
-        dirs = [config.input_root / hp for hp in config.healpix_ids]
-        missing = [str(p) for p in dirs if not p.is_dir()]
+        shards: list[_InputShard] = []
+        missing: list[str] = []
+        for shard_id in config.healpix_ids:
+            direct = config.input_root / shard_id
+            with_suffix = config.input_root / f"{shard_id}.parquet"
+            if direct.is_dir():
+                shards.append(
+                    _InputShard(
+                        shard_id=direct.name,
+                        parquet_files=tuple(sorted(direct.glob("*.parquet"))),
+                    )
+                )
+            elif direct.is_file() and direct.suffix == ".parquet":
+                shards.append(
+                    _InputShard(shard_id=direct.stem, parquet_files=(direct,))
+                )
+            elif with_suffix.is_file():
+                shards.append(
+                    _InputShard(
+                        shard_id=with_suffix.stem,
+                        parquet_files=(with_suffix,),
+                    )
+                )
+            else:
+                missing.append(str(direct))
         if missing:
-            raise FileNotFoundError(f"Missing HEALPix input directories: {missing}")
+            raise FileNotFoundError(
+                f"Missing HEALPix input directories or parquet shards: {missing}"
+            )
     else:
-        dirs = sorted(
-            p
-            for p in config.input_root.iterdir()
-            if p.is_dir() and any(p.glob("*.parquet"))
-        )
+        shards = []
+        for path in sorted(config.input_root.iterdir()):
+            if path.is_dir():
+                parquet_files = tuple(sorted(path.glob("*.parquet")))
+                if parquet_files:
+                    shards.append(
+                        _InputShard(
+                            shard_id=path.name,
+                            parquet_files=parquet_files,
+                        )
+                    )
+            elif path.is_file() and path.suffix == ".parquet":
+                shards.append(
+                    _InputShard(
+                        shard_id=path.stem,
+                        parquet_files=(path,),
+                    )
+                )
     if config.max_pixels is not None:
-        dirs = dirs[: config.max_pixels]
-    return dirs
+        shards = shards[: config.max_pixels]
+    return shards
 
 
 def _ensure_stage00_columns(table: pa.Table, mag_config: MagLevelConfig) -> pa.Table:

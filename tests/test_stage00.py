@@ -17,16 +17,8 @@ def _morton_for_node(level: int, node_id: int) -> int:
     return int(node_id) << (3 * (MORTON_BITS - level))
 
 
-def _write_stage00_pixel(
-    root: Path,
-    pixel: str,
-    rows: list[dict],
-    *,
-    part_name: str = "part.parquet",
-) -> None:
-    pixel_dir = root / pixel
-    pixel_dir.mkdir(parents=True, exist_ok=True)
-    table = pa.table(
+def _stage00_table(rows: list[dict], *, shard_id: str) -> pa.Table:
+    return pa.table(
         {
             "source": pa.array([r["source"] for r in rows], type=pa.string()),
             "source_id": pa.array([r["source_id"] for r in rows], type=pa.string()),
@@ -37,10 +29,34 @@ def _write_stage00_pixel(
             "render": pa.array([b"\x00" * 16 for _ in rows], type=pa.binary(16)),
             "level": pa.array([r["level"] for r in rows], type=pa.int32()),
             "mag_abs": pa.array([r["mag_abs"] for r in rows], type=pa.float64()),
-            "healpix_id": pa.array([pixel for _ in rows], type=pa.string()),
+            "healpix_id": pa.array([shard_id for _ in rows], type=pa.string()),
         }
     )
-    pq.write_table(table, pixel_dir / part_name, compression="zstd")
+
+
+def _write_stage00_pixel(
+    root: Path,
+    pixel: str,
+    rows: list[dict],
+    *,
+    part_name: str = "part.parquet",
+) -> None:
+    pixel_dir = root / pixel
+    pixel_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        _stage00_table(rows, shard_id=pixel),
+        pixel_dir / part_name,
+        compression="zstd",
+    )
+
+
+def _write_stage00_shard_file(root: Path, shard: str, rows: list[dict]) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        _stage00_table(rows, shard_id=shard),
+        root / f"{shard}.parquet",
+        compression="zstd",
+    )
 
 
 def test_stage00_rewrites_packed_files_when_node_becomes_lower_mag_limited(
@@ -116,6 +132,48 @@ def test_stage00_rewrites_packed_files_when_node_becomes_lower_mag_limited(
 
     child_table = pq.read_table(next((tree / "o=0").glob("hp123-pack-*.parquet")))
     assert "healpix_id" not in child_table.schema.names
+
+
+def test_stage00_accepts_root_level_parquet_shards(tmp_path: Path) -> None:
+    input_root = tmp_path / "input"
+    _write_stage00_shard_file(
+        input_root,
+        "batch-001",
+        [
+            {
+                "source": "gaia",
+                "source_id": "a",
+                "morton_code": _morton_for_node(1, 0),
+                "level": 1,
+                "mag_abs": 7.0,
+            },
+            {
+                "source": "gaia",
+                "source_id": "b",
+                "morton_code": _morton_for_node(1, 1),
+                "level": 1,
+                "mag_abs": 7.1,
+            },
+        ],
+    )
+
+    out_dir = tmp_path / "stage00"
+    report_path = run_stage00(
+        Stage00Config(
+            input_root=input_root,
+            output_dir=out_dir,
+            mag_config=MagLevelConfig(v_mag=6.5, max_level=1),
+            max_level=1,
+            bucket_size=100,
+            batch_size=10,
+        )
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["processed_healpix"] == ["batch-001"]
+    assert report["input_files"] == 1
+    assert report["rows_current"] == 2
+    assert len(list((out_dir / "tree").glob("hpbatch-001-pack-*.parquet"))) == 1
 
 
 def test_stage00_rewrites_nested_octant_files_without_partition_columns(
