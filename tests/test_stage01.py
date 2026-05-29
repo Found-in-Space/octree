@@ -149,7 +149,7 @@ def test_stage01_first_run_writes_sorted_groups_and_state(tmp_path: Path) -> Non
     sorted_table = pa.concat_tables([pq.read_table(path) for path in files])
     assert sorted_table.column("source_id").to_pylist() == ["root", "a", "b", "z"]
     assert "_stage01_final_node_id" not in sorted_table.schema.names
-    assert "healpix_id" not in sorted_table.schema.names
+    assert "healpix_id" in sorted_table.schema.names
     assert len(files) == 2
     assert report["processed_group_count"] == 1
     assert report["changed_group_count"] == 1
@@ -357,6 +357,44 @@ def test_stage01_rejects_missing_manifest_and_identity_mismatch(
                 bucket_size=99,
             )
         )
+
+
+def test_stage01_rejects_stage00_group_schema_drift(tmp_path: Path) -> None:
+    input_root = tmp_path / "input"
+    _write_stage00_pixel(
+        input_root,
+        "100",
+        [
+            {
+                "source": "gaia",
+                "source_id": "a",
+                "morton_code": _morton_for_node(1, 0),
+                "level": 1,
+                "mag_abs": 7.0,
+            }
+        ],
+    )
+    stage00_dir = tmp_path / "stage00"
+    stage01_dir = tmp_path / "stage01"
+    run_stage00(_stage00_config(input_root, stage00_dir))
+    state_path = stage00_dir / "stage-state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    original_rel = state["stage00_groups"][0]["files"][0]
+    original_table = pq.read_table(stage00_dir / original_rel)
+    drift_rel = "tree/shard-100-pack-999999.parquet"
+    pq.write_table(
+        original_table.append_column(
+            "unexpected",
+            pa.array(["x"], type=pa.string()),
+        ),
+        stage00_dir / drift_rel,
+        compression="zstd",
+    )
+    state["stage00_groups"][0]["files"].append(drift_rel)
+    state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="identical schemas"):
+        run_stage01(_stage01_config(stage00_dir, stage01_dir))
 
 
 def test_stage01_force_rebuilds_all_groups(tmp_path: Path) -> None:

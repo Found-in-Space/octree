@@ -18,14 +18,18 @@ import pyarrow.parquet as pq
 from foundinspace.octree.config import MORTON_BITS, WORLD_CENTER, WORLD_HALF_SIZE_PC
 from foundinspace.octree.mag_levels import MagLevelConfig
 
-from .add_shard_columns import _enrich_table
-
 STAGE00_FORMAT = "foundinspace.octree.stage00/v0"
 TREE_MANIFEST_FORMAT = "foundinspace.octree.stage-tree/v0"
 STAGE_STATE_FORMAT = "foundinspace.octree.stage-state/v0"
 STAGE00_GROUP_CHECKSUM_ALGORITHM = "arrow-ipc-sha256/v0"
-STAGE00_ROW_SCHEMA_VERSION = "stage00-row-schema/v0"
+STAGE00_ROW_SCHEMA_VERSION = "stage00-row-schema/v1"
 STAGE00_SPLIT_POLICY = "lower-mag-limited-bucket/v0"
+STAGE00_INPUT_FILTER_NONE = "none"
+STAGE00_INPUT_FILTER_RAW_CARTESIAN = "raw-cartesian-to-stage00-enriched/v0"
+STAGE00_INPUT_FILTERS = (
+    STAGE00_INPUT_FILTER_NONE,
+    STAGE00_INPUT_FILTER_RAW_CARTESIAN,
+)
 TREE_DIR_NAME = "tree"
 REPORT_NAME = "stage00-report.json"
 TREE_MANIFEST_NAME = "tree-manifest.json"
@@ -35,23 +39,8 @@ _FRAGMENT_RE = re.compile(
     r"^(?:shard-(?P<shard>.+?)|hp(?P<legacy_shard>.+?))"
     r"-(?P<kind>pack|lim)-(?P<seq>\d+)\.parquet$"
 )
-_HEALPIX_COLUMN_CANDIDATES = ("healpix", "healpix_id", "hp")
-_COLUMN_TYPES = {
-    "source": pa.large_string(),
-    "source_id": pa.large_string(),
-    "x_icrs_pc": pa.float64(),
-    "y_icrs_pc": pa.float64(),
-    "z_icrs_pc": pa.float64(),
-    "ra_deg": pa.float64(),
-    "dec_deg": pa.float64(),
-    "r_pc": pa.float64(),
-    "mag_abs": pa.float64(),
-    "teff": pa.float64(),
-    "quality_flags": pa.int64(),
-    "astrometry_quality": pa.float64(),
-    "photometry_quality": pa.float64(),
+_ROUTING_COLUMN_TYPES = {
     "morton_code": pa.uint64(),
-    "render": pa.binary(16),
     "level": pa.int32(),
 }
 
@@ -68,6 +57,7 @@ class Stage00Config:
     compact_after_files: int = 64
     shard_ids: tuple[str, ...] = ()
     max_pixels: int | None = None
+    input_filter: str = STAGE00_INPUT_FILTER_NONE
     force: bool = False
     replace_shards: bool = False
 
@@ -86,6 +76,11 @@ class Stage00Config:
             raise ValueError("compact_after_files must be >= 0")
         if self.max_pixels is not None and self.max_pixels <= 0:
             raise ValueError("max_pixels must be > 0")
+        if self.input_filter not in STAGE00_INPUT_FILTERS:
+            raise ValueError(
+                "stage00 input_filter must be one of "
+                f"{list(STAGE00_INPUT_FILTERS)}, got {self.input_filter!r}"
+            )
         if self.replace_shards:
             if not self.shard_ids:
                 raise ValueError("--replace-shards requires one or more --shard")
@@ -148,6 +143,7 @@ class _Stage00Builder:
         self._preserve_existing_topology = preserve_existing_topology
         self._open_writers: OrderedDict[_WriterKey, _OpenFragmentWriter] = OrderedDict()
         self._rows_in = 0
+        self._rows_after_filter = 0
         self._rows_written = 0
         self._files_written = 0
         self._files_deleted_on_split = 0
@@ -169,11 +165,19 @@ class _Stage00Builder:
         if len(table) == 0:
             return
         self._batches += 1
-        self._rows_in += len(table)
-        enriched = _ensure_stage00_columns(table, self._config.mag_config)
+        input_rows = len(table)
+        self._rows_in += input_rows
+        filtered = _apply_input_filter(table, self._config)
+        _ensure_equal_row_count(
+            before=input_rows,
+            after=len(filtered),
+            context=f"Stage 00 input_filter {self._config.input_filter}",
+        )
+        self._rows_after_filter += len(filtered)
+        staged = _ensure_stage00_routing_columns(filtered)
         self._route_table(
             self._node_for_path(()),
-            enriched,
+            staged,
             input_shard_id=input_shard_id,
         )
 
@@ -229,7 +233,9 @@ class _Stage00Builder:
             "processed_input_shards": processed_input_shards,
             "input_files": input_files,
             "input_batches": self._batches,
+            "input_filter": self._config.input_filter,
             "rows_in": self._rows_in,
+            "rows_after_filter": self._rows_after_filter,
             "rows_current": current_rows,
             "staging_nodes": len(self._nodes),
             "lower_mag_limited_nodes": lower_limited,
@@ -396,6 +402,11 @@ class _Stage00Builder:
             )
 
         descendant_indices = np.flatnonzero(levels > node.depth)
+        _ensure_equal_row_count(
+            before=len(table),
+            after=len(resident_indices) + len(descendant_indices),
+            context=f"routing lower-mag-limited node {_node_path_label(node.path_octants)}",
+        )
         if len(descendant_indices) == 0:
             return
         if node.depth >= MORTON_BITS:
@@ -404,9 +415,16 @@ class _Stage00Builder:
             )
 
         descendants = _take_rows(table, descendant_indices)
+        routed_descendant_rows = 0
         for octant, child_table in _tables_by_child_octant(descendants, node.depth):
+            routed_descendant_rows += len(child_table)
             child = self._node_for_path((*node.path_octants, int(octant)))
             self._route_table(child, child_table, input_shard_id=input_shard_id)
+        _ensure_equal_row_count(
+            before=len(descendants),
+            after=routed_descendant_rows,
+            context=f"routing descendants below {_node_path_label(node.path_octants)}",
+        )
 
     def _make_lower_mag_limited(self, node: _BucketNode) -> None:
         if node.lower_mag_limited:
@@ -423,12 +441,15 @@ class _Stage00Builder:
         pack_files = sorted(
             p for p in node.current_files if _fragment_kind(p) == "pack"
         )
+        rows_before_split = node.row_count
+        rows_in_pack_files = 0
         node.current_files.clear()
         node.row_count = 0
 
         for path in pack_files:
             input_shard_id = _input_shard_id_from_fragment(path)
             table = pq.ParquetFile(path).read()
+            rows_in_pack_files += len(table)
             path.unlink()
             self._files_deleted_on_split += 1
             self._route_into_lower_limited_node(
@@ -436,6 +457,11 @@ class _Stage00Builder:
                 table,
                 input_shard_id=input_shard_id,
             )
+        _ensure_equal_row_count(
+            before=rows_before_split,
+            after=rows_in_pack_files,
+            context=f"reading split input for node {_node_path_label(node.path_octants)}",
+        )
 
     def _write_fragment(
         self,
@@ -481,13 +507,10 @@ class _Stage00Builder:
         existing = self._open_writers.get(key)
         if existing is not None:
             if not existing.schema.equals(schema, check_metadata=False):
-                self._close_writer(key)
-            else:
-                self._open_writers.move_to_end(key)
-                return existing
-
-        existing = self._open_writers.get(key)
-        if existing is not None:
+                raise ValueError(
+                    "Stage 00 group schema changed while writing "
+                    f"{_stage00_group_key(node.path_octants, key.input_shard_id, key.kind)}"
+                )
             self._open_writers.move_to_end(key)
             return existing
 
@@ -595,9 +618,11 @@ class _Stage00Builder:
         buffered: list[pa.Table] = []
         buffered_rows = 0
         buffered_schema: pa.Schema | None = None
+        input_rows = 0
+        output_rows = 0
 
         def flush_buffer() -> None:
-            nonlocal buffered, buffered_rows, buffered_schema
+            nonlocal buffered, buffered_rows, buffered_schema, output_rows
             if not buffered:
                 return
             compacted = pa.concat_tables(buffered, promote_options="none")
@@ -610,6 +635,7 @@ class _Stage00Builder:
             new_files.append(path)
             self._files_written += 1
             self._rows_written += len(compacted)
+            output_rows += len(compacted)
             self._compaction_output_files += 1
             buffered = []
             buffered_rows = 0
@@ -617,11 +643,14 @@ class _Stage00Builder:
 
         for path in files:
             table = pq.ParquetFile(path).read()
+            input_rows += len(table)
             if buffered_schema is None:
                 buffered_schema = table.schema
             elif not buffered_schema.equals(table.schema, check_metadata=False):
-                flush_buffer()
-                buffered_schema = table.schema
+                raise ValueError(
+                    "Cannot compact Stage 00 group with schema drift: "
+                    f"{path.relative_to(self._config.output_dir).as_posix()}"
+                )
             offset = 0
             while offset < len(table):
                 if buffered_rows >= self._config.fragment_target_rows:
@@ -634,6 +663,11 @@ class _Stage00Builder:
                 buffered_rows += rows_to_take
                 offset += rows_to_take
         flush_buffer()
+        _ensure_equal_row_count(
+            before=input_rows,
+            after=output_rows,
+            context=f"compacting group {_stage00_group_key(node.path_octants, input_shard_id, kind)}",
+        )
 
         for path in files:
             path.unlink()
@@ -647,9 +681,9 @@ class _Stage00Builder:
 def run_stage00(config: Stage00Config) -> Path:
     """Build the packed Stage 00 staging tree.
 
-    Input may be raw merged catalogue parquet or already enriched parquet. Rows
-    are routed into adaptive staging buckets, with lower magnitude limiting
-    enabled only after a bucket reaches the configured row cap.
+    Input must already contain the Stage 00 routing columns. Rows are routed
+    into adaptive staging buckets, with lower magnitude limiting enabled only
+    after a bucket reaches the configured row cap.
     """
     config.validate()
     if config.replace_shards:
@@ -680,6 +714,7 @@ def run_stage00(config: Stage00Config) -> Path:
     report["changed_group_count"] = len(report["groups"])
     report["unchanged_group_count"] = 0
     report["deleted_group_count"] = 0
+    _validate_stage00_full_row_counts(report)
     manifest = _tree_manifest(config)
     state = _stage_state(
         config,
@@ -738,6 +773,8 @@ def _run_stage00_replacement(
         for group in state.get("stage00_groups", [])
         if str(group.get("input_shard_id", group.get("shard_id", ""))) in target_shards
     }
+    old_total_rows = _sum_group_rows(state.get("stage00_groups", []))
+    old_target_rows = _sum_group_rows(old_target_groups.values())
 
     builder = _Stage00Builder(
         config,
@@ -762,6 +799,12 @@ def _run_stage00_replacement(
         for group in report["groups"]
         if group["input_shard_id"] in target_shards
     }
+    _validate_stage00_replacement_row_counts(
+        report,
+        old_total_rows=old_total_rows,
+        old_target_rows=old_target_rows,
+        new_target_rows=_sum_group_rows(new_target_groups.values()),
+    )
     changed_group_keys = [
         key
         for key, group in sorted(new_target_groups.items())
@@ -837,10 +880,16 @@ def _tree_identity(config: Stage00Config) -> dict[str, Any]:
     return _tree_identity_values(
         v_mag=float(config.mag_config.v_mag),
         bucket_size=config.bucket_size,
+        input_filter=config.input_filter,
     )
 
 
-def _tree_identity_values(*, v_mag: float, bucket_size: int) -> dict[str, Any]:
+def _tree_identity_values(
+    *,
+    v_mag: float,
+    bucket_size: int,
+    input_filter: str = STAGE00_INPUT_FILTER_NONE,
+) -> dict[str, Any]:
     return {
         "coordinate_frame": "icrs-cartesian-pc",
         "world_center": [float(v) for v in WORLD_CENTER.tolist()],
@@ -848,6 +897,7 @@ def _tree_identity_values(*, v_mag: float, bucket_size: int) -> dict[str, Any]:
         "morton_bits": MORTON_BITS,
         "v_mag": float(v_mag),
         "bucket_size": bucket_size,
+        "input_filter": input_filter,
         "split_policy": STAGE00_SPLIT_POLICY,
         "row_schema_version": STAGE00_ROW_SCHEMA_VERSION,
     }
@@ -868,6 +918,7 @@ def _stage_state(
         "tree_identity": _tree_identity(config),
         "input_root": str(config.input_root),
         "output_dir": str(config.output_dir),
+        "input_filter": config.input_filter,
         "input_shards": sorted(input_shards, key=lambda row: row["shard_id"]),
         "nodes": builder.nodes_report(),
         "stage00_groups": [_state_group(group) for group in groups],
@@ -1000,48 +1051,97 @@ def _selected_input_shards(config: Stage00Config) -> list[_InputShard]:
     return shards
 
 
-def _ensure_stage00_columns(table: pa.Table, mag_config: MagLevelConfig) -> pa.Table:
-    names = set(table.schema.names)
-    required = {"morton_code", "render", "level", "mag_abs"}
-    if required.issubset(names):
-        return _normalize_stage00_schema(_drop_healpix_columns(table))
+def _ensure_equal_row_count(*, before: int, after: int, context: str) -> None:
+    if before != after:
+        raise ValueError(f"{context} changed row count: before={before}, after={after}")
 
-    raw_required = {"x_icrs_pc", "y_icrs_pc", "z_icrs_pc", "mag_abs"}
-    missing = raw_required - names
+
+def _sum_group_rows(groups: Any) -> int:
+    return sum(int(group.get("row_count", 0)) for group in groups)
+
+
+def _validate_stage00_full_row_counts(report: dict[str, Any]) -> None:
+    group_rows = _sum_group_rows(report.get("groups", []))
+    _ensure_equal_row_count(
+        before=int(report["rows_in"]),
+        after=int(report["rows_after_filter"]),
+        context="Stage 00 input filtering",
+    )
+    _ensure_equal_row_count(
+        before=int(report["rows_after_filter"]),
+        after=int(report["rows_current"]),
+        context="Stage 00 staging",
+    )
+    _ensure_equal_row_count(
+        before=int(report["rows_current"]),
+        after=group_rows,
+        context="Stage 00 group accounting",
+    )
+
+
+def _validate_stage00_replacement_row_counts(
+    report: dict[str, Any],
+    *,
+    old_total_rows: int,
+    old_target_rows: int,
+    new_target_rows: int,
+) -> None:
+    _ensure_equal_row_count(
+        before=int(report["rows_in"]),
+        after=int(report["rows_after_filter"]),
+        context="Stage 00 replacement input filtering",
+    )
+    _ensure_equal_row_count(
+        before=int(report["rows_after_filter"]),
+        after=new_target_rows,
+        context="Stage 00 replacement target staging",
+    )
+    expected_current_rows = old_total_rows - old_target_rows + new_target_rows
+    _ensure_equal_row_count(
+        before=expected_current_rows,
+        after=int(report["rows_current"]),
+        context="Stage 00 replacement total row accounting",
+    )
+    _ensure_equal_row_count(
+        before=int(report["rows_current"]),
+        after=_sum_group_rows(report.get("groups", [])),
+        context="Stage 00 replacement group accounting",
+    )
+
+
+def _apply_input_filter(table: pa.Table, config: Stage00Config) -> pa.Table:
+    if config.input_filter == STAGE00_INPUT_FILTER_NONE:
+        return table
+    if config.input_filter == STAGE00_INPUT_FILTER_RAW_CARTESIAN:
+        from .add_shard_columns import _enrich_table
+
+        return _enrich_table(
+            table,
+            mag_config=config.mag_config,
+            center=WORLD_CENTER.copy(),
+            half_size=WORLD_HALF_SIZE_PC,
+        )
+    raise ValueError(f"Unsupported Stage 00 input_filter: {config.input_filter!r}")
+
+
+def _ensure_stage00_routing_columns(table: pa.Table) -> pa.Table:
+    names = set(table.schema.names)
+    missing = set(_ROUTING_COLUMN_TYPES) - names
     if missing:
         raise ValueError(
-            "Input table must be Stage 00-enriched or raw merged parquet; "
-            f"missing columns {sorted(missing)}"
+            "Stage 00 input is missing required routing columns "
+            f"{sorted(_ROUTING_COLUMN_TYPES)}; missing columns {sorted(missing)}"
         )
-    enriched = _enrich_table(
-        table,
-        mag_config=mag_config,
-        center=WORLD_CENTER.copy(),
-        half_size=WORLD_HALF_SIZE_PC,
-    )
-    return _normalize_stage00_schema(_drop_healpix_columns(enriched))
-
-
-def _drop_healpix_columns(table: pa.Table) -> pa.Table:
-    drop = [name for name in _HEALPIX_COLUMN_CANDIDATES if name in table.schema.names]
-    if not drop:
-        return table
-    return table.drop(drop)
-
-
-def _normalize_stage00_schema(table: pa.Table) -> pa.Table:
-    arrays: list[pa.ChunkedArray] = []
-    fields: list[pa.Field] = []
-    for source_field in table.schema:
-        column = table.column(source_field.name)
-        target_type = _COLUMN_TYPES.get(source_field.name)
-        if target_type is not None and not source_field.type.equals(target_type):
-            column = column.cast(target_type)
-            fields.append(pa.field(source_field.name, target_type))
-        else:
-            fields.append(pa.field(source_field.name, source_field.type))
-        arrays.append(column)
-    return pa.Table.from_arrays(arrays, schema=pa.schema(fields))
+    for name, expected_type in _ROUTING_COLUMN_TYPES.items():
+        field = table.schema.field(name)
+        if not field.type.equals(expected_type):
+            raise ValueError(
+                "Stage 00 routing column has wrong type: "
+                f"{name} must be {expected_type}, got {field.type}"
+            )
+        if table.column(name).null_count:
+            raise ValueError(f"Stage 00 routing column must not contain nulls: {name}")
+    return table
 
 
 def _stage00_group_key(
@@ -1067,37 +1167,23 @@ def _stage00_group_checksum(paths: list[Path]) -> tuple[str, int]:
 
 
 def _align_tables_to_union_schema(tables: list[pa.Table]) -> pa.Table:
-    fields: dict[str, pa.DataType] = {}
-    field_order: list[str] = []
-    for table in tables:
-        for schema_field in table.schema:
-            existing = fields.get(schema_field.name)
-            if existing is None:
-                fields[schema_field.name] = schema_field.type
-                field_order.append(schema_field.name)
-            elif not existing.equals(schema_field.type):
-                raise ValueError(
-                    "Cannot checksum Stage 00 group with conflicting field types: "
-                    f"{schema_field.name} has both {existing} and {schema_field.type}"
-                )
-
-    schema = pa.schema(pa.field(name, fields[name]) for name in field_order)
-    aligned: list[pa.Table] = []
-    for table in tables:
-        arrays: list[pa.ChunkedArray | pa.Array] = []
-        for schema_field in schema:
-            if schema_field.name in table.schema.names:
-                arrays.append(table.column(schema_field.name))
-            else:
-                arrays.append(pa.nulls(len(table), type=schema_field.type))
-        aligned.append(pa.Table.from_arrays(arrays, schema=schema))
-    if not aligned:
+    if not tables:
         return pa.table({})
-    return pa.concat_tables(aligned, promote_options="none").combine_chunks()
+    schema = tables[0].schema
+    for table in tables[1:]:
+        if not table.schema.equals(schema, check_metadata=False):
+            raise ValueError(
+                "Stage 00 group fragments must have identical schemas; "
+                "schema drift would require padding or dropping columns"
+            )
+    return pa.concat_tables(tables, promote_options="none").combine_chunks()
 
 
 def _level_array(table: pa.Table) -> np.ndarray:
-    return np.asarray(table.column("level"), dtype=np.int32)
+    levels = np.asarray(table.column("level"), dtype=np.int32)
+    if len(levels) and (levels.min() < 0 or levels.max() > MORTON_BITS):
+        raise ValueError(f"Stage 00 level values must be in 0..{MORTON_BITS}")
+    return levels
 
 
 def _morton_array(table: pa.Table) -> np.ndarray:

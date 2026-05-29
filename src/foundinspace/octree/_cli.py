@@ -13,6 +13,7 @@ from foundinspace.octree.assembly.formats import (
     IDENTIFIERS_MANIFEST_NAME,
     RENDER_MANIFEST_NAME,
 )
+from foundinspace.octree.config import MORTON_BITS
 from foundinspace.octree.mag_levels import MagLevelConfig
 from foundinspace.octree.project import load_project, render_project_template
 from foundinspace.octree.reader import Point
@@ -125,6 +126,12 @@ def _load_project_or_die(project_path: Path):
     help="Compact a node/input-shard/kind group after this many files. Defaults to stage00.compact_after_files.",
 )
 @click.option(
+    "--input-filter",
+    type=click.Choice(["none", "raw-cartesian-to-stage00-enriched/v0"]),
+    default=None,
+    help="Explicit pre-filter before Stage 00 routing. Defaults to stage00.input_filter.",
+)
+@click.option(
     "--force",
     is_flag=True,
     help="Replace an existing Stage 00 output directory.",
@@ -145,6 +152,7 @@ def stage_00(
     fragment_target_rows: int | None,
     max_open_writers: int | None,
     compact_after_files: int | None,
+    input_filter: str | None,
     force: bool,
     replace_shards: bool,
 ) -> None:
@@ -154,6 +162,7 @@ def stage_00(
     project = _load_project_or_die(project_path)
     mag_config = MagLevelConfig(
         v_mag=project.stage00.v_mag,
+        morton_bits=MORTON_BITS,
     )
     resolved_input = (
         input_root if input_root is not None else project.paths.merged_healpix_dir
@@ -184,6 +193,9 @@ def stage_00(
             if compact_after_files is not None
             else project.stage00.compact_after_files
         ),
+        input_filter=(
+            input_filter if input_filter is not None else project.stage00.input_filter
+        ),
         shard_ids=tuple(shard_ids),
         max_pixels=max_pixels,
         force=force,
@@ -196,7 +208,8 @@ def stage_00(
         f"bucket_size={config.bucket_size:,}; "
         f"fragment_target_rows={config.fragment_target_rows:,}; "
         f"max_open_writers={config.max_open_writers:,}; "
-        f"compact_after_files={config.compact_after_files:,}"
+        f"compact_after_files={config.compact_after_files:,}; "
+        f"input_filter={config.input_filter}"
     )
     report_path = run_stage00(config)
     report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -242,6 +255,7 @@ def stage_01(
         output_dir=project.paths.stage01_output_dir,
         v_mag=project.stage00.v_mag,
         bucket_size=project.stage00.bucket_size,
+        input_filter=project.stage00.input_filter,
         batch_size=project.stage01.batch_size,
         fragment_target_rows=project.stage00.fragment_target_rows,
         force=force,
@@ -347,6 +361,154 @@ def stage_03(
     click.echo(f"Stage 03 manifest written to {manifest_path}")
 
 
+@cli.command("stage-03-benchmark")
+@click.option(
+    "--project",
+    "project_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Path to octree project TOML.",
+)
+@click.option(
+    "--profile",
+    "profiles",
+    multiple=True,
+    type=click.Choice(["classic", "unbounded"]),
+    help="Output profile to simulate. May be passed multiple times.",
+)
+@click.option(
+    "--order",
+    "orders",
+    multiple=True,
+    type=click.Choice(["dfs", "level-major", "tile-level-major"]),
+    help="Packing order to simulate. May be passed multiple times.",
+)
+@click.option(
+    "--scenario",
+    "scenarios",
+    multiple=True,
+    type=click.Choice(["observer-shell", "target-frustum"]),
+    help="Query scenario to simulate. May be passed multiple times.",
+)
+@click.option(
+    "--center",
+    type=str,
+    default="0,0,0",
+    show_default=True,
+    help="Query origin in parsecs as X,Y,Z.",
+)
+@click.option(
+    "--magnitude",
+    type=float,
+    default=None,
+    help="Limiting apparent magnitude. Defaults to stage00.v_mag.",
+)
+@click.option(
+    "--target",
+    type=str,
+    default="1000,0,0",
+    show_default=True,
+    help="Target point for target-frustum in parsecs as X,Y,Z.",
+)
+@click.option(
+    "--vertical-fov",
+    type=float,
+    default=40.0,
+    show_default=True,
+    help="Vertical FOV in degrees for target-frustum.",
+)
+@click.option(
+    "--aspect-ratio",
+    type=float,
+    default=16.0 / 9.0,
+    show_default=True,
+    help="Aspect ratio for target-frustum.",
+)
+@click.option(
+    "--tile-prefix-depth",
+    type=int,
+    default=4,
+    show_default=True,
+    help="Top-prefix depth for tile-level-major packing.",
+)
+@click.option(
+    "--coalesce-gap-bytes",
+    type=int,
+    default=64 * 1024,
+    show_default=True,
+    help="Maximum gap to merge adjacent payload ranges.",
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Print machine-readable JSON instead of a table.",
+)
+def stage_03_benchmark(
+    project_path: Path,
+    profiles: tuple[str, ...],
+    orders: tuple[str, ...],
+    scenarios: tuple[str, ...],
+    center: str,
+    magnitude: float | None,
+    target: str,
+    vertical_fov: float,
+    aspect_ratio: float,
+    tile_prefix_depth: int,
+    coalesce_gap_bytes: int,
+    as_json: bool,
+) -> None:
+    """Estimate Stage 03 packing order range-read behavior from Stage 01."""
+    from foundinspace.octree.stage03_benchmark import (
+        PACKING_ORDERS,
+        PROFILES,
+        SCENARIOS,
+        Point3,
+        Stage03BenchmarkConfig,
+        report_to_json,
+        run_stage03_packing_benchmark,
+    )
+
+    project = _load_project_or_die(project_path)
+    center_point = _parse_point(center)
+    target_point = _parse_point(target)
+    config = Stage03BenchmarkConfig(
+        stage00_output_dir=project.paths.stage00_output_dir,
+        stage01_output_dir=project.paths.stage01_output_dir,
+        profiles=profiles or PROFILES,
+        orders=orders or PACKING_ORDERS,
+        scenarios=scenarios or SCENARIOS,
+        center=Point3(center_point.x, center_point.y, center_point.z),
+        target=Point3(target_point.x, target_point.y, target_point.z),
+        limiting_magnitude=magnitude
+        if magnitude is not None
+        else project.stage00.v_mag,
+        vertical_fov_deg=vertical_fov,
+        aspect_ratio=aspect_ratio,
+        tile_prefix_depth=tile_prefix_depth,
+        coalesce_gap_bytes=coalesce_gap_bytes,
+        batch_size=project.stage01.batch_size,
+    )
+    try:
+        report = run_stage03_packing_benchmark(config)
+    except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if as_json:
+        click.echo(report_to_json(report), nl=False)
+        return
+
+    console = Console()
+    console.print(
+        "Stage 03 packing benchmark: "
+        f"{config.stage01_output_dir} | "
+        f"profiles={','.join(config.profiles)} | "
+        f"orders={','.join(config.orders)} | "
+        f"scenarios={','.join(config.scenarios)}"
+    )
+    _render_stage03_benchmark(console, report)
+
+
 def _parse_point(value: str) -> Point:
     try:
         parts = [p.strip() for p in value.split(",")]
@@ -382,6 +544,41 @@ def _format_teff(teff: float) -> str:
     if math.isnan(teff):
         return "n/a"
     return f"{teff:,.0f} K"
+
+
+def _format_ratio(value: float) -> str:
+    return f"{value:.3f}"
+
+
+def _render_stage03_benchmark(console: Console, report: dict) -> None:
+    table = Table(title="Stage 03 Packing Benchmark")
+    table.add_column("Profile")
+    table.add_column("Order")
+    table.add_column("Scenario")
+    table.add_column("Nodes", justify="right")
+    table.add_column("Selected", justify="right")
+    table.add_column("Stars", justify="right")
+    table.add_column("Ranges", justify="right")
+    table.add_column("Batches", justify="right")
+    table.add_column("Raw", justify="right")
+    table.add_column("Span", justify="right")
+    table.add_column("Useful", justify="right")
+
+    for row in report["results"]:
+        table.add_row(
+            str(row["profile"]),
+            str(row["order"]),
+            str(row["scenario"]),
+            f"{row['final_node_count']:,}",
+            f"{row['selected_node_count']:,}",
+            f"{row['selected_star_count']:,}",
+            f"{row['payload_range_count']:,}",
+            f"{row['coalesced_batch_count']:,}",
+            _format_compact_mb(int(row["raw_payload_bytes"])),
+            _format_compact_mb(int(row["span_bytes"])),
+            _format_ratio(float(row["useful_ratio"])),
+        )
+    console.print(table)
 
 
 def _format_identifiers(identifiers: tuple[tuple[str, object], ...]) -> str:

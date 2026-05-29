@@ -34,6 +34,7 @@ bucket_size = 1000000
 fragment_target_rows = 100000
 max_open_writers = 128
 compact_after_files = 64
+input_filter = "none"
 
 [stage01]
 input_glob = "artifacts/stage00/**/*.parquet"
@@ -74,6 +75,7 @@ def test_load_project_resolves_relative_paths_from_project_file_dir(
     assert project.stage00.fragment_target_rows == 100_000
     assert project.stage00.max_open_writers == 128
     assert project.stage00.compact_after_files == 64
+    assert project.stage00.input_filter == "none"
     assert project.stage03.sidecars[0].name == "meta"
     assert project.stage03.sidecars[0].fields == ("proper_name",)
 
@@ -129,7 +131,8 @@ def test_load_project_defaults_stage00_packing_for_existing_v1_config(
         "bucket_size = 1000000\n"
         "fragment_target_rows = 100000\n"
         "max_open_writers = 128\n"
-        "compact_after_files = 64\n",
+        "compact_after_files = 64\n"
+        'input_filter = "none"\n',
         "",
     )
     project_path.write_text(legacy_text, encoding="utf-8")
@@ -140,6 +143,21 @@ def test_load_project_defaults_stage00_packing_for_existing_v1_config(
     assert project.stage00.fragment_target_rows == 100_000
     assert project.stage00.max_open_writers == 128
     assert project.stage00.compact_after_files == 64
+    assert project.stage00.input_filter == "none"
+
+
+def test_load_project_rejects_unknown_stage00_input_filter(tmp_path: Path) -> None:
+    project_path = tmp_path / "project.toml"
+    project_path.write_text(
+        _project_text(tmp_path).replace(
+            'input_filter = "none"',
+            'input_filter = "implicit-magic"',
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="stage00.input_filter"):
+        load_project(project_path)
 
 
 def test_render_project_template_contains_complete_v1_config() -> None:
@@ -153,6 +171,7 @@ def test_render_project_template_contains_complete_v1_config() -> None:
     assert "fragment_target_rows = 100000" in rendered
     assert "max_open_writers = 128" in rendered
     assert "compact_after_files = 64" in rendered
+    assert 'input_filter = "none"' in rendered
     assert 'identifiers_order_output_path = "artifacts/identifiers.order"' in rendered
     assert 'stage03_output_dir = "artifacts/stage03"' in rendered
     assert 'name = "meta"' in rendered

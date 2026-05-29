@@ -155,6 +155,7 @@ def _make_project(tmp_path: Path) -> OctreeProject:
             fragment_target_rows=100_000,
             max_open_writers=128,
             compact_after_files=64,
+            input_filter="none",
         ),
         stage01=Stage01ProjectConfig(
             input_glob="unused/*.parquet",

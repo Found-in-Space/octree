@@ -59,6 +59,7 @@ def test_stage00_help_contains_batch_size():
     assert "--fragment-target-rows" in result.output
     assert "--max-open-writers" in result.output
     assert "--compact-after-files" in result.output
+    assert "--input-filter" in result.output
     assert "--shard" in result.output
     assert "--replace-shards" in result.output
     assert "--healpix" in result.output

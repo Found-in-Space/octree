@@ -9,7 +9,6 @@ Query shape (precomputed-render mode)::
     SELECT morton_code >> :shift AS node_id, render, source, source_id
     FROM   read_parquet(:glob)
     WHERE  level = :level
-      AND  mag_abs IS NOT NULL
       [AND (morton_code >> :top_shift) = :prefix]   -- deep-sharded levels
     ORDER BY node_id, mag_abs, source_id
 """
@@ -38,7 +37,6 @@ def iter_sorted_rows(
 
     where_parts = [
         f"level = {level}",
-        "mag_abs IS NOT NULL",
     ]
     if shard.prefix_bits > 0:
         top_shift = 3 * MORTON_BITS - shard.prefix_bits

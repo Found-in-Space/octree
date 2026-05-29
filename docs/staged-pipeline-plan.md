@@ -124,8 +124,9 @@ files, the octree pipeline will rebuild and checksum at batch-shard granularity.
 
 Stage 00 derives `input_shard_id` from the input directory name or root-level
 parquet filename stem. It does not derive the rebuild boundary from row-level
-HEALPix columns, and it drops those partition columns before writing staged row
-fragments.
+HEALPix columns. It preserves row columns as supplied; enrichment or
+normalization is allowed only through an explicitly configured pre-filter, and
+that filter must preserve row count.
 
 ### Canonical Ordering
 

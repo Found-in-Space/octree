@@ -73,7 +73,11 @@ but that is only an intermediate layout choice.
 
 Current direction:
 
-- Compute missing octree row fields such as Morton code and final render level.
+- Require upstream placement fields needed for routing, currently
+  `morton_code` and `level`.
+- Preserve every input row and pass non-routing columns through unchanged.
+- Allow enrichment or normalization only through an explicitly configured
+  pre-filter that must preserve row count.
 - Keep sparse regions shallow in the staging filesystem.
 - Let dense staging nodes become lower-magnitude limited only after they reach
   the configured row cap.

@@ -139,6 +139,7 @@ def _resolve_mag_config(
     return MagLevelConfig(
         v_mag=vm,
         world_half_size=WORLD_HALF_SIZE_PC,
+        morton_bits=MORTON_BITS,
     )
 
 

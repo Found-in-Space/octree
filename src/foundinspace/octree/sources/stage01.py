@@ -40,6 +40,7 @@ class Stage01Config:
     output_dir: Path
     v_mag: float
     bucket_size: int
+    input_filter: str = "none"
     batch_size: int = 100_000
     fragment_target_rows: int = 100_000
     force: bool = False
@@ -118,6 +119,7 @@ def run_stage01(config: Stage01Config) -> Path:
         stage00_group = stage00_groups[key]
         old_group = existing_stage01_groups.get(key)
         sorted_table = _sorted_stage00_group(config.stage00_output_dir, stage00_group)
+        _ensure_stage01_group_row_count(stage00_group, sorted_table)
         checksum = _stage01_group_checksum(sorted_table)
         final_nodes = _final_node_keys(sorted_table)
         new_files = _write_sorted_group(config, stage00_group, sorted_table)
@@ -197,6 +199,7 @@ def _validate_stage00_identity(
     expected = _tree_identity_values(
         v_mag=config.v_mag,
         bucket_size=config.bucket_size,
+        input_filter=config.input_filter,
     )
     existing = manifest.get("tree_identity")
     if existing != expected:
@@ -237,6 +240,15 @@ def _sorted_stage00_group(stage00_output_dir: Path, group: dict[str, Any]) -> pa
         )
     )
     return sorted_with_helper.drop(["_stage01_final_node_id"])
+
+
+def _ensure_stage01_group_row_count(group: dict[str, Any], table: pa.Table) -> None:
+    expected = int(group.get("row_count", 0))
+    if len(table) != expected:
+        raise ValueError(
+            "Stage 01 sorting changed row count for "
+            f"{group.get('key', '<unknown>')}: before={expected}, after={len(table)}"
+        )
 
 
 def _final_node_id_array(table: pa.Table) -> np.ndarray:

@@ -8,10 +8,15 @@ import pyarrow.parquet as pq
 import pytest
 from click.testing import CliRunner
 
+import foundinspace.octree.sources.stage00 as stage00_module
 from foundinspace.octree._cli import cli
 from foundinspace.octree.config import MORTON_BITS
 from foundinspace.octree.mag_levels import MagLevelConfig
-from foundinspace.octree.sources.stage00 import Stage00Config, run_stage00
+from foundinspace.octree.sources.stage00 import (
+    STAGE00_INPUT_FILTER_RAW_CARTESIAN,
+    Stage00Config,
+    run_stage00,
+)
 
 
 def _morton_for_node(level: int, node_id: int) -> int:
@@ -60,6 +65,26 @@ def _write_stage00_shard_file(root: Path, shard: str, rows: list[dict]) -> None:
     )
 
 
+def _write_raw_stage00_pixel(root: Path, pixel: str, rows: list[dict]) -> None:
+    pixel_dir = root / pixel
+    pixel_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(
+        pa.table(
+            {
+                "source": pa.array([r["source"] for r in rows], type=pa.string()),
+                "source_id": pa.array([r["source_id"] for r in rows], type=pa.string()),
+                "x_icrs_pc": pa.array([r["x_icrs_pc"] for r in rows], pa.float64()),
+                "y_icrs_pc": pa.array([r["y_icrs_pc"] for r in rows], pa.float64()),
+                "z_icrs_pc": pa.array([r["z_icrs_pc"] for r in rows], pa.float64()),
+                "mag_abs": pa.array([r["mag_abs"] for r in rows], pa.float64()),
+                "teff": pa.array([r.get("teff", 5500.0) for r in rows], pa.float64()),
+            }
+        ),
+        pixel_dir / "part.parquet",
+        compression="zstd",
+    )
+
+
 def _group_checksums(report: dict) -> dict[tuple[str, str, str], tuple[int, str]]:
     return {
         (row["node_path"], row["input_shard_id"], row["kind"]): (
@@ -77,6 +102,7 @@ def _stage00_config(
     bucket_size: int = 100,
     shard_ids: tuple[str, ...] = (),
     replace_shards: bool = False,
+    input_filter: str = "none",
     force: bool = False,
 ) -> Stage00Config:
     return Stage00Config(
@@ -89,6 +115,7 @@ def _stage00_config(
         compact_after_files=0,
         shard_ids=shard_ids,
         replace_shards=replace_shards,
+        input_filter=input_filter,
         force=force,
     )
 
@@ -128,6 +155,9 @@ def test_stage00_writes_tree_manifest_and_state(tmp_path: Path) -> None:
         == manifest["tree_identity"]
     )
     assert state["format"] == "foundinspace.octree.stage-state/v0"
+    assert report["input_filter"] == "none"
+    assert report["rows_after_filter"] == report["rows_in"]
+    assert state["input_filter"] == "none"
     assert state["input_shards"][0]["shard_id"] == "100"
     assert state["input_shards"][0]["source_files"][0]["path"] == "100/part.parquet"
     assert [group["key"] for group in state["stage00_groups"]] == [
@@ -142,6 +172,126 @@ def test_stage00_writes_tree_manifest_and_state(tmp_path: Path) -> None:
     ]
     assert state["dirty"]["deleted_stage00_groups"] == []
     assert state["dirty"]["stage03_nodes"] == []
+
+
+def test_stage00_fails_hard_without_required_routing_columns(
+    tmp_path: Path,
+) -> None:
+    input_root = tmp_path / "input"
+    _write_raw_stage00_pixel(
+        input_root,
+        "100",
+        [
+            {
+                "source": "gaia",
+                "source_id": "faint",
+                "x_icrs_pc": 0.0,
+                "y_icrs_pc": 0.0,
+                "z_icrs_pc": 0.0,
+                "mag_abs": 20.0,
+            }
+        ],
+    )
+    out_dir = tmp_path / "stage00"
+    config = _stage00_config(input_root, out_dir)
+
+    with pytest.raises(ValueError, match="missing required routing columns"):
+        run_stage00(config)
+    assert not (out_dir / "stage-state.json").exists()
+
+
+def test_stage00_explicit_raw_filter_preserves_row_count_and_records_filter(
+    tmp_path: Path,
+) -> None:
+    input_root = tmp_path / "input"
+    _write_raw_stage00_pixel(
+        input_root,
+        "100",
+        [
+            {
+                "source": "gaia",
+                "source_id": "a",
+                "x_icrs_pc": 0.0,
+                "y_icrs_pc": 0.0,
+                "z_icrs_pc": 0.0,
+                "mag_abs": 5.0,
+                "teff": 5500.0,
+            },
+            {
+                "source": "gaia",
+                "source_id": "b",
+                "x_icrs_pc": 1.0,
+                "y_icrs_pc": 0.0,
+                "z_icrs_pc": 0.0,
+                "mag_abs": 6.0,
+                "teff": 5000.0,
+            },
+        ],
+    )
+    out_dir = tmp_path / "stage00"
+
+    report_path = run_stage00(
+        _stage00_config(
+            input_root,
+            out_dir,
+            input_filter=STAGE00_INPUT_FILTER_RAW_CARTESIAN,
+        )
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    manifest = json.loads((out_dir / "tree-manifest.json").read_text(encoding="utf-8"))
+    fragment = next((out_dir / "tree").glob("*.parquet"))
+    table = pq.read_table(fragment)
+    assert report["input_filter"] == STAGE00_INPUT_FILTER_RAW_CARTESIAN
+    assert report["rows_in"] == 2
+    assert report["rows_after_filter"] == 2
+    assert report["rows_current"] == 2
+    assert (
+        manifest["tree_identity"]["input_filter"] == STAGE00_INPUT_FILTER_RAW_CARTESIAN
+    )
+    assert {
+        "x_icrs_pc",
+        "y_icrs_pc",
+        "z_icrs_pc",
+        "teff",
+        "morton_code",
+        "level",
+    }.issubset(table.schema.names)
+
+
+def test_stage00_fails_if_input_filter_changes_row_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_root = tmp_path / "input"
+    _write_stage00_pixel(
+        input_root,
+        "100",
+        [
+            {
+                "source": "gaia",
+                "source_id": "a",
+                "morton_code": _morton_for_node(1, 0),
+                "level": 1,
+                "mag_abs": 7.0,
+            },
+            {
+                "source": "gaia",
+                "source_id": "b",
+                "morton_code": _morton_for_node(1, 1),
+                "level": 1,
+                "mag_abs": 8.0,
+            },
+        ],
+    )
+
+    def drop_one_row(table: pa.Table, _config: Stage00Config) -> pa.Table:
+        return table.slice(0, len(table) - 1)
+
+    monkeypatch.setattr(stage00_module, "_apply_input_filter", drop_one_row)
+
+    with pytest.raises(ValueError, match="changed row count"):
+        run_stage00(_stage00_config(input_root, tmp_path / "stage00"))
 
 
 def test_stage00_rewrites_packed_files_when_node_becomes_lower_mag_limited(
@@ -215,7 +365,7 @@ def test_stage00_rewrites_packed_files_when_node_becomes_lower_mag_limited(
     assert len(list((tree / "o=1").glob("shard-124-pack-*.parquet"))) == 1
 
     child_table = pq.read_table(next((tree / "o=0").glob("shard-123-pack-*.parquet")))
-    assert "healpix_id" not in child_table.schema.names
+    assert "healpix_id" in child_table.schema.names
     assert report["group_checksum_algorithm"] == "arrow-ipc-sha256/v0"
     assert {
         (row["node_path"], row["input_shard_id"], row["kind"])
@@ -463,7 +613,7 @@ def test_stage00_rolls_fragments_by_target_rows(tmp_path: Path) -> None:
     assert [pq.ParquetFile(path).metadata.num_rows for path in files] == [2, 2, 1]
 
 
-def test_stage00_normalizes_schema_for_rolling_writers(tmp_path: Path) -> None:
+def test_stage00_rejects_schema_drift_for_rolling_writers(tmp_path: Path) -> None:
     input_root = tmp_path / "input"
     pixel_dir = input_root / "202"
     pixel_dir.mkdir(parents=True)
@@ -485,24 +635,18 @@ def test_stage00_normalizes_schema_for_rolling_writers(tmp_path: Path) -> None:
     )
 
     out_dir = tmp_path / "stage00"
-    report_path = run_stage00(
-        Stage00Config(
-            input_root=input_root,
-            output_dir=out_dir,
-            mag_config=MagLevelConfig(v_mag=6.5),
-            bucket_size=100,
-            batch_size=10,
-            fragment_target_rows=10,
-            compact_after_files=0,
+    with pytest.raises(ValueError, match="schema changed"):
+        run_stage00(
+            Stage00Config(
+                input_root=input_root,
+                output_dir=out_dir,
+                mag_config=MagLevelConfig(v_mag=6.5),
+                bucket_size=100,
+                batch_size=10,
+                fragment_target_rows=10,
+                compact_after_files=0,
+            )
         )
-    )
-
-    report = json.loads(report_path.read_text(encoding="utf-8"))
-    files = sorted((out_dir / "tree").glob("shard-202-pack-*.parquet"))
-    table = pq.read_table(files[0])
-    assert report["current_fragment_files"] == 1
-    assert table.schema.field("quality_flags").type == pa.int64()
-    assert table.schema.field("source").type == pa.large_string()
 
 
 def test_stage00_compacts_repeated_small_fragments_after_lru_churn(
@@ -810,6 +954,7 @@ def test_stage00_help_contains_packed_options() -> None:
     assert "--fragment-target-rows" in result.output
     assert "--max-open-writers" in result.output
     assert "--compact-after-files" in result.output
+    assert "--input-filter" in result.output
     assert "--shard" in result.output
     assert "--replace-shards" in result.output
     assert "--healpix" in result.output

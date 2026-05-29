@@ -20,6 +20,11 @@ _DEFAULT_STAGE00_BUCKET_SIZE = 1_000_000
 _DEFAULT_STAGE00_FRAGMENT_TARGET_ROWS = 100_000
 _DEFAULT_STAGE00_MAX_OPEN_WRITERS = 128
 _DEFAULT_STAGE00_COMPACT_AFTER_FILES = 64
+_DEFAULT_STAGE00_INPUT_FILTER = "none"
+_STAGE00_INPUT_FILTERS = {
+    "none",
+    "raw-cartesian-to-stage00-enriched/v0",
+}
 
 _PATH_KEYS = {
     "merged_healpix_dir",
@@ -37,6 +42,7 @@ _STAGE00_KEYS = {
     "fragment_target_rows",
     "max_open_writers",
     "compact_after_files",
+    "input_filter",
 }
 _STAGE01_KEYS = {
     "input_glob",
@@ -68,6 +74,7 @@ class Stage00ProjectConfig:
     fragment_target_rows: int
     max_open_writers: int
     compact_after_files: int
+    input_filter: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +151,13 @@ def _require_str(raw: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{key} must be a non-empty string")
     return value
+
+
+def _optional_str(raw: dict[str, Any], key: str, default: str) -> str:
+    value = raw.get(key, default)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{key} must be a non-empty string")
+    return value.strip()
 
 
 def _resolve_path(project_dir: Path, value: str, *, field_name: str) -> Path:
@@ -255,6 +269,11 @@ def load_project(project_path: Path) -> OctreeProject:
             "compact_after_files",
             _DEFAULT_STAGE00_COMPACT_AFTER_FILES,
         ),
+        input_filter=_optional_str(
+            stage00_raw,
+            "input_filter",
+            _DEFAULT_STAGE00_INPUT_FILTER,
+        ),
     )
     if stage00.batch_size <= 0:
         raise ValueError("stage00.batch_size must be > 0")
@@ -266,6 +285,11 @@ def load_project(project_path: Path) -> OctreeProject:
         raise ValueError("stage00.max_open_writers must be > 0")
     if stage00.compact_after_files < 0:
         raise ValueError("stage00.compact_after_files must be >= 0")
+    if stage00.input_filter not in _STAGE00_INPUT_FILTERS:
+        raise ValueError(
+            "stage00.input_filter must be one of "
+            f"{sorted(_STAGE00_INPUT_FILTERS)}, got {stage00.input_filter!r}"
+        )
 
     stage01 = Stage01ProjectConfig(
         input_glob=_resolve_glob(
@@ -355,7 +379,8 @@ def render_project_template() -> str:
         f"bucket_size = {_DEFAULT_STAGE00_BUCKET_SIZE}\n"
         f"fragment_target_rows = {_DEFAULT_STAGE00_FRAGMENT_TARGET_ROWS}\n"
         f"max_open_writers = {_DEFAULT_STAGE00_MAX_OPEN_WRITERS}\n"
-        f"compact_after_files = {_DEFAULT_STAGE00_COMPACT_AFTER_FILES}\n\n"
+        f"compact_after_files = {_DEFAULT_STAGE00_COMPACT_AFTER_FILES}\n"
+        f'input_filter = "{_DEFAULT_STAGE00_INPUT_FILTER}"\n\n'
         "[stage01]\n"
         f'input_glob = "{stage00_input_glob}"\n'
         "batch_size = 100000\n"
