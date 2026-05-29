@@ -129,6 +129,11 @@ def _load_project_or_die(project_path: Path):
     is_flag=True,
     help="Replace an existing Stage 00 output directory.",
 )
+@click.option(
+    "--replace-shards",
+    is_flag=True,
+    help="Replace existing Stage 00 fragments for the selected --shard values.",
+)
 def stage_00(
     project_path: Path,
     input_root: Path | None,
@@ -141,6 +146,7 @@ def stage_00(
     max_open_writers: int | None,
     compact_after_files: int | None,
     force: bool,
+    replace_shards: bool,
 ) -> None:
     """Pack input shards into adaptive Stage 00 staging buckets."""
     from foundinspace.octree.sources.stage00 import Stage00Config, run_stage00
@@ -183,10 +189,12 @@ def stage_00(
         shard_ids=tuple(shard_ids),
         max_pixels=max_pixels,
         force=force,
+        replace_shards=replace_shards,
     )
     click.echo(
         "Stage 00 — adaptive staging buckets: "
         f"{config.input_root} -> {config.output_dir}; "
+        f"mode={'replace-shards' if config.replace_shards else 'full'}; "
         f"bucket_size={config.bucket_size:,}; "
         f"fragment_target_rows={config.fragment_target_rows:,}; "
         f"max_open_writers={config.max_open_writers:,}; "
@@ -201,6 +209,9 @@ def stage_00(
         f"nodes={report['staging_nodes']:,}, "
         f"lower_mag_limited={report['lower_mag_limited_nodes']:,}, "
         f"fragments={report['current_fragment_files']:,}, "
+        f"changed_groups={report['changed_group_count']:,}, "
+        f"unchanged_groups={report['unchanged_group_count']:,}, "
+        f"deleted_groups={report['deleted_group_count']:,}, "
         f"split_rewrites={report['split_rewrites']:,}, "
         f"compaction_rewrites={report['compaction_rewrites']:,}"
     )

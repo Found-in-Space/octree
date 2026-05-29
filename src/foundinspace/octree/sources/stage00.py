@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 from collections import OrderedDict
@@ -20,9 +21,15 @@ from foundinspace.octree.mag_levels import MagLevelConfig
 from .add_shard_columns import _enrich_table
 
 STAGE00_FORMAT = "foundinspace.octree.stage00/v0"
+TREE_MANIFEST_FORMAT = "foundinspace.octree.stage-tree/v0"
+STAGE_STATE_FORMAT = "foundinspace.octree.stage-state/v0"
 STAGE00_GROUP_CHECKSUM_ALGORITHM = "arrow-ipc-sha256/v0"
+STAGE00_ROW_SCHEMA_VERSION = "stage00-row-schema/v0"
+STAGE00_SPLIT_POLICY = "lower-mag-limited-bucket/v0"
 TREE_DIR_NAME = "tree"
 REPORT_NAME = "stage00-report.json"
+TREE_MANIFEST_NAME = "tree-manifest.json"
+STAGE_STATE_NAME = "stage-state.json"
 LOWER_MAG_LIMITED_MARKER = "_LOWER_MAG_LIMITED"
 _FRAGMENT_RE = re.compile(
     r"^(?:shard-(?P<shard>.+?)|hp(?P<legacy_shard>.+?))"
@@ -63,6 +70,7 @@ class Stage00Config:
     shard_ids: tuple[str, ...] = ()
     max_pixels: int | None = None
     force: bool = False
+    replace_shards: bool = False
 
     def validate(self) -> None:
         if not self.input_root.is_dir():
@@ -85,6 +93,13 @@ class Stage00Config:
             )
         if self.max_pixels is not None and self.max_pixels <= 0:
             raise ValueError("max_pixels must be > 0")
+        if self.replace_shards:
+            if not self.shard_ids:
+                raise ValueError("--replace-shards requires one or more --shard")
+            if self.force:
+                raise ValueError("--replace-shards cannot be used with --force")
+            if self.max_pixels is not None:
+                raise ValueError("--replace-shards cannot be used with --max-pixels")
 
 
 @dataclass(slots=True)
@@ -127,10 +142,17 @@ class _OpenFragmentWriter:
 
 
 class _Stage00Builder:
-    def __init__(self, config: Stage00Config) -> None:
+    def __init__(
+        self,
+        config: Stage00Config,
+        *,
+        existing_state: dict[str, Any] | None = None,
+        preserve_existing_topology: bool = False,
+    ) -> None:
         self._config = config
         self._tree_dir = config.output_dir / TREE_DIR_NAME
         self._nodes: dict[tuple[int, ...], _BucketNode] = {}
+        self._preserve_existing_topology = preserve_existing_topology
         self._open_writers: OrderedDict[_WriterKey, _OpenFragmentWriter] = OrderedDict()
         self._rows_in = 0
         self._rows_written = 0
@@ -143,6 +165,8 @@ class _Stage00Builder:
         self._compaction_output_files = 0
         self._max_open_writers_seen = 0
         self._batches = 0
+        if existing_state is not None:
+            self._load_existing_state(existing_state)
 
     @property
     def rows_in(self) -> int:
@@ -160,9 +184,9 @@ class _Stage00Builder:
             input_shard_id=input_shard_id,
         )
 
-    def finish(self) -> None:
+    def finish(self, *, compact_shard_ids: set[str] | None = None) -> None:
         self._close_all_writers()
-        self._compact_current_files()
+        self._compact_current_files(compact_shard_ids=compact_shard_ids)
 
     def report(
         self, *, processed_input_shards: list[str], input_files: int
@@ -206,7 +230,10 @@ class _Stage00Builder:
             "max_open_writers": self._config.max_open_writers,
             "compact_after_files": self._config.compact_after_files,
             "max_level": self._config.max_level,
+            "tree_manifest": TREE_MANIFEST_NAME,
+            "stage_state": STAGE_STATE_NAME,
             "group_checksum_algorithm": STAGE00_GROUP_CHECKSUM_ALGORITHM,
+            "replacement_mode": self._config.replace_shards,
             "processed_input_shards": processed_input_shards,
             "input_files": input_files,
             "input_batches": self._batches,
@@ -227,6 +254,54 @@ class _Stage00Builder:
             "by_depth": [by_depth[d] for d in sorted(by_depth)],
             "groups": self._group_reports(),
         }
+
+    def nodes_report(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "node_path": _node_path_label(node.path_octants),
+                "path_octants": list(node.path_octants),
+                "depth": node.depth,
+                "row_count": node.row_count,
+                "lower_mag_limited": node.lower_mag_limited,
+            }
+            for node in sorted(self._nodes.values(), key=lambda item: item.path_octants)
+        ]
+
+    def remove_input_shards(self, shard_ids: set[str], state: dict[str, Any]) -> None:
+        for group in state.get("stage00_groups", []):
+            if (
+                str(group.get("input_shard_id", group.get("shard_id", "")))
+                not in shard_ids
+            ):
+                continue
+            path_octants = tuple(int(v) for v in group["path_octants"])
+            node = self._node_for_path(path_octants)
+            for rel_file in group.get("files", []):
+                path = self._config.output_dir / rel_file
+                node.current_files.discard(path)
+                if path.exists():
+                    path.unlink()
+            node.row_count = max(0, node.row_count - int(group.get("row_count", 0)))
+
+    def _load_existing_state(self, state: dict[str, Any]) -> None:
+        for node_record in sorted(
+            state.get("nodes", []),
+            key=lambda row: tuple(int(v) for v in row["path_octants"]),
+        ):
+            node = self._node_for_path(
+                tuple(int(v) for v in node_record["path_octants"])
+            )
+            node.row_count = int(node_record.get("row_count", 0))
+            node.lower_mag_limited = bool(node_record.get("lower_mag_limited", False))
+
+        for group in state.get("stage00_groups", []):
+            node = self._node_for_path(tuple(int(v) for v in group["path_octants"]))
+            for rel_file in group.get("files", []):
+                path = self._config.output_dir / rel_file
+                node.current_files.add(path)
+
+        for node in self._nodes.values():
+            node.next_sequence = _next_fragment_sequence(node.current_files)
 
     def _group_reports(self) -> list[dict[str, Any]]:
         groups: dict[tuple[tuple[int, ...], str, str], list[Path]] = {}
@@ -305,7 +380,10 @@ class _Stage00Builder:
             return
 
         self._write_fragment(node, table, input_shard_id=input_shard_id, kind="pack")
-        if node.row_count >= self._config.bucket_size:
+        if (
+            node.row_count >= self._config.bucket_size
+            and not self._preserve_existing_topology
+        ):
             self._make_lower_mag_limited(node)
 
     def _route_into_lower_limited_node(
@@ -486,7 +564,7 @@ class _Stage00Builder:
         for key in list(self._open_writers):
             self._close_writer(key)
 
-    def _compact_current_files(self) -> None:
+    def _compact_current_files(self, *, compact_shard_ids: set[str] | None) -> None:
         threshold = self._config.compact_after_files
         if threshold == 0:
             return
@@ -499,6 +577,11 @@ class _Stage00Builder:
                 ).append(path)
 
             for (input_shard_id, kind), files in sorted(groups.items()):
+                if (
+                    compact_shard_ids is not None
+                    and input_shard_id not in compact_shard_ids
+                ):
+                    continue
                 if len(files) <= threshold:
                     continue
                 self._compact_file_group(
@@ -577,6 +660,10 @@ def run_stage00(config: Stage00Config) -> Path:
     enabled only after a bucket reaches the configured row cap.
     """
     config.validate()
+    if config.replace_shards:
+        selected_input_shards = _selected_input_shards(config)
+        return _run_stage00_replacement(config, selected_input_shards)
+
     if config.force and config.output_dir.exists():
         shutil.rmtree(config.output_dir)
     if config.output_dir.exists() and any(config.output_dir.iterdir()):
@@ -585,29 +672,274 @@ def run_stage00(config: Stage00Config) -> Path:
         )
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
+    selected_input_shards = _selected_input_shards(config)
     builder = _Stage00Builder(config)
+    processed_input_shards, input_files = _process_input_shards(
+        builder,
+        selected_input_shards,
+        batch_size=config.batch_size,
+    )
+    builder.finish()
+    report = builder.report(
+        processed_input_shards=processed_input_shards,
+        input_files=input_files,
+    )
+    report["replacement_mode"] = False
+    report["changed_group_count"] = len(report["groups"])
+    report["unchanged_group_count"] = 0
+    report["deleted_group_count"] = 0
+    manifest = _tree_manifest(config)
+    state = _stage_state(
+        config,
+        builder=builder,
+        input_shards=[
+            _input_shard_metadata(config.input_root, shard)
+            for shard in selected_input_shards
+            if shard.parquet_files
+        ],
+        groups=report["groups"],
+        dirty={
+            "stage01_groups": [group["key"] for group in report["groups"]],
+            "deleted_stage00_groups": [],
+            "stage03_nodes": [],
+        },
+    )
+    _atomic_write_json(config.output_dir / TREE_MANIFEST_NAME, manifest)
+    _atomic_write_json(config.output_dir / STAGE_STATE_NAME, state)
+    report_path = config.output_dir / REPORT_NAME
+    _atomic_write_json(report_path, report)
+    return report_path
+
+
+def _run_stage00_replacement(
+    config: Stage00Config,
+    selected_input_shards: list[_InputShard],
+) -> Path:
+    manifest_path = config.output_dir / TREE_MANIFEST_NAME
+    state_path = config.output_dir / STAGE_STATE_NAME
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Missing Stage 00 tree manifest: {manifest_path}")
+    if not state_path.is_file():
+        raise FileNotFoundError(f"Missing Stage 00 state: {state_path}")
+
+    manifest = _read_json(manifest_path)
+    state = _read_json(state_path)
+    if manifest.get("format") != TREE_MANIFEST_FORMAT:
+        raise ValueError(
+            f"Unsupported Stage 00 tree manifest format: {manifest.get('format')!r}"
+        )
+    expected_identity = _tree_identity(config)
+    existing_identity = manifest.get("tree_identity")
+    if existing_identity != expected_identity:
+        raise ValueError(
+            "Existing Stage 00 tree identity does not match current project config; "
+            "use --force for a full rebuild."
+        )
+    if state.get("format") != STAGE_STATE_FORMAT:
+        raise ValueError(f"Unsupported Stage 00 state format: {state.get('format')!r}")
+    if state.get("tree_identity") != existing_identity:
+        raise ValueError("Stage 00 state identity does not match tree manifest")
+
+    target_shards = {shard.shard_id for shard in selected_input_shards}
+    old_target_groups = {
+        group["key"]: group
+        for group in state.get("stage00_groups", [])
+        if str(group.get("input_shard_id", group.get("shard_id", ""))) in target_shards
+    }
+
+    builder = _Stage00Builder(
+        config,
+        existing_state=state,
+        preserve_existing_topology=True,
+    )
+    builder.remove_input_shards(target_shards, state)
+    processed_input_shards, input_files = _process_input_shards(
+        builder,
+        selected_input_shards,
+        batch_size=config.batch_size,
+    )
+    builder.finish(compact_shard_ids=target_shards)
+    report = builder.report(
+        processed_input_shards=processed_input_shards,
+        input_files=input_files,
+    )
+    report["replacement_mode"] = True
+
+    new_target_groups = {
+        group["key"]: group
+        for group in report["groups"]
+        if group["input_shard_id"] in target_shards
+    }
+    changed_group_keys = [
+        key
+        for key, group in sorted(new_target_groups.items())
+        if old_target_groups.get(key, {}).get("content_checksum")
+        != group["content_checksum"]
+    ]
+    unchanged_group_keys = [
+        key
+        for key, group in sorted(new_target_groups.items())
+        if old_target_groups.get(key, {}).get("content_checksum")
+        == group["content_checksum"]
+    ]
+    deleted_group_keys = sorted(set(old_target_groups) - set(new_target_groups))
+    report["changed_group_count"] = len(changed_group_keys)
+    report["unchanged_group_count"] = len(unchanged_group_keys)
+    report["deleted_group_count"] = len(deleted_group_keys)
+
+    input_shards = _replace_input_shard_metadata(
+        state.get("input_shards", []),
+        target_shards=target_shards,
+        replacements=[
+            _input_shard_metadata(config.input_root, shard)
+            for shard in selected_input_shards
+        ],
+    )
+    next_state = _stage_state(
+        config,
+        builder=builder,
+        input_shards=input_shards,
+        groups=report["groups"],
+        dirty={
+            "stage01_groups": changed_group_keys,
+            "deleted_stage00_groups": deleted_group_keys,
+            "stage03_nodes": [],
+        },
+    )
+    _atomic_write_json(state_path, next_state)
+    _atomic_write_json(config.output_dir / REPORT_NAME, report)
+    return config.output_dir / REPORT_NAME
+
+
+def _process_input_shards(
+    builder: _Stage00Builder,
+    input_shards: list[_InputShard],
+    *,
+    batch_size: int,
+) -> tuple[list[str], int]:
     processed_input_shards: list[str] = []
     input_files = 0
 
-    for input_shard in _selected_input_shards(config):
+    for input_shard in input_shards:
         if not input_shard.parquet_files:
             continue
         processed_input_shards.append(input_shard.shard_id)
         for src_file in input_shard.parquet_files:
             input_files += 1
             parquet_file = pq.ParquetFile(src_file)
-            for batch in parquet_file.iter_batches(batch_size=config.batch_size):
+            for batch in parquet_file.iter_batches(batch_size=batch_size):
                 table = pa.Table.from_batches([batch])
                 builder.process_table(table, input_shard_id=input_shard.shard_id)
+    return processed_input_shards, input_files
 
-    builder.finish()
-    report = builder.report(
-        processed_input_shards=processed_input_shards,
-        input_files=input_files,
-    )
-    report_path = config.output_dir / REPORT_NAME
-    report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    return report_path
+
+def _tree_manifest(config: Stage00Config) -> dict[str, Any]:
+    return {
+        "format": TREE_MANIFEST_FORMAT,
+        "tree_identity": _tree_identity(config),
+    }
+
+
+def _tree_identity(config: Stage00Config) -> dict[str, Any]:
+    return {
+        "coordinate_frame": "icrs-cartesian-pc",
+        "world_center": [float(v) for v in WORLD_CENTER.tolist()],
+        "world_half_size_pc": float(WORLD_HALF_SIZE_PC),
+        "morton_bits": MORTON_BITS,
+        "max_level": config.max_level,
+        "v_mag": float(config.mag_config.v_mag),
+        "bucket_size": config.bucket_size,
+        "split_policy": STAGE00_SPLIT_POLICY,
+        "row_schema_version": STAGE00_ROW_SCHEMA_VERSION,
+    }
+
+
+def _stage_state(
+    config: Stage00Config,
+    *,
+    builder: _Stage00Builder,
+    input_shards: list[dict[str, Any]],
+    groups: list[dict[str, Any]],
+    dirty: dict[str, list[str]],
+) -> dict[str, Any]:
+    return {
+        "format": STAGE_STATE_FORMAT,
+        "tree_manifest": TREE_MANIFEST_NAME,
+        "tree_identity": _tree_identity(config),
+        "input_root": str(config.input_root),
+        "output_dir": str(config.output_dir),
+        "input_shards": sorted(input_shards, key=lambda row: row["shard_id"]),
+        "nodes": builder.nodes_report(),
+        "stage00_groups": [_state_group(group) for group in groups],
+        "dirty": dirty,
+    }
+
+
+def _state_group(group: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "key": group["key"],
+        "node_path": group["node_path"],
+        "path_octants": list(group["path_octants"]),
+        "depth": group["depth"],
+        "shard_id": group["input_shard_id"],
+        "input_shard_id": group["input_shard_id"],
+        "kind": group["kind"],
+        "files": list(group["files"]),
+        "file_count": group["file_count"],
+        "row_count": group["row_count"],
+        "checksum": group["content_checksum"],
+        "content_checksum": group["content_checksum"],
+    }
+
+
+def _input_shard_metadata(input_root: Path, shard: _InputShard) -> dict[str, Any]:
+    source_files: list[dict[str, Any]] = []
+    for path in shard.parquet_files:
+        stat = path.stat()
+        source_files.append(
+            {
+                "path": path.relative_to(input_root).as_posix(),
+                "size": stat.st_size,
+                "mtime_ns": stat.st_mtime_ns,
+            }
+        )
+    return {
+        "shard_id": shard.shard_id,
+        "source_files": source_files,
+    }
+
+
+def _replace_input_shard_metadata(
+    existing: list[dict[str, Any]],
+    *,
+    target_shards: set[str],
+    replacements: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    rows = [
+        row for row in existing if str(row.get("shard_id", "")) not in target_shards
+    ]
+    rows.extend(replacements)
+    return sorted(rows, key=lambda row: row["shard_id"])
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _next_fragment_sequence(paths: set[Path]) -> int:
+    max_sequence = 0
+    for path in paths:
+        match = _FRAGMENT_RE.match(path.name)
+        if match is not None:
+            max_sequence = max(max_sequence, int(match.group("seq")))
+    return max_sequence + 1
 
 
 def _selected_input_shards(config: Stage00Config) -> list[_InputShard]:

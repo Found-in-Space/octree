@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 from click.testing import CliRunner
 
 from foundinspace.octree._cli import cli
@@ -67,6 +68,83 @@ def _group_checksums(report: dict) -> dict[tuple[str, str, str], tuple[int, str]
         )
         for row in report["groups"]
     }
+
+
+def _stage00_config(
+    input_root: Path,
+    output_dir: Path,
+    *,
+    max_level: int = 2,
+    bucket_size: int = 100,
+    shard_ids: tuple[str, ...] = (),
+    replace_shards: bool = False,
+    force: bool = False,
+) -> Stage00Config:
+    return Stage00Config(
+        input_root=input_root,
+        output_dir=output_dir,
+        mag_config=MagLevelConfig(v_mag=6.5, max_level=max_level),
+        max_level=max_level,
+        bucket_size=bucket_size,
+        batch_size=10,
+        fragment_target_rows=10,
+        compact_after_files=0,
+        shard_ids=shard_ids,
+        replace_shards=replace_shards,
+        force=force,
+    )
+
+
+def test_stage00_writes_tree_manifest_and_state(tmp_path: Path) -> None:
+    input_root = tmp_path / "input"
+    _write_stage00_pixel(
+        input_root,
+        "100",
+        [
+            {
+                "source": "gaia",
+                "source_id": "a",
+                "morton_code": _morton_for_node(1, 0),
+                "level": 1,
+                "mag_abs": 7.0,
+            }
+        ],
+    )
+
+    out_dir = tmp_path / "stage00"
+    report_path = run_stage00(_stage00_config(input_root, out_dir, max_level=1))
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    manifest = json.loads((out_dir / "tree-manifest.json").read_text(encoding="utf-8"))
+    state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
+
+    assert manifest["format"] == "foundinspace.octree.stage-tree/v0"
+    assert manifest["tree_identity"] == state["tree_identity"]
+    assert (
+        manifest["tree_identity"]
+        | {
+            "max_level": 1,
+            "v_mag": 6.5,
+            "bucket_size": 100,
+            "morton_bits": MORTON_BITS,
+        }
+        == manifest["tree_identity"]
+    )
+    assert state["format"] == "foundinspace.octree.stage-state/v0"
+    assert state["input_shards"][0]["shard_id"] == "100"
+    assert state["input_shards"][0]["source_files"][0]["path"] == "100/part.parquet"
+    assert [group["key"] for group in state["stage00_groups"]] == [
+        group["key"] for group in report["groups"]
+    ]
+    assert (
+        state["stage00_groups"][0]["checksum"]
+        == report["groups"][0]["content_checksum"]
+    )
+    assert state["dirty"]["stage01_groups"] == [
+        group["key"] for group in report["groups"]
+    ]
+    assert state["dirty"]["deleted_stage00_groups"] == []
+    assert state["dirty"]["stage03_nodes"] == []
 
 
 def test_stage00_rewrites_packed_files_when_node_becomes_lower_mag_limited(
@@ -522,6 +600,224 @@ def test_stage00_compacts_repeated_small_fragments_after_lru_churn(
     assert len(list((tree / "o=1").glob("shard-201-pack-*.parquet"))) == 1
 
 
+def test_stage00_replace_unchanged_shard_marks_no_dirty_groups(
+    tmp_path: Path,
+) -> None:
+    input_root = tmp_path / "input"
+    _write_stage00_pixel(
+        input_root,
+        "100",
+        [
+            {
+                "source": "gaia",
+                "source_id": "a",
+                "morton_code": _morton_for_node(1, 0),
+                "level": 1,
+                "mag_abs": 7.0,
+            }
+        ],
+    )
+    _write_stage00_pixel(
+        input_root,
+        "101",
+        [
+            {
+                "source": "hip",
+                "source_id": "b",
+                "morton_code": _morton_for_node(1, 1),
+                "level": 1,
+                "mag_abs": 7.1,
+            }
+        ],
+    )
+    out_dir = tmp_path / "stage00"
+    run_stage00(_stage00_config(input_root, out_dir, max_level=1))
+    unrelated_files = sorted(
+        path.relative_to(out_dir).as_posix()
+        for path in (out_dir / "tree").glob("shard-101-pack-*.parquet")
+    )
+
+    report_path = run_stage00(
+        _stage00_config(
+            input_root,
+            out_dir,
+            max_level=1,
+            shard_ids=("100",),
+            replace_shards=True,
+        )
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
+    assert report["replacement_mode"] is True
+    assert report["processed_input_shards"] == ["100"]
+    assert report["changed_group_count"] == 0
+    assert report["unchanged_group_count"] == 1
+    assert report["deleted_group_count"] == 0
+    assert state["dirty"]["stage01_groups"] == []
+    assert state["dirty"]["deleted_stage00_groups"] == []
+    assert (
+        sorted(
+            path.relative_to(out_dir).as_posix()
+            for path in (out_dir / "tree").glob("shard-101-pack-*.parquet")
+        )
+        == unrelated_files
+    )
+
+
+def test_stage00_replace_changed_shard_marks_changed_group(
+    tmp_path: Path,
+) -> None:
+    input_root = tmp_path / "input"
+    _write_stage00_pixel(
+        input_root,
+        "100",
+        [
+            {
+                "source": "gaia",
+                "source_id": "a",
+                "morton_code": _morton_for_node(1, 0),
+                "level": 1,
+                "mag_abs": 7.0,
+            }
+        ],
+    )
+    out_dir = tmp_path / "stage00"
+    run_stage00(_stage00_config(input_root, out_dir, max_level=1))
+    _write_stage00_pixel(
+        input_root,
+        "100",
+        [
+            {
+                "source": "gaia",
+                "source_id": "changed",
+                "morton_code": _morton_for_node(1, 0),
+                "level": 1,
+                "mag_abs": 7.0,
+            }
+        ],
+    )
+
+    report_path = run_stage00(
+        _stage00_config(
+            input_root,
+            out_dir,
+            max_level=1,
+            shard_ids=("100",),
+            replace_shards=True,
+        )
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
+    assert report["changed_group_count"] == 1
+    assert report["unchanged_group_count"] == 0
+    assert report["deleted_group_count"] == 0
+    assert state["dirty"]["stage01_groups"] == ["|100|pack"]
+
+
+def test_stage00_replace_records_deleted_group(tmp_path: Path) -> None:
+    input_root = tmp_path / "input"
+    root_row = {
+        "source": "manual",
+        "source_id": "root",
+        "morton_code": _morton_for_node(0, 0),
+        "level": 0,
+        "mag_abs": 1.0,
+    }
+    _write_stage00_pixel(
+        input_root,
+        "200",
+        [
+            root_row,
+            {
+                "source": "gaia",
+                "source_id": "child",
+                "morton_code": _morton_for_node(1, 0),
+                "level": 1,
+                "mag_abs": 8.0,
+            },
+        ],
+    )
+    out_dir = tmp_path / "stage00"
+    run_stage00(_stage00_config(input_root, out_dir, max_level=1, bucket_size=1))
+    _write_stage00_pixel(input_root, "200", [root_row])
+
+    report_path = run_stage00(
+        _stage00_config(
+            input_root,
+            out_dir,
+            max_level=1,
+            bucket_size=1,
+            shard_ids=("200",),
+            replace_shards=True,
+        )
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
+    assert report["changed_group_count"] == 0
+    assert report["unchanged_group_count"] == 1
+    assert report["deleted_group_count"] == 1
+    assert state["dirty"]["stage01_groups"] == []
+    assert state["dirty"]["deleted_stage00_groups"] == ["o=0|200|lim"]
+
+
+def test_stage00_replace_rejects_invalid_modes_and_identity_mismatch(
+    tmp_path: Path,
+) -> None:
+    input_root = tmp_path / "input"
+    _write_stage00_pixel(
+        input_root,
+        "100",
+        [
+            {
+                "source": "gaia",
+                "source_id": "a",
+                "morton_code": _morton_for_node(1, 0),
+                "level": 1,
+                "mag_abs": 7.0,
+            }
+        ],
+    )
+    out_dir = tmp_path / "stage00"
+
+    with pytest.raises(ValueError, match="requires one or more --shard"):
+        run_stage00(_stage00_config(input_root, out_dir, replace_shards=True))
+    with pytest.raises(ValueError, match="cannot be used with --force"):
+        run_stage00(
+            _stage00_config(
+                input_root,
+                out_dir,
+                shard_ids=("100",),
+                replace_shards=True,
+                force=True,
+            )
+        )
+    with pytest.raises(FileNotFoundError, match="tree manifest"):
+        run_stage00(
+            _stage00_config(
+                input_root,
+                out_dir,
+                shard_ids=("100",),
+                replace_shards=True,
+            )
+        )
+
+    run_stage00(_stage00_config(input_root, out_dir, max_level=1, bucket_size=100))
+    with pytest.raises(ValueError, match="tree identity"):
+        run_stage00(
+            _stage00_config(
+                input_root,
+                out_dir,
+                max_level=1,
+                bucket_size=99,
+                shard_ids=("100",),
+                replace_shards=True,
+            )
+        )
+
+
 def test_stage00_help_contains_packed_options() -> None:
     runner = CliRunner()
     result = runner.invoke(cli, ["stage-00", "--help"])
@@ -531,5 +827,6 @@ def test_stage00_help_contains_packed_options() -> None:
     assert "--max-open-writers" in result.output
     assert "--compact-after-files" in result.output
     assert "--shard" in result.output
+    assert "--replace-shards" in result.output
     assert "--healpix" in result.output
     assert "adaptive Stage 00 staging buckets" in result.output

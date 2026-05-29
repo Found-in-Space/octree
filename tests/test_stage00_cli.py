@@ -60,6 +60,7 @@ def test_stage00_help_contains_batch_size():
     assert "--max-open-writers" in result.output
     assert "--compact-after-files" in result.output
     assert "--shard" in result.output
+    assert "--replace-shards" in result.output
     assert "--healpix" in result.output
     assert "--force" in result.output
     assert "octree project TOML" in result.output
