@@ -8,6 +8,9 @@ The durable idea is that the expensive spatial indexing work should produce a
 reusable staging tree. Later stages should sort, encode, materialize, and pack
 that staged data without repeatedly duplicating the whole catalogue.
 
+The implementation plan, manifest sketches, and work streams are tracked in
+[`staged-pipeline-plan.md`](staged-pipeline-plan.md).
+
 ## Overview
 
 | Stage | Purpose | Typical Input | Typical Output |

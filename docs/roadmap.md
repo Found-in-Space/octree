@@ -75,6 +75,7 @@ The new architecture creates room for later extensions without changing the clea
 
 ## Related Docs
 
+- `docs/staged-pipeline-plan.md`
 - `docs/stages.md`
 - `docs/identifiers-order.md`
 - `docs/sidecars.md`

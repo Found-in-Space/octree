@@ -117,6 +117,7 @@ src/foundinspace/octree/
 
 Current stage overview and supporting notes:
 
+- [`docs/staged-pipeline-plan.md`](docs/staged-pipeline-plan.md)
 - [`docs/stages.md`](docs/stages.md)
 - [`docs/sidecars.md`](docs/sidecars.md)
 - [`docs/identifiers-order.md`](docs/identifiers-order.md)
