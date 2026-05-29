@@ -74,7 +74,6 @@ def _stage00_config(
     input_root: Path,
     output_dir: Path,
     *,
-    max_level: int = 2,
     bucket_size: int = 100,
     shard_ids: tuple[str, ...] = (),
     replace_shards: bool = False,
@@ -83,8 +82,7 @@ def _stage00_config(
     return Stage00Config(
         input_root=input_root,
         output_dir=output_dir,
-        mag_config=MagLevelConfig(v_mag=6.5, max_level=max_level),
-        max_level=max_level,
+        mag_config=MagLevelConfig(v_mag=6.5),
         bucket_size=bucket_size,
         batch_size=10,
         fragment_target_rows=10,
@@ -112,7 +110,7 @@ def test_stage00_writes_tree_manifest_and_state(tmp_path: Path) -> None:
     )
 
     out_dir = tmp_path / "stage00"
-    report_path = run_stage00(_stage00_config(input_root, out_dir, max_level=1))
+    report_path = run_stage00(_stage00_config(input_root, out_dir))
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     manifest = json.loads((out_dir / "tree-manifest.json").read_text(encoding="utf-8"))
@@ -123,7 +121,6 @@ def test_stage00_writes_tree_manifest_and_state(tmp_path: Path) -> None:
     assert (
         manifest["tree_identity"]
         | {
-            "max_level": 1,
             "v_mag": 6.5,
             "bucket_size": 100,
             "morton_bits": MORTON_BITS,
@@ -197,8 +194,7 @@ def test_stage00_rewrites_packed_files_when_node_becomes_lower_mag_limited(
         Stage00Config(
             input_root=input_root,
             output_dir=out_dir,
-            mag_config=MagLevelConfig(v_mag=6.5, max_level=2),
-            max_level=2,
+            mag_config=MagLevelConfig(v_mag=6.5),
             bucket_size=3,
             batch_size=10,
         )
@@ -263,8 +259,7 @@ def test_stage00_accepts_root_level_parquet_shards(tmp_path: Path) -> None:
         Stage00Config(
             input_root=input_root,
             output_dir=out_dir,
-            mag_config=MagLevelConfig(v_mag=6.5, max_level=1),
-            max_level=1,
+            mag_config=MagLevelConfig(v_mag=6.5),
             bucket_size=100,
             batch_size=10,
         )
@@ -311,7 +306,6 @@ stage03_output_dir = "stage03"
 [stage00]
 batch_size = 10
 v_mag = 6.5
-max_level = 1
 bucket_size = 100
 fragment_target_rows = 100
 max_open_writers = 8
@@ -366,8 +360,7 @@ def test_stage00_group_checksums_do_not_depend_on_fragment_boundaries(
         Stage00Config(
             input_root=input_root,
             output_dir=tmp_path / "compact",
-            mag_config=MagLevelConfig(v_mag=6.5, max_level=2),
-            max_level=2,
+            mag_config=MagLevelConfig(v_mag=6.5),
             bucket_size=100,
             batch_size=10,
             fragment_target_rows=10,
@@ -378,8 +371,7 @@ def test_stage00_group_checksums_do_not_depend_on_fragment_boundaries(
         Stage00Config(
             input_root=input_root,
             output_dir=tmp_path / "split",
-            mag_config=MagLevelConfig(v_mag=6.5, max_level=2),
-            max_level=2,
+            mag_config=MagLevelConfig(v_mag=6.5),
             bucket_size=100,
             batch_size=10,
             fragment_target_rows=2,
@@ -418,8 +410,7 @@ def test_stage00_rewrites_nested_octant_files_without_partition_columns(
         Stage00Config(
             input_root=input_root,
             output_dir=out_dir,
-            mag_config=MagLevelConfig(v_mag=6.5, max_level=3),
-            max_level=3,
+            mag_config=MagLevelConfig(v_mag=6.5),
             bucket_size=2,
             batch_size=10,
         )
@@ -458,8 +449,7 @@ def test_stage00_rolls_fragments_by_target_rows(tmp_path: Path) -> None:
         Stage00Config(
             input_root=input_root,
             output_dir=out_dir,
-            mag_config=MagLevelConfig(v_mag=6.5, max_level=2),
-            max_level=2,
+            mag_config=MagLevelConfig(v_mag=6.5),
             bucket_size=100,
             batch_size=10,
             fragment_target_rows=2,
@@ -499,8 +489,7 @@ def test_stage00_normalizes_schema_for_rolling_writers(tmp_path: Path) -> None:
         Stage00Config(
             input_root=input_root,
             output_dir=out_dir,
-            mag_config=MagLevelConfig(v_mag=6.5, max_level=2),
-            max_level=2,
+            mag_config=MagLevelConfig(v_mag=6.5),
             bucket_size=100,
             batch_size=10,
             fragment_target_rows=10,
@@ -579,8 +568,7 @@ def test_stage00_compacts_repeated_small_fragments_after_lru_churn(
         Stage00Config(
             input_root=input_root,
             output_dir=out_dir,
-            mag_config=MagLevelConfig(v_mag=6.5, max_level=2),
-            max_level=2,
+            mag_config=MagLevelConfig(v_mag=6.5),
             bucket_size=4,
             batch_size=10,
             fragment_target_rows=10,
@@ -631,7 +619,7 @@ def test_stage00_replace_unchanged_shard_marks_no_dirty_groups(
         ],
     )
     out_dir = tmp_path / "stage00"
-    run_stage00(_stage00_config(input_root, out_dir, max_level=1))
+    run_stage00(_stage00_config(input_root, out_dir))
     unrelated_files = sorted(
         path.relative_to(out_dir).as_posix()
         for path in (out_dir / "tree").glob("shard-101-pack-*.parquet")
@@ -641,7 +629,6 @@ def test_stage00_replace_unchanged_shard_marks_no_dirty_groups(
         _stage00_config(
             input_root,
             out_dir,
-            max_level=1,
             shard_ids=("100",),
             replace_shards=True,
         )
@@ -683,7 +670,7 @@ def test_stage00_replace_changed_shard_marks_changed_group(
         ],
     )
     out_dir = tmp_path / "stage00"
-    run_stage00(_stage00_config(input_root, out_dir, max_level=1))
+    run_stage00(_stage00_config(input_root, out_dir))
     _write_stage00_pixel(
         input_root,
         "100",
@@ -702,7 +689,6 @@ def test_stage00_replace_changed_shard_marks_changed_group(
         _stage00_config(
             input_root,
             out_dir,
-            max_level=1,
             shard_ids=("100",),
             replace_shards=True,
         )
@@ -740,14 +726,13 @@ def test_stage00_replace_records_deleted_group(tmp_path: Path) -> None:
         ],
     )
     out_dir = tmp_path / "stage00"
-    run_stage00(_stage00_config(input_root, out_dir, max_level=1, bucket_size=1))
+    run_stage00(_stage00_config(input_root, out_dir, bucket_size=1))
     _write_stage00_pixel(input_root, "200", [root_row])
 
     report_path = run_stage00(
         _stage00_config(
             input_root,
             out_dir,
-            max_level=1,
             bucket_size=1,
             shard_ids=("200",),
             replace_shards=True,
@@ -804,13 +789,12 @@ def test_stage00_replace_rejects_invalid_modes_and_identity_mismatch(
             )
         )
 
-    run_stage00(_stage00_config(input_root, out_dir, max_level=1, bucket_size=100))
+    run_stage00(_stage00_config(input_root, out_dir, bucket_size=100))
     with pytest.raises(ValueError, match="tree identity"):
         run_stage00(
             _stage00_config(
                 input_root,
                 out_dir,
-                max_level=1,
                 bucket_size=99,
                 shard_ids=("100",),
                 replace_shards=True,

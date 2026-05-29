@@ -33,7 +33,6 @@ The top-level manifest should contain build-defining identity such as:
 - coordinate frame and coordinate convention
 - world origin, world bounds, and Morton bit depth
 - magnitude-to-level configuration
-- maximum octree level
 - staging bucket size and split policy
 - input catalogue identity
 - row schema and payload schema versions where relevant

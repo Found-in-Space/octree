@@ -192,8 +192,7 @@ Proposed fields:
   "coordinate_frame": "icrs",
   "world_center": [0.0, 0.0, 0.0],
   "world_half_size_pc": 32768.0,
-  "morton_bits": 14,
-  "max_level": 14,
+  "morton_bits": 21,
   "mag_level": {
     "v_mag": 6.5
   },

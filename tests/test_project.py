@@ -30,7 +30,6 @@ stage03_output_dir = "artifacts/stage03"
 [stage00]
 batch_size = 1000000
 v_mag = 6.5
-max_level = 14
 bucket_size = 1000000
 fragment_target_rows = 100000
 max_open_writers = 128

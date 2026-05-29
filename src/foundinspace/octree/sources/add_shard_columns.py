@@ -23,8 +23,6 @@ import pyarrow.parquet as pq
 
 from foundinspace.octree.config import (
     DEFAULT_MAG_VIS,
-    DEFAULT_MAX_LEVEL,
-    LEVEL_CONFIG,
     MORTON_BITS,
     WORLD_CENTER,
     WORLD_HALF_SIZE_PC,
@@ -134,18 +132,13 @@ def _resolve_mag_config(
     mag_config: MagLevelConfig | None,
     *,
     v_mag: float | None,
-    max_level: int | None,
 ) -> MagLevelConfig:
     if mag_config is not None:
         return mag_config
     vm = DEFAULT_MAG_VIS if v_mag is None else v_mag
-    ml = DEFAULT_MAX_LEVEL if max_level is None else max_level
-    if vm == DEFAULT_MAG_VIS and ml == DEFAULT_MAX_LEVEL:
-        return LEVEL_CONFIG
     return MagLevelConfig(
         v_mag=vm,
         world_half_size=WORLD_HALF_SIZE_PC,
-        max_level=ml,
     )
 
 
@@ -255,7 +248,6 @@ def run_enrich_healpix(
     force: bool = False,
     batch_size: int = 1_000_000,
     v_mag: float | None = None,
-    max_level: int | None = None,
     verbose: bool = True,
 ) -> tuple[int, int]:
     """
@@ -272,7 +264,6 @@ def run_enrich_healpix(
     mag_config = _resolve_mag_config(
         mag_config,
         v_mag=v_mag,
-        max_level=max_level,
     )
     center = WORLD_CENTER.copy()
     half_size = WORLD_HALF_SIZE_PC

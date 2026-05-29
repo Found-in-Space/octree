@@ -154,7 +154,6 @@ def stage_00(
     project = _load_project_or_die(project_path)
     mag_config = MagLevelConfig(
         v_mag=project.stage00.v_mag,
-        max_level=project.stage00.max_level,
     )
     resolved_input = (
         input_root if input_root is not None else project.paths.merged_healpix_dir
@@ -166,7 +165,6 @@ def stage_00(
         input_root=resolved_input,
         output_dir=resolved_output,
         mag_config=mag_config,
-        max_level=project.stage00.max_level,
         bucket_size=(
             bucket_size if bucket_size is not None else project.stage00.bucket_size
         ),
@@ -242,11 +240,7 @@ def stage_01(
     config = Stage01Config(
         stage00_output_dir=project.paths.stage00_output_dir,
         output_dir=project.paths.stage01_output_dir,
-        mag_config=MagLevelConfig(
-            v_mag=project.stage00.v_mag,
-            max_level=project.stage00.max_level,
-        ),
-        max_level=project.stage00.max_level,
+        v_mag=project.stage00.v_mag,
         bucket_size=project.stage00.bucket_size,
         batch_size=project.stage01.batch_size,
         fragment_target_rows=project.stage00.fragment_target_rows,

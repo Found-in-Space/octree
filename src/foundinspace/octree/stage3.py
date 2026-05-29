@@ -87,7 +87,7 @@ def _build_family_intermediates(
     out_dir: Path,
 ) -> Path:
     plan = BuildPlan(
-        max_level=project.stage00.max_level,
+        max_level=render_header.max_level,
         deep_shard_from_level=project.stage01.deep_shard_from_level,
         deep_prefix_bits=project.stage01.deep_prefix_bits,
         batch_size=project.stage01.batch_size,
@@ -147,7 +147,7 @@ def _build_family_intermediates(
 
     return write_manifest(
         out_dir,
-        project.stage00.max_level,
+        render_header.max_level,
         shard_entries,
         artifact_kind=SIDECAR_ARTIFACT_KIND,
         index_magic=SIDECAR_INDEX_MAGIC,

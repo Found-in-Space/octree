@@ -151,7 +151,6 @@ def _make_project(tmp_path: Path) -> OctreeProject:
         stage00=Stage00ProjectConfig(
             batch_size=1000,
             v_mag=6.5,
-            max_level=0,
             bucket_size=1_000_000,
             fragment_target_rows=100_000,
             max_open_writers=128,

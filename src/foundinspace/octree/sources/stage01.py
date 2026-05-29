@@ -14,7 +14,6 @@ import pyarrow.ipc as pa_ipc
 import pyarrow.parquet as pq
 
 from foundinspace.octree.config import MORTON_BITS
-from foundinspace.octree.mag_levels import MagLevelConfig
 
 from .stage00 import (
     STAGE_STATE_FORMAT,
@@ -25,7 +24,7 @@ from .stage00 import (
     _atomic_write_json,
     _read_json,
     _safe_input_shard_id,
-    _tree_identity,
+    _tree_identity_values,
 )
 
 STAGE01_FORMAT = "foundinspace.octree.stage01/v0"
@@ -39,8 +38,7 @@ REPORT_NAME = "stage01-report.json"
 class Stage01Config:
     stage00_output_dir: Path
     output_dir: Path
-    mag_config: MagLevelConfig
-    max_level: int
+    v_mag: float
     bucket_size: int
     batch_size: int = 100_000
     fragment_target_rows: int = 100_000
@@ -49,12 +47,6 @@ class Stage01Config:
     def validate(self) -> None:
         if not self.stage00_output_dir.is_dir():
             raise NotADirectoryError(f"Not a directory: {self.stage00_output_dir}")
-        if self.max_level < 0:
-            raise ValueError("max_level must be >= 0")
-        if self.max_level > MORTON_BITS:
-            raise ValueError(
-                f"max_level ({self.max_level}) must be <= MORTON_BITS ({MORTON_BITS})"
-            )
         if self.bucket_size <= 0:
             raise ValueError("bucket_size must be > 0")
         if self.batch_size <= 0:
@@ -202,12 +194,9 @@ def _validate_stage00_identity(
         )
     if state.get("format") != STAGE_STATE_FORMAT:
         raise ValueError(f"Unsupported Stage 00 state format: {state.get('format')!r}")
-    expected = _tree_identity(
-        _Stage00IdentityConfig(
-            mag_config=config.mag_config,
-            max_level=config.max_level,
-            bucket_size=config.bucket_size,
-        )
+    expected = _tree_identity_values(
+        v_mag=config.v_mag,
+        bucket_size=config.bucket_size,
     )
     existing = manifest.get("tree_identity")
     if existing != expected:
@@ -216,13 +205,6 @@ def _validate_stage00_identity(
         )
     if state.get("tree_identity") != existing:
         raise ValueError("Stage 00 state identity does not match tree manifest")
-
-
-@dataclass(frozen=True, slots=True)
-class _Stage00IdentityConfig:
-    mag_config: MagLevelConfig
-    max_level: int
-    bucket_size: int
 
 
 def _sorted_stage00_group(stage00_output_dir: Path, group: dict[str, Any]) -> pa.Table:

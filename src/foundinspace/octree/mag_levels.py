@@ -12,6 +12,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from foundinspace.octree.config import MORTON_BITS
+
 
 @dataclass(slots=True)
 class Level:
@@ -25,10 +27,6 @@ class Level:
     def steps_at_level(self) -> int:
         """Return the number of steps per axis at this level."""
         return 2**self.id
-
-
-# Practical faint limit when max_level is None: stop when M(L) exceeds this
-_FAINT_MAG_LIMIT = 25.0
 
 
 def _half_size_at_level(world_half_size: float, level: int) -> float:
@@ -53,11 +51,11 @@ class MagLevelConfig:
         self,
         v_mag: float = 6.5,
         world_half_size: float = 200_000.0,
-        max_level: int | None = None,
+        morton_bits: int = MORTON_BITS,
     ) -> None:
         self.v_mag = v_mag
         self.world_half_size = world_half_size
-        self.max_level = max_level
+        self.morton_bits = morton_bits
         self._levels_cache: list[Level] | None = None
 
     def _build_levels(self) -> list[Level]:
@@ -68,10 +66,7 @@ class MagLevelConfig:
         m_prev = -math.inf
         while True:
             m_curr = _mag_threshold_at_level(self.v_mag, self.world_half_size, level_id)
-            if self.max_level is not None and self.max_level == level_id:
-                levels.append(Level(id=level_id, m_min=m_prev, m_max=math.inf))
-                break
-            if self.max_level is None and m_curr > _FAINT_MAG_LIMIT:
+            if self.morton_bits == level_id:
                 levels.append(Level(id=level_id, m_min=m_prev, m_max=math.inf))
                 break
             levels.append(Level(id=level_id, m_min=m_prev, m_max=m_curr))

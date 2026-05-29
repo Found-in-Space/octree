@@ -35,7 +35,6 @@ stage03_output_dir = "{(project_path.parent / "stage03").as_posix()}"
 [stage00]
 batch_size = 1000000
 v_mag = 6.5
-max_level = 14
 
 [stage01]
 input_glob = "{(project_path.parent / "stage00" / "**" / "*.parquet").as_posix()}"

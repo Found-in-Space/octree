@@ -55,7 +55,6 @@ def _stage00_config(
     input_root: Path,
     output_dir: Path,
     *,
-    max_level: int = 2,
     bucket_size: int = 100,
     fragment_target_rows: int = 10,
     shard_ids: tuple[str, ...] = (),
@@ -64,8 +63,7 @@ def _stage00_config(
     return Stage00Config(
         input_root=input_root,
         output_dir=output_dir,
-        mag_config=MagLevelConfig(v_mag=6.5, max_level=max_level),
-        max_level=max_level,
+        mag_config=MagLevelConfig(v_mag=6.5),
         bucket_size=bucket_size,
         batch_size=10,
         fragment_target_rows=fragment_target_rows,
@@ -79,7 +77,6 @@ def _stage01_config(
     stage00_output_dir: Path,
     output_dir: Path,
     *,
-    max_level: int = 2,
     bucket_size: int = 100,
     fragment_target_rows: int = 10,
     force: bool = False,
@@ -87,8 +84,7 @@ def _stage01_config(
     return Stage01Config(
         stage00_output_dir=stage00_output_dir,
         output_dir=output_dir,
-        mag_config=MagLevelConfig(v_mag=6.5, max_level=max_level),
-        max_level=max_level,
+        v_mag=6.5,
         bucket_size=bucket_size,
         batch_size=10,
         fragment_target_rows=fragment_target_rows,
@@ -141,10 +137,10 @@ def test_stage01_first_run_writes_sorted_groups_and_state(tmp_path: Path) -> Non
     )
     stage00_dir = tmp_path / "stage00"
     stage01_dir = tmp_path / "stage01"
-    run_stage00(_stage00_config(input_root, stage00_dir, max_level=1))
+    run_stage00(_stage00_config(input_root, stage00_dir))
 
     report_path = run_stage01(
-        _stage01_config(stage00_dir, stage01_dir, max_level=1, fragment_target_rows=2)
+        _stage01_config(stage00_dir, stage01_dir, fragment_target_rows=2)
     )
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
@@ -199,8 +195,8 @@ def test_stage01_dirty_only_changed_group_marks_stage03_nodes(
     )
     stage00_dir = tmp_path / "stage00"
     stage01_dir = tmp_path / "stage01"
-    run_stage00(_stage00_config(input_root, stage00_dir, max_level=1))
-    run_stage01(_stage01_config(stage00_dir, stage01_dir, max_level=1))
+    run_stage00(_stage00_config(input_root, stage00_dir))
+    run_stage01(_stage01_config(stage00_dir, stage01_dir))
     _clear_stage03_dirty(stage00_dir)
     unchanged_file = next(
         (stage01_dir / "tree").glob("shard-101-pack-sorted-*.parquet")
@@ -224,13 +220,12 @@ def test_stage01_dirty_only_changed_group_marks_stage03_nodes(
         _stage00_config(
             input_root,
             stage00_dir,
-            max_level=1,
             shard_ids=("100",),
             replace_shards=True,
         )
     )
 
-    report_path = run_stage01(_stage01_config(stage00_dir, stage01_dir, max_level=1))
+    report_path = run_stage01(_stage01_config(stage00_dir, stage01_dir))
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     state = json.loads((stage00_dir / "stage-state.json").read_text(encoding="utf-8"))
@@ -255,8 +250,8 @@ def test_stage01_unchanged_replacement_processes_no_groups(tmp_path: Path) -> No
     _write_stage00_pixel(input_root, "100", rows)
     stage00_dir = tmp_path / "stage00"
     stage01_dir = tmp_path / "stage01"
-    run_stage00(_stage00_config(input_root, stage00_dir, max_level=1))
-    run_stage01(_stage01_config(stage00_dir, stage01_dir, max_level=1))
+    run_stage00(_stage00_config(input_root, stage00_dir))
+    run_stage01(_stage01_config(stage00_dir, stage01_dir))
     _clear_stage03_dirty(stage00_dir)
 
     _write_stage00_pixel(input_root, "100", rows)
@@ -264,12 +259,11 @@ def test_stage01_unchanged_replacement_processes_no_groups(tmp_path: Path) -> No
         _stage00_config(
             input_root,
             stage00_dir,
-            max_level=1,
             shard_ids=("100",),
             replace_shards=True,
         )
     )
-    report_path = run_stage01(_stage01_config(stage00_dir, stage01_dir, max_level=1))
+    report_path = run_stage01(_stage01_config(stage00_dir, stage01_dir))
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     state = json.loads((stage00_dir / "stage-state.json").read_text(encoding="utf-8"))
@@ -305,8 +299,8 @@ def test_stage01_deleted_group_removes_sorted_files_and_dirties_old_nodes(
     )
     stage00_dir = tmp_path / "stage00"
     stage01_dir = tmp_path / "stage01"
-    run_stage00(_stage00_config(input_root, stage00_dir, max_level=1, bucket_size=1))
-    run_stage01(_stage01_config(stage00_dir, stage01_dir, max_level=1, bucket_size=1))
+    run_stage00(_stage00_config(input_root, stage00_dir, bucket_size=1))
+    run_stage01(_stage01_config(stage00_dir, stage01_dir, bucket_size=1))
     _clear_stage03_dirty(stage00_dir)
     deleted_files = sorted((stage01_dir / "tree" / "o=0").glob("*.parquet"))
     assert deleted_files
@@ -315,16 +309,13 @@ def test_stage01_deleted_group_removes_sorted_files_and_dirties_old_nodes(
         _stage00_config(
             input_root,
             stage00_dir,
-            max_level=1,
             bucket_size=1,
             shard_ids=("200",),
             replace_shards=True,
         )
     )
 
-    report_path = run_stage01(
-        _stage01_config(stage00_dir, stage01_dir, max_level=1, bucket_size=1)
-    )
+    report_path = run_stage01(_stage01_config(stage00_dir, stage01_dir, bucket_size=1))
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     state = json.loads((stage00_dir / "stage-state.json").read_text(encoding="utf-8"))
@@ -357,13 +348,12 @@ def test_stage01_rejects_missing_manifest_and_identity_mismatch(
             }
         ],
     )
-    run_stage00(_stage00_config(input_root, stage00_dir, max_level=1))
+    run_stage00(_stage00_config(input_root, stage00_dir))
     with pytest.raises(ValueError, match="tree identity"):
         run_stage01(
             _stage01_config(
                 stage00_dir,
                 stage01_dir,
-                max_level=1,
                 bucket_size=99,
             )
         )
@@ -386,13 +376,11 @@ def test_stage01_force_rebuilds_all_groups(tmp_path: Path) -> None:
     )
     stage00_dir = tmp_path / "stage00"
     stage01_dir = tmp_path / "stage01"
-    run_stage00(_stage00_config(input_root, stage00_dir, max_level=1))
-    run_stage01(_stage01_config(stage00_dir, stage01_dir, max_level=1))
+    run_stage00(_stage00_config(input_root, stage00_dir))
+    run_stage01(_stage01_config(stage00_dir, stage01_dir))
     _clear_stage03_dirty(stage00_dir)
 
-    report_path = run_stage01(
-        _stage01_config(stage00_dir, stage01_dir, max_level=1, force=True)
-    )
+    report_path = run_stage01(_stage01_config(stage00_dir, stage01_dir, force=True))
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["processed_group_count"] == 1

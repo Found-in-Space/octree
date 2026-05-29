@@ -61,7 +61,6 @@ class Stage00Config:
     input_root: Path
     output_dir: Path
     mag_config: MagLevelConfig
-    max_level: int
     bucket_size: int = 1_000_000
     batch_size: int = 1_000_000
     fragment_target_rows: int = 100_000
@@ -85,12 +84,6 @@ class Stage00Config:
             raise ValueError("max_open_writers must be > 0")
         if self.compact_after_files < 0:
             raise ValueError("compact_after_files must be >= 0")
-        if self.max_level < 0:
-            raise ValueError("max_level must be >= 0")
-        if self.max_level > MORTON_BITS:
-            raise ValueError(
-                f"max_level ({self.max_level}) must be <= MORTON_BITS ({MORTON_BITS})"
-            )
         if self.max_pixels is not None and self.max_pixels <= 0:
             raise ValueError("max_pixels must be > 0")
         if self.replace_shards:
@@ -229,7 +222,6 @@ class _Stage00Builder:
             "fragment_target_rows": self._config.fragment_target_rows,
             "max_open_writers": self._config.max_open_writers,
             "compact_after_files": self._config.compact_after_files,
-            "max_level": self._config.max_level,
             "tree_manifest": TREE_MANIFEST_NAME,
             "stage_state": STAGE_STATE_NAME,
             "group_checksum_algorithm": STAGE00_GROUP_CHECKSUM_ALGORITHM,
@@ -406,9 +398,9 @@ class _Stage00Builder:
         descendant_indices = np.flatnonzero(levels > node.depth)
         if len(descendant_indices) == 0:
             return
-        if node.depth >= self._config.max_level:
+        if node.depth >= MORTON_BITS:
             raise ValueError(
-                f"Rows below max staging depth {node.depth} cannot be routed lower"
+                f"Rows below Morton depth {node.depth} cannot be routed lower"
             )
 
         descendants = _take_rows(table, descendant_indices)
@@ -842,14 +834,20 @@ def _tree_manifest(config: Stage00Config) -> dict[str, Any]:
 
 
 def _tree_identity(config: Stage00Config) -> dict[str, Any]:
+    return _tree_identity_values(
+        v_mag=float(config.mag_config.v_mag),
+        bucket_size=config.bucket_size,
+    )
+
+
+def _tree_identity_values(*, v_mag: float, bucket_size: int) -> dict[str, Any]:
     return {
         "coordinate_frame": "icrs-cartesian-pc",
         "world_center": [float(v) for v in WORLD_CENTER.tolist()],
         "world_half_size_pc": float(WORLD_HALF_SIZE_PC),
         "morton_bits": MORTON_BITS,
-        "max_level": config.max_level,
-        "v_mag": float(config.mag_config.v_mag),
-        "bucket_size": config.bucket_size,
+        "v_mag": float(v_mag),
+        "bucket_size": bucket_size,
         "split_policy": STAGE00_SPLIT_POLICY,
         "row_schema_version": STAGE00_ROW_SCHEMA_VERSION,
     }

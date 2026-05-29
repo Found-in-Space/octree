@@ -6,7 +6,7 @@ from typing import Any
 
 import tomllib
 
-from .config import DEFAULT_DEEP_SHARD_FROM_LEVEL, DEFAULT_MAG_VIS, DEFAULT_MAX_LEVEL
+from .config import DEFAULT_DEEP_SHARD_FROM_LEVEL, DEFAULT_MAG_VIS
 
 FORMAT_VERSION = 1
 _DEFAULT_MERGED_HEALPIX_DIR = "../data/processed/merged/healpix"
@@ -33,7 +33,6 @@ _PATH_KEYS = {
 _STAGE00_KEYS = {
     "batch_size",
     "v_mag",
-    "max_level",
     "bucket_size",
     "fragment_target_rows",
     "max_open_writers",
@@ -65,7 +64,6 @@ class ProjectPaths:
 class Stage00ProjectConfig:
     batch_size: int
     v_mag: float
-    max_level: int
     bucket_size: int
     fragment_target_rows: int
     max_open_writers: int
@@ -237,7 +235,6 @@ def load_project(project_path: Path) -> OctreeProject:
     stage00 = Stage00ProjectConfig(
         batch_size=_require_int(stage00_raw, "batch_size"),
         v_mag=_require_float(stage00_raw, "v_mag"),
-        max_level=_require_int(stage00_raw, "max_level"),
         bucket_size=_optional_int(
             stage00_raw,
             "bucket_size",
@@ -261,8 +258,6 @@ def load_project(project_path: Path) -> OctreeProject:
     )
     if stage00.batch_size <= 0:
         raise ValueError("stage00.batch_size must be > 0")
-    if stage00.max_level < 0:
-        raise ValueError("stage00.max_level must be >= 0")
     if stage00.bucket_size <= 0:
         raise ValueError("stage00.bucket_size must be > 0")
     if stage00.fragment_target_rows <= 0:
@@ -357,7 +352,6 @@ def render_project_template() -> str:
         "[stage00]\n"
         "batch_size = 1000000\n"
         f"v_mag = {DEFAULT_MAG_VIS}\n"
-        f"max_level = {DEFAULT_MAX_LEVEL}\n"
         f"bucket_size = {_DEFAULT_STAGE00_BUCKET_SIZE}\n"
         f"fragment_target_rows = {_DEFAULT_STAGE00_FRAGMENT_TARGET_ROWS}\n"
         f"max_open_writers = {_DEFAULT_STAGE00_MAX_OPEN_WRITERS}\n"
