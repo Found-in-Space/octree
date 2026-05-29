@@ -135,12 +135,12 @@ def test_stage00_rewrites_packed_files_when_node_becomes_lower_mag_limited(
 
     tree = out_dir / "tree"
     assert (tree / "_LOWER_MAG_LIMITED").exists()
-    assert not list(tree.glob("hp*-pack-*.parquet"))
-    assert len(list(tree.glob("hp124-lim-*.parquet"))) == 1
-    assert len(list((tree / "o=0").glob("hp123-pack-*.parquet"))) == 1
-    assert len(list((tree / "o=1").glob("hp124-pack-*.parquet"))) == 1
+    assert not list(tree.glob("shard-*-pack-*.parquet"))
+    assert len(list(tree.glob("shard-124-lim-*.parquet"))) == 1
+    assert len(list((tree / "o=0").glob("shard-123-pack-*.parquet"))) == 1
+    assert len(list((tree / "o=1").glob("shard-124-pack-*.parquet"))) == 1
 
-    child_table = pq.read_table(next((tree / "o=0").glob("hp123-pack-*.parquet")))
+    child_table = pq.read_table(next((tree / "o=0").glob("shard-123-pack-*.parquet")))
     assert "healpix_id" not in child_table.schema.names
     assert report["group_checksum_algorithm"] == "arrow-ipc-sha256/v0"
     assert {
@@ -193,11 +193,79 @@ def test_stage00_accepts_root_level_parquet_shards(tmp_path: Path) -> None:
     )
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["processed_healpix"] == ["batch-001"]
+    assert report["processed_input_shards"] == ["batch-001"]
     assert report["input_files"] == 1
     assert report["rows_current"] == 2
-    assert len(list((out_dir / "tree").glob("hpbatch-001-pack-*.parquet"))) == 1
+    assert len(list((out_dir / "tree").glob("shard-batch-001-pack-*.parquet"))) == 1
     assert _group_checksums(report).keys() == {("", "batch-001", "pack")}
+
+
+def test_stage00_cli_accepts_shard_option(tmp_path: Path) -> None:
+    input_root = tmp_path / "input"
+    _write_stage00_shard_file(
+        input_root,
+        "batch-001",
+        [
+            {
+                "source": "gaia",
+                "source_id": "a",
+                "morton_code": _morton_for_node(1, 0),
+                "level": 1,
+                "mag_abs": 7.0,
+            }
+        ],
+    )
+    project_path = tmp_path / "project.toml"
+    out_dir = tmp_path / "stage00"
+    project_path.write_text(
+        f"""
+format_version = 1
+
+[paths]
+merged_healpix_dir = "{input_root.as_posix()}"
+identifiers_map_path = "identifiers.parquet"
+stage00_output_dir = "{out_dir.as_posix()}"
+stage01_output_dir = "stage01"
+stage02_output_path = "stars.octree"
+identifiers_order_output_path = "identifiers.order"
+stage03_output_dir = "stage03"
+
+[stage00]
+batch_size = 10
+v_mag = 6.5
+max_level = 1
+bucket_size = 100
+fragment_target_rows = 100
+max_open_writers = 8
+compact_after_files = 0
+
+[stage01]
+input_glob = "stage00/**/*.parquet"
+batch_size = 100
+deep_shard_from_level = 99
+deep_prefix_bits = 3
+
+[stage02]
+max_open_files = 32
+
+[stage03]
+
+[[stage03.sidecars]]
+name = "meta"
+fields = []
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        ["stage-00", "--project", str(project_path), "--shard", "batch-001"],
+    )
+
+    assert result.exit_code == 0
+    assert "input_shards=1" in result.output
+    report = json.loads((out_dir / "stage00-report.json").read_text(encoding="utf-8"))
+    assert report["processed_input_shards"] == ["batch-001"]
 
 
 def test_stage00_group_checksums_do_not_depend_on_fragment_boundaries(
@@ -285,7 +353,9 @@ def test_stage00_rewrites_nested_octant_files_without_partition_columns(
     assert report["lower_mag_limited_nodes"] == 4
     assert (tree / "o=0" / "_LOWER_MAG_LIMITED").exists()
     assert (tree / "o=0" / "o=0" / "o=0" / "_LOWER_MAG_LIMITED").exists()
-    assert len(list((tree / "o=0" / "o=0" / "o=0").glob("hp448-lim-*.parquet"))) == 1
+    assert (
+        len(list((tree / "o=0" / "o=0" / "o=0").glob("shard-448-lim-*.parquet"))) == 1
+    )
 
 
 def test_stage00_rolls_fragments_by_target_rows(tmp_path: Path) -> None:
@@ -320,7 +390,7 @@ def test_stage00_rolls_fragments_by_target_rows(tmp_path: Path) -> None:
     )
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    files = sorted((out_dir / "tree").glob("hp200-pack-*.parquet"))
+    files = sorted((out_dir / "tree").glob("shard-200-pack-*.parquet"))
     assert report["current_fragment_files"] == 3
     assert [pq.ParquetFile(path).metadata.num_rows for path in files] == [2, 2, 1]
 
@@ -361,7 +431,7 @@ def test_stage00_normalizes_schema_for_rolling_writers(tmp_path: Path) -> None:
     )
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    files = sorted((out_dir / "tree").glob("hp202-pack-*.parquet"))
+    files = sorted((out_dir / "tree").glob("shard-202-pack-*.parquet"))
     table = pq.read_table(files[0])
     assert report["current_fragment_files"] == 1
     assert table.schema.field("quality_flags").type == pa.int64()
@@ -448,8 +518,8 @@ def test_stage00_compacts_repeated_small_fragments_after_lru_churn(
     assert report["compaction_input_files"] == 6
     assert report["compaction_output_files"] == 2
     assert report["current_fragment_files"] == 4
-    assert len(list((tree / "o=0").glob("hp201-pack-*.parquet"))) == 1
-    assert len(list((tree / "o=1").glob("hp201-pack-*.parquet"))) == 1
+    assert len(list((tree / "o=0").glob("shard-201-pack-*.parquet"))) == 1
+    assert len(list((tree / "o=1").glob("shard-201-pack-*.parquet"))) == 1
 
 
 def test_stage00_help_contains_packed_options() -> None:
@@ -460,5 +530,6 @@ def test_stage00_help_contains_packed_options() -> None:
     assert "--fragment-target-rows" in result.output
     assert "--max-open-writers" in result.output
     assert "--compact-after-files" in result.output
+    assert "--shard" in result.output
     assert "--healpix" in result.output
     assert "adaptive Stage 00 staging buckets" in result.output

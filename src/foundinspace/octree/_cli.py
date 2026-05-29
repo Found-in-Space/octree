@@ -67,7 +67,7 @@ def _load_project_or_die(project_path: Path):
     "--input-root",
     type=click.Path(path_type=Path),
     default=None,
-    help="Input HEALPix root. Defaults to paths.merged_healpix_dir.",
+    help="Input shard root. Defaults to paths.merged_healpix_dir.",
 )
 @click.option(
     "--output-dir",
@@ -76,19 +76,20 @@ def _load_project_or_die(project_path: Path):
     help="Stage 00 packed staging output directory. Defaults to paths.stage00_output_dir.",
 )
 @click.option(
+    "--shard",
     "--healpix",
-    "healpix_ids",
+    "shard_ids",
     multiple=True,
     help=(
-        "HEALPix pixel directory or root-level parquet shard to process. "
-        "May be passed multiple times."
+        "Input shard directory or root-level parquet shard to process. "
+        "May be passed multiple times. --healpix is a compatibility alias."
     ),
 )
 @click.option(
     "--max-pixels",
     type=int,
     default=None,
-    help="Process at most this many HEALPix directories.",
+    help="Process at most this many input shard directories or files.",
 )
 @click.option(
     "--bucket-size",
@@ -121,7 +122,7 @@ def _load_project_or_die(project_path: Path):
     "--compact-after-files",
     type=int,
     default=None,
-    help="Compact a node/healpix/kind group after this many files. Defaults to stage00.compact_after_files.",
+    help="Compact a node/input-shard/kind group after this many files. Defaults to stage00.compact_after_files.",
 )
 @click.option(
     "--force",
@@ -132,7 +133,7 @@ def stage_00(
     project_path: Path,
     input_root: Path | None,
     output_dir: Path | None,
-    healpix_ids: tuple[str, ...],
+    shard_ids: tuple[str, ...],
     max_pixels: int | None,
     bucket_size: int | None,
     batch_size: int | None,
@@ -141,7 +142,7 @@ def stage_00(
     compact_after_files: int | None,
     force: bool,
 ) -> None:
-    """Pack HEALPix rows into adaptive Stage 00 staging buckets."""
+    """Pack input shards into adaptive Stage 00 staging buckets."""
     from foundinspace.octree.sources.stage00 import Stage00Config, run_stage00
 
     project = _load_project_or_die(project_path)
@@ -179,7 +180,7 @@ def stage_00(
             if compact_after_files is not None
             else project.stage00.compact_after_files
         ),
-        healpix_ids=tuple(healpix_ids),
+        shard_ids=tuple(shard_ids),
         max_pixels=max_pixels,
         force=force,
     )
@@ -195,7 +196,7 @@ def stage_00(
     report = json.loads(report_path.read_text(encoding="utf-8"))
     click.echo(
         "Stage 00 summary: "
-        f"healpix={len(report['processed_healpix'])}, "
+        f"input_shards={len(report['processed_input_shards'])}, "
         f"rows={report['rows_in']:,}, "
         f"nodes={report['staging_nodes']:,}, "
         f"lower_mag_limited={report['lower_mag_limited_nodes']:,}, "

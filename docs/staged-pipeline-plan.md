@@ -13,8 +13,9 @@ semantic content did not change.
 Implemented on the current work branch:
 
 - Stage 00 can build an adaptive octree-shaped staging tree.
-- Stage 00 accepts both directory-based HEALPix inputs and root-level parquet
-  shard files.
+- Stage 00 accepts both directory-based input shards and root-level parquet
+  shard files. A shard may be a HEALPix pixel, a batch shard, or any other
+  stable upstream rebuild unit.
 - Stage 00 preserves the input shard id in output fragment names.
 - Stage 00 reports group-level content checksums for current staged fragments.
 - Stage 00 has been smoke-tested against a 31M-row real parquet shard.
@@ -85,8 +86,14 @@ An input shard must be replaceable without deleting unrelated shard data:
 5. Mark only changed groups dirty.
 
 This is true for HEALPix pixel files and also for older batch-sharded parquet
-files. The pipeline should use the generic term `input_shard_id` internally,
-even when CLI options still say `--healpix`.
+files. The upstream catalogue pipeline owns this granularity: if it wants
+HEALPix-level rebuilds it should emit stable HEALPix shards; if it emits batch
+files, the octree pipeline will rebuild and checksum at batch-shard granularity.
+
+Stage 00 derives `input_shard_id` from the input directory name or root-level
+parquet filename stem. It does not derive the rebuild boundary from row-level
+HEALPix columns, and it drops those partition columns before writing staged row
+fragments.
 
 ### Canonical Ordering
 
@@ -214,7 +221,7 @@ Sketch:
       "input_shard_id": "hp-449",
       "kind": "pack",
       "files": [
-        "tree/o=1/o=6/hphp-449-pack-000001.parquet"
+        "tree/o=1/o=6/shard-hp-449-pack-000001.parquet"
       ],
       "row_count": 100000,
       "content_checksum": "sha256:...",
@@ -224,7 +231,7 @@ Sketch:
   "stage01_groups": {
     "o=1/o=6|hp-449|pack": {
       "files": [
-        "tree/o=1/o=6/hphp-449-sorted-000001.parquet"
+        "tree/o=1/o=6/shard-hp-449-sorted-000001.parquet"
       ],
       "row_count": 100000,
       "sorted_checksum": "sha256:...",
@@ -269,9 +276,8 @@ Next implementation tasks:
 
 - write tree identity manifest
 - write stage-state manifest
-- compute Stage 00 group content checksums
 - add shard replacement mode
-- rename internal `healpix` concepts to `input_shard` where practical
+- persist Stage 00 group content checksums into stage-state
 
 ### Stage 01
 
@@ -539,14 +545,15 @@ Operational checks:
   materialized shard.
 - Whether Stage 04 partial patching is worth the complexity for the first new
   format release.
-- Whether `--healpix` should be renamed to `--shard` with `--healpix` retained
-  as an alias.
+- Whether the compatibility `--healpix` alias should remain long term once
+  `--shard` is the documented option.
 
 ## Glossary
 
 Input shard:
 : One upstream parquet unit that can be replaced independently. Usually a
-  HEALPix pixel, but older pipeline outputs may be batch-sharded.
+  HEALPix pixel, but older pipeline outputs may be batch-sharded. Stage 00 keys
+  checksums and replacement by this shard id, not by row-level HEALPix columns.
 
 Staging node:
 : A node in the adaptive Stage 00 filesystem tree. It may hold rows for final

@@ -8,7 +8,7 @@ numbering is being revised around the packed staging tree described in
 
 The current pipeline is:
 
-- Stage 00: `(node, healpix)` staging partition
+- Stage 00: `(node, input_shard_id, kind)` staging partition
 - Stage 01: in-place staging sort and compaction
 - Stage 02: optional payload re-encoding
 - Stage 03: canonical payload-order materialization

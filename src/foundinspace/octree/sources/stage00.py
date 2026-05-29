@@ -24,7 +24,10 @@ STAGE00_GROUP_CHECKSUM_ALGORITHM = "arrow-ipc-sha256/v0"
 TREE_DIR_NAME = "tree"
 REPORT_NAME = "stage00-report.json"
 LOWER_MAG_LIMITED_MARKER = "_LOWER_MAG_LIMITED"
-_FRAGMENT_RE = re.compile(r"^hp(?P<hp>.+?)-(?P<kind>pack|lim)-(?P<seq>\d+)\.parquet$")
+_FRAGMENT_RE = re.compile(
+    r"^(?:shard-(?P<shard>.+?)|hp(?P<legacy_shard>.+?))"
+    r"-(?P<kind>pack|lim)-(?P<seq>\d+)\.parquet$"
+)
 _HEALPIX_COLUMN_CANDIDATES = ("healpix", "healpix_id", "hp")
 _COLUMN_TYPES = {
     "source": pa.large_string(),
@@ -57,7 +60,7 @@ class Stage00Config:
     fragment_target_rows: int = 100_000
     max_open_writers: int = 128
     compact_after_files: int = 64
-    healpix_ids: tuple[str, ...] = ()
+    shard_ids: tuple[str, ...] = ()
     max_pixels: int | None = None
     force: bool = False
 
@@ -103,7 +106,7 @@ class _BucketNode:
 @dataclass(frozen=True, slots=True)
 class _WriterKey:
     path_octants: tuple[int, ...]
-    healpix_id: str
+    input_shard_id: str
     kind: str
 
 
@@ -145,20 +148,24 @@ class _Stage00Builder:
     def rows_in(self) -> int:
         return self._rows_in
 
-    def process_table(self, table: pa.Table, *, healpix_id: str) -> None:
+    def process_table(self, table: pa.Table, *, input_shard_id: str) -> None:
         if len(table) == 0:
             return
         self._batches += 1
         self._rows_in += len(table)
         enriched = _ensure_stage00_columns(table, self._config.mag_config)
-        self._route_table(self._node_for_path(()), enriched, healpix_id=healpix_id)
+        self._route_table(
+            self._node_for_path(()),
+            enriched,
+            input_shard_id=input_shard_id,
+        )
 
     def finish(self) -> None:
         self._close_all_writers()
         self._compact_current_files()
 
     def report(
-        self, *, processed_healpix: list[str], input_files: int
+        self, *, processed_input_shards: list[str], input_files: int
     ) -> dict[str, Any]:
         by_depth: dict[int, dict[str, Any]] = {}
         for node in self._nodes.values():
@@ -200,7 +207,7 @@ class _Stage00Builder:
             "compact_after_files": self._config.compact_after_files,
             "max_level": self._config.max_level,
             "group_checksum_algorithm": STAGE00_GROUP_CHECKSUM_ALGORITHM,
-            "processed_healpix": processed_healpix,
+            "processed_input_shards": processed_input_shards,
             "input_files": input_files,
             "input_batches": self._batches,
             "rows_in": self._rows_in,
@@ -228,22 +235,22 @@ class _Stage00Builder:
                 groups.setdefault(
                     (
                         node.path_octants,
-                        _healpix_id_from_fragment(path),
+                        _input_shard_id_from_fragment(path),
                         _fragment_kind(path),
                     ),
                     [],
                 ).append(path)
 
         rows: list[dict[str, Any]] = []
-        for (path_octants, healpix_id, kind), files in sorted(groups.items()):
+        for (path_octants, input_shard_id, kind), files in sorted(groups.items()):
             checksum, row_count = _stage00_group_checksum(files)
             rows.append(
                 {
-                    "key": _stage00_group_key(path_octants, healpix_id, kind),
+                    "key": _stage00_group_key(path_octants, input_shard_id, kind),
                     "node_path": _node_path_label(path_octants),
                     "path_octants": list(path_octants),
                     "depth": len(path_octants),
-                    "input_shard_id": healpix_id,
+                    "input_shard_id": input_shard_id,
                     "kind": kind,
                     "file_count": len(files),
                     "row_count": row_count,
@@ -278,7 +285,7 @@ class _Stage00Builder:
         node: _BucketNode,
         table: pa.Table,
         *,
-        healpix_id: str,
+        input_shard_id: str,
     ) -> None:
         if len(table) == 0:
             return
@@ -290,10 +297,14 @@ class _Stage00Builder:
             )
 
         if node.lower_mag_limited:
-            self._route_into_lower_limited_node(node, table, healpix_id=healpix_id)
+            self._route_into_lower_limited_node(
+                node,
+                table,
+                input_shard_id=input_shard_id,
+            )
             return
 
-        self._write_fragment(node, table, healpix_id=healpix_id, kind="pack")
+        self._write_fragment(node, table, input_shard_id=input_shard_id, kind="pack")
         if node.row_count >= self._config.bucket_size:
             self._make_lower_mag_limited(node)
 
@@ -302,7 +313,7 @@ class _Stage00Builder:
         node: _BucketNode,
         table: pa.Table,
         *,
-        healpix_id: str,
+        input_shard_id: str,
     ) -> None:
         levels = _level_array(table)
         resident_indices = np.flatnonzero(levels == node.depth)
@@ -310,7 +321,7 @@ class _Stage00Builder:
             self._write_fragment(
                 node,
                 _take_rows(table, resident_indices),
-                healpix_id=healpix_id,
+                input_shard_id=input_shard_id,
                 kind="lim",
             )
 
@@ -325,7 +336,7 @@ class _Stage00Builder:
         descendants = _take_rows(table, descendant_indices)
         for octant, child_table in _tables_by_child_octant(descendants, node.depth):
             child = self._node_for_path((*node.path_octants, int(octant)))
-            self._route_table(child, child_table, healpix_id=healpix_id)
+            self._route_table(child, child_table, input_shard_id=input_shard_id)
 
     def _make_lower_mag_limited(self, node: _BucketNode) -> None:
         if node.lower_mag_limited:
@@ -346,18 +357,22 @@ class _Stage00Builder:
         node.row_count = 0
 
         for path in pack_files:
-            healpix_id = _healpix_id_from_fragment(path)
+            input_shard_id = _input_shard_id_from_fragment(path)
             table = pq.ParquetFile(path).read()
             path.unlink()
             self._files_deleted_on_split += 1
-            self._route_into_lower_limited_node(node, table, healpix_id=healpix_id)
+            self._route_into_lower_limited_node(
+                node,
+                table,
+                input_shard_id=input_shard_id,
+            )
 
     def _write_fragment(
         self,
         node: _BucketNode,
         table: pa.Table,
         *,
-        healpix_id: str,
+        input_shard_id: str,
         kind: str,
     ) -> None:
         if kind not in {"pack", "lim"}:
@@ -366,7 +381,7 @@ class _Stage00Builder:
             return
         key = _WriterKey(
             path_octants=node.path_octants,
-            healpix_id=_safe_healpix_id(healpix_id),
+            input_shard_id=_safe_input_shard_id(input_shard_id),
             kind=kind,
         )
         offset = 0
@@ -410,7 +425,11 @@ class _Stage00Builder:
             old_key = next(iter(self._open_writers))
             self._close_writer(old_key)
 
-        path = self._next_fragment_path(node, healpix_id=key.healpix_id, kind=key.kind)
+        path = self._next_fragment_path(
+            node,
+            input_shard_id=key.input_shard_id,
+            kind=key.kind,
+        )
         writer = _OpenFragmentWriter(
             key=key,
             node=node,
@@ -431,12 +450,13 @@ class _Stage00Builder:
         self,
         node: _BucketNode,
         *,
-        healpix_id: str,
+        input_shard_id: str,
         kind: str,
     ) -> Path:
-        safe_healpix = _safe_healpix_id(healpix_id)
+        safe_input_shard = _safe_input_shard_id(input_shard_id)
         path = (
-            node.directory / f"hp{safe_healpix}-{kind}-{node.next_sequence:06d}.parquet"
+            node.directory
+            / f"shard-{safe_input_shard}-{kind}-{node.next_sequence:06d}.parquet"
         )
         node.next_sequence += 1
         return path
@@ -474,17 +494,17 @@ class _Stage00Builder:
             groups: dict[tuple[str, str], list[Path]] = {}
             for path in sorted(node.current_files):
                 groups.setdefault(
-                    (_healpix_id_from_fragment(path), _fragment_kind(path)),
+                    (_input_shard_id_from_fragment(path), _fragment_kind(path)),
                     [],
                 ).append(path)
 
-            for (healpix_id, kind), files in sorted(groups.items()):
+            for (input_shard_id, kind), files in sorted(groups.items()):
                 if len(files) <= threshold:
                     continue
                 self._compact_file_group(
                     node,
                     files,
-                    healpix_id=healpix_id,
+                    input_shard_id=input_shard_id,
                     kind=kind,
                 )
 
@@ -493,7 +513,7 @@ class _Stage00Builder:
         node: _BucketNode,
         files: list[Path],
         *,
-        healpix_id: str,
+        input_shard_id: str,
         kind: str,
     ) -> None:
         new_files: list[Path] = []
@@ -506,7 +526,11 @@ class _Stage00Builder:
             if not buffered:
                 return
             compacted = pa.concat_tables(buffered, promote_options="none")
-            path = self._next_fragment_path(node, healpix_id=healpix_id, kind=kind)
+            path = self._next_fragment_path(
+                node,
+                input_shard_id=input_shard_id,
+                kind=kind,
+            )
             pq.write_table(compacted, path, compression="zstd")
             new_files.append(path)
             self._files_written += 1
@@ -548,9 +572,9 @@ class _Stage00Builder:
 def run_stage00(config: Stage00Config) -> Path:
     """Build the packed Stage 00 staging tree.
 
-    Input may be raw merged HEALPix parquet or already enriched parquet. Rows are
-    routed into adaptive staging buckets, with lower magnitude limiting enabled
-    only after a bucket reaches the configured row cap.
+    Input may be raw merged catalogue parquet or already enriched parquet. Rows
+    are routed into adaptive staging buckets, with lower magnitude limiting
+    enabled only after a bucket reaches the configured row cap.
     """
     config.validate()
     if config.force and config.output_dir.exists():
@@ -562,23 +586,23 @@ def run_stage00(config: Stage00Config) -> Path:
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
     builder = _Stage00Builder(config)
-    processed_healpix: list[str] = []
+    processed_input_shards: list[str] = []
     input_files = 0
 
     for input_shard in _selected_input_shards(config):
         if not input_shard.parquet_files:
             continue
-        processed_healpix.append(input_shard.shard_id)
+        processed_input_shards.append(input_shard.shard_id)
         for src_file in input_shard.parquet_files:
             input_files += 1
             parquet_file = pq.ParquetFile(src_file)
             for batch in parquet_file.iter_batches(batch_size=config.batch_size):
                 table = pa.Table.from_batches([batch])
-                builder.process_table(table, healpix_id=input_shard.shard_id)
+                builder.process_table(table, input_shard_id=input_shard.shard_id)
 
     builder.finish()
     report = builder.report(
-        processed_healpix=processed_healpix,
+        processed_input_shards=processed_input_shards,
         input_files=input_files,
     )
     report_path = config.output_dir / REPORT_NAME
@@ -587,10 +611,10 @@ def run_stage00(config: Stage00Config) -> Path:
 
 
 def _selected_input_shards(config: Stage00Config) -> list[_InputShard]:
-    if config.healpix_ids:
+    if config.shard_ids:
         shards: list[_InputShard] = []
         missing: list[str] = []
-        for shard_id in config.healpix_ids:
+        for shard_id in config.shard_ids:
             direct = config.input_root / shard_id
             with_suffix = config.input_root / f"{shard_id}.parquet"
             if direct.is_dir():
@@ -615,7 +639,7 @@ def _selected_input_shards(config: Stage00Config) -> list[_InputShard]:
                 missing.append(str(direct))
         if missing:
             raise FileNotFoundError(
-                f"Missing HEALPix input directories or parquet shards: {missing}"
+                f"Missing input shard directories or parquet shards: {missing}"
             )
     else:
         shards = []
@@ -687,10 +711,10 @@ def _normalize_stage00_schema(table: pa.Table) -> pa.Table:
 
 def _stage00_group_key(
     path_octants: tuple[int, ...],
-    healpix_id: str,
+    input_shard_id: str,
     kind: str,
 ) -> str:
-    return f"{_node_path_label(path_octants)}|{healpix_id}|{kind}"
+    return f"{_node_path_label(path_octants)}|{input_shard_id}|{kind}"
 
 
 def _node_path_label(path_octants: tuple[int, ...]) -> str:
@@ -762,20 +786,20 @@ def _tables_by_child_octant(
     return out
 
 
-def _safe_healpix_id(value: str) -> str:
+def _safe_input_shard_id(value: str) -> str:
     text = str(value).strip()
     if not text:
-        raise ValueError("HEALPix id must not be empty")
+        raise ValueError("input shard id must not be empty")
     if "/" in text or "\\" in text:
-        raise ValueError(f"HEALPix id must not contain path separators: {value!r}")
+        raise ValueError(f"input shard id must not contain path separators: {value!r}")
     return text
 
 
-def _healpix_id_from_fragment(path: Path) -> str:
+def _input_shard_id_from_fragment(path: Path) -> str:
     match = _FRAGMENT_RE.match(path.name)
     if match is None:
         raise ValueError(f"Invalid Stage 00 fragment filename: {path.name}")
-    return match.group("hp")
+    return match.group("shard") or match.group("legacy_shard")
 
 
 def _fragment_kind(path: Path) -> str:

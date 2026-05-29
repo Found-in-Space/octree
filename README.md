@@ -24,12 +24,17 @@ materialization and packaging:
 
 | Stage | Input | Output | Purpose |
 |-------|-------|--------|---------|
-| **Stage 00** | HEALPix-partitioned merged parquet | `(node, healpix)` staging folders | Partitions input rows into the octree staging tree |
+| **Stage 00** | Input-sharded merged parquet | `(node, input_shard_id, kind)` staging groups | Partitions input rows into the octree staging tree |
 | **Stage 01** | Stage 00 staging folders | Canonical staged parts | Sorts and compacts staged data in place |
 | **Stage 02** | Stage 01 staged parts | Updated payload fragments | Optionally rewrites payload bytes without re-indexing |
 | **Stage 03** | Sorted staged parts | Payload-order byte arrays + identity indexes | Materializes canonical node payload order |
 | **Stage 04** | Stage 03 node outputs | `stars.octree` + identity/order artifacts | Packs the final base dataset package |
 | **Stage 05** | Stage 04 outputs | Named sidecar files (e.g. `meta`) | Builds optional sidecar families |
+
+Stage 00 keys replaceability by upstream input shard id. That id comes from the
+input directory name or root-level parquet filename stem, so HEALPix files,
+batch shards, or another stable upstream layout all work; the upstream pipeline
+chooses the rebuild granularity by choosing its shard layout.
 
 Each render octree carries a `dataset_uuid`. Sidecars carry a `parent_dataset_uuid` so readers can validate the pairing before opening them.
 

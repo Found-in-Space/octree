@@ -15,8 +15,8 @@ The implementation plan, manifest sketches, and work streams are tracked in
 
 | Stage | Purpose | Typical Input | Typical Output |
 |---|---|---|---|
-| Stage 00 | Partition HEALPix rows into octree staging buckets. | Merged HEALPix parquet from the catalogue pipeline. | `(node, healpix)` staging folders. |
-| Stage 01 | Sort and compact staged `(node, healpix)` files in place. | Stage 00 staging folders. | Canonical, replaceable staged parts. |
+| Stage 00 | Partition input shards into octree staging buckets. | Merged parquet shards from the catalogue pipeline. | `(node, input_shard_id, kind)` staging groups. |
+| Stage 01 | Sort and compact staged `(node, input_shard_id, kind)` groups in place. | Stage 00 staging folders. | Canonical, replaceable staged parts. |
 | Stage 02 | Optionally rewrite payload bytes without re-indexing. | Stage 01 staged parts. | Updated staged payload columns or payload fragments. |
 | Stage 03 | Materialize canonical per-node payload order. | Sorted staged parts. | Payload-order byte arrays plus star identity indexes. |
 | Stage 04 | Pack canonical node outputs into final octree artifacts. | Stage 03 byte arrays and indexes. | `stars.octree` and companion identity/order artifacts. |
@@ -46,7 +46,7 @@ Progress and dirtiness should live separately from the build identity. A mutable
 stage-state manifest can record:
 
 - completed stages
-- dirty HEALPix pixels
+- dirty input shards
 - dirty staging nodes
 - fragment counts, row counts, and checksums
 - stage-specific output versions
@@ -57,9 +57,16 @@ that the tree manifest matches the requested build.
 
 ## Stage 00: Partition
 
-Stage 00 reads merged HEALPix parquet and routes each row into the staging tree.
-The durable output shape is `(node, healpix)`: each staging node keeps rows
-grouped by the HEALPix input that produced them.
+Stage 00 reads merged parquet shards and routes each row into the staging tree.
+The durable output shape is `(node, input_shard_id, kind)`: each staging node
+keeps rows grouped by the upstream shard that produced them.
+
+The `input_shard_id` is derived from the input directory name or root-level
+parquet filename stem. HEALPix files are one useful shard layout, but batch
+files are valid too. Stage 00 does not reinterpret row-level HEALPix columns as
+the rebuild boundary; the upstream catalogue pipeline owns the sharding
+strategy and should choose stable shards that match its desired rebuild
+workflow.
 
 The important semantic point is that Stage 00 should not change which final
 octree node a star belongs to. It may pack rows into a shallower staging node,
@@ -71,22 +78,22 @@ Current direction:
 - Keep sparse regions shallow in the staging filesystem.
 - Let dense staging nodes become lower-magnitude limited only after they reach
   the configured row cap.
-- Preserve enough HEALPix identity that one input pixel can be deleted and
-  rebuilt without rewriting unrelated pixels.
+- Preserve enough input shard identity that one shard can be deleted and
+  rebuilt without rewriting unrelated shards.
 
 ## Stage 01: Sort And Pack
 
-Stage 01 canonicalizes the `(node, healpix)` folders in place. It sorts any
-unsorted fragments, compacts small fragments where useful, and marks the result
-as ready for downstream materialization.
+Stage 01 canonicalizes the `(node, input_shard_id, kind)` groups in place. It
+sorts any unsorted fragments, compacts small fragments where useful, and marks
+the result as ready for downstream materialization.
 
 This stage should be rerunnable over the staging tree. If Stage 00 adds fresh
-unsorted parts for one HEALPix pixel, Stage 01 should only need to revisit the
+unsorted parts for one input shard, Stage 01 should only need to revisit the
 affected folders.
 
 Current direction:
 
-- Preserve the `(node, healpix)` replaceability boundary.
+- Preserve the `(node, input_shard_id, kind)` replaceability boundary.
 - Use atomic temp files and renames for rewritten fragments.
 - Track fragment state in the stage-state manifest.
 - Use filename markers as an optimization, for example `unsorted`, `sorted`, or
@@ -120,8 +127,9 @@ final node payloads in the order expected by the renderer and sidecar builders.
 
 Current direction:
 
-- Read all `(node, healpix)` staged parts that contribute to a node.
-- Interleave HEALPix fragments into canonical payload order.
+- Read all `(node, input_shard_id, kind)` staged parts that contribute to a
+  node.
+- Interleave shard fragments into canonical payload order.
 - Fan out rows from packed staging nodes into their final payload nodes when the
   final render level is deeper than the staging node.
 - Write raw payload bytes directly to disk in payload order.
@@ -180,10 +188,10 @@ Current direction:
 
 The staging tree should make local rebuilds cheap:
 
-1. Mark the affected HEALPix pixel or staging node dirty.
-2. Delete that HEALPix pixel's staged fragments from affected `(node, healpix)`
-   folders.
-3. Re-run Stage 00 for the changed HEALPix input.
+1. Mark the affected input shard or staging node dirty.
+2. Delete that input shard's staged fragments from affected
+   `(node, input_shard_id, kind)` groups.
+3. Re-run Stage 00 for the changed input shard.
 4. Re-run Stage 01 over dirty or unsorted staged folders.
 5. Re-run Stage 02 only if the payload encoding changed.
 6. Re-run Stage 03 for affected materialized nodes.
@@ -197,7 +205,7 @@ The staging tree should make local rebuilds cheap:
 - Stages communicate through files, not shared in-memory state.
 - Expensive catalogue merge and reconciliation work belongs upstream of this
   repository.
-- Stage 00/01 remain HEALPix-replaceable.
+- Stage 00/01 remain input-shard-replaceable.
 - Stage 03 is the boundary where node payload order becomes canonical.
 - Large stages should be bounded-memory by design.
 - Render, identity/order, and sidecar artifacts should carry enough metadata for
