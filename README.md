@@ -76,6 +76,57 @@ uv run fis-octree stats https://example.com/stars.octree --nearest 20 --radius 2
 uv run fis-octree stats stars.octree --meta-octree meta.octree --point "8.6,0,0"
 ```
 
+### Publishing artifacts to S3
+
+Large artifacts are uploaded with the resumable `s3-resume` CLI:
+
+- Entry point: `s3-resume` in [`pyproject.toml`](pyproject.toml)
+- Implementation: [`src/foundinspace/octree/s3_resume/cli.py`](src/foundinspace/octree/s3_resume/cli.py)
+
+Objects published through `data.foundin.space` are immutable. Every new or
+changed dataset must use a new versioned prefix; an existing public object key
+must never be overwritten. The required S3 system metadata for every published
+object is:
+
+```text
+Cache-Control: public, max-age=31536000, immutable
+```
+
+> **Before the next production upload:** the current `s3-resume` implementation
+> supports `ContentType` and user-defined metadata, but does not yet expose
+> S3's `CacheControl` parameter. Add a `--cache-control` option, pass it as
+> `CacheControl` when creating the multipart upload, persist it in the resume
+> state, and add tests before publishing. Do not use `--metadata
+> Cache-Control=...`; that creates `x-amz-meta-cache-control` rather than the
+> HTTP `Cache-Control` response header.
+
+After upload, verify the S3 metadata before making the URL public:
+
+```bash
+aws s3api head-object \
+  --bucket foundinspace \
+  --key "<versioned-prefix>/<artifact>" \
+  --query CacheControl \
+  --output text
+```
+
+The command must print:
+
+```text
+public, max-age=31536000, immutable
+```
+
+Then verify the CDN response, using a one-byte range for large artifacts:
+
+```bash
+curl --range 0-0 --dump-header - --output /dev/null \
+  "https://data.foundin.space/<versioned-prefix>/<artifact>"
+```
+
+The response must contain the same `Cache-Control` value. CDN infrastructure is
+managed in
+[`Found-in-Space/infra/terraform/data-cdn`](https://github.com/Found-in-Space/infra/tree/main/terraform/data-cdn).
+
 ## Runtime configuration
 
 DuckDB memory and threading behaviour can be tuned at runtime via environment variables (or a `.env` file in the project root). All are optional:
@@ -104,6 +155,7 @@ src/foundinspace/octree/
   stage3.py           # Stage 03 — named sidecar families
   encoding/           # Morton code and Teff encoding utilities
   reader/             # Binary octree reader (header, index, payload, stats)
+  s3_resume/          # Resumable S3 multipart uploader used for publication
 ```
 
 ## Detailed stage documentation
