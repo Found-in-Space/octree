@@ -95,6 +95,14 @@ def _group_checksums(report: dict) -> dict[tuple[str, str, str], tuple[int, str]
     }
 
 
+def _clear_stage01_dirty(output_dir: Path) -> None:
+    state_path = output_dir / "stage-state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["dirty"]["stage01_groups"] = []
+    state["dirty"]["deleted_stage00_groups"] = []
+    state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+
 def _stage00_config(
     input_root: Path,
     output_dir: Path,
@@ -764,6 +772,7 @@ def test_stage00_replace_unchanged_shard_marks_no_dirty_groups(
     )
     out_dir = tmp_path / "stage00"
     run_stage00(_stage00_config(input_root, out_dir))
+    _clear_stage01_dirty(out_dir)
     unrelated_files = sorted(
         path.relative_to(out_dir).as_posix()
         for path in (out_dir / "tree").glob("shard-101-pack-*.parquet")
@@ -871,6 +880,7 @@ def test_stage00_replace_records_deleted_group(tmp_path: Path) -> None:
     )
     out_dir = tmp_path / "stage00"
     run_stage00(_stage00_config(input_root, out_dir, bucket_size=1))
+    _clear_stage01_dirty(out_dir)
     _write_stage00_pixel(input_root, "200", [root_row])
 
     report_path = run_stage00(

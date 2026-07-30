@@ -236,6 +236,105 @@ def test_stage01_dirty_only_changed_group_marks_stage03_nodes(
     assert unchanged_file.stat().st_mtime_ns == unchanged_mtime
 
 
+def test_stage01_processes_dirty_groups_accumulated_across_replacements(
+    tmp_path: Path,
+) -> None:
+    input_root = tmp_path / "input"
+    _write_stage00_pixel(
+        input_root,
+        "100",
+        [
+            {
+                "source": "gaia",
+                "source_id": "a",
+                "morton_code": _morton_for_node(1, 0),
+                "level": 1,
+                "mag_abs": 7.0,
+            }
+        ],
+    )
+    _write_stage00_pixel(
+        input_root,
+        "101",
+        [
+            {
+                "source": "hip",
+                "source_id": "b",
+                "morton_code": _morton_for_node(1, 1),
+                "level": 1,
+                "mag_abs": 7.1,
+            }
+        ],
+    )
+    stage00_dir = tmp_path / "stage00"
+    stage01_dir = tmp_path / "stage01"
+    run_stage00(_stage00_config(input_root, stage00_dir))
+    run_stage01(_stage01_config(stage00_dir, stage01_dir))
+    _clear_stage03_dirty(stage00_dir)
+
+    _write_stage00_pixel(
+        input_root,
+        "100",
+        [
+            {
+                "source": "gaia",
+                "source_id": "a-changed",
+                "morton_code": _morton_for_node(1, 0),
+                "level": 1,
+                "mag_abs": 7.0,
+            }
+        ],
+    )
+    run_stage00(
+        _stage00_config(
+            input_root,
+            stage00_dir,
+            shard_ids=("100",),
+            replace_shards=True,
+        )
+    )
+
+    _write_stage00_pixel(
+        input_root,
+        "101",
+        [
+            {
+                "source": "hip",
+                "source_id": "b-changed",
+                "morton_code": _morton_for_node(1, 1),
+                "level": 1,
+                "mag_abs": 7.1,
+            }
+        ],
+    )
+    run_stage00(
+        _stage00_config(
+            input_root,
+            stage00_dir,
+            shard_ids=("101",),
+            replace_shards=True,
+        )
+    )
+
+    state = json.loads((stage00_dir / "stage-state.json").read_text(encoding="utf-8"))
+    assert state["dirty"]["stage01_groups"] == ["|100|pack", "|101|pack"]
+
+    report_path = run_stage01(_stage01_config(stage00_dir, stage01_dir))
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    state = json.loads((stage00_dir / "stage-state.json").read_text(encoding="utf-8"))
+    assert report["processed_group_count"] == 2
+    assert report["changed_group_count"] == 2
+    assert state["dirty"]["stage01_groups"] == []
+    assert state["dirty"]["stage03_nodes"] == ["1:0", "1:1"]
+    assert pq.read_table(
+        next((stage01_dir / "tree").glob("shard-100-pack-sorted-*.parquet"))
+    ).column("source_id").to_pylist() == ["a-changed"]
+    assert pq.read_table(
+        next((stage01_dir / "tree").glob("shard-101-pack-sorted-*.parquet"))
+    ).column("source_id").to_pylist() == ["b-changed"]
+
+
 def test_stage01_unchanged_replacement_processes_no_groups(tmp_path: Path) -> None:
     input_root = tmp_path / "input"
     rows = [

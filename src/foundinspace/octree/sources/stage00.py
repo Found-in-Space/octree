@@ -830,15 +830,33 @@ def _run_stage00_replacement(
             for shard in selected_input_shards
         ],
     )
+    existing_dirty = state.get("dirty", {})
+    current_group_keys = {str(group["key"]) for group in report["groups"]}
+    pending_stage01_groups = sorted(
+        (
+            {str(key) for key in existing_dirty.get("stage01_groups", [])}.union(
+                changed_group_keys
+            )
+        )
+        & current_group_keys
+    )
+    pending_deleted_stage00_groups = sorted(
+        (
+            {
+                str(key) for key in existing_dirty.get("deleted_stage00_groups", [])
+            }.union(deleted_group_keys)
+        )
+        - current_group_keys
+    )
     next_state = _stage_state(
         config,
         builder=builder,
         input_shards=input_shards,
         groups=report["groups"],
         dirty={
-            "stage01_groups": changed_group_keys,
-            "deleted_stage00_groups": deleted_group_keys,
-            "stage03_nodes": list(state.get("dirty", {}).get("stage03_nodes", [])),
+            "stage01_groups": pending_stage01_groups,
+            "deleted_stage00_groups": pending_deleted_stage00_groups,
+            "stage03_nodes": list(existing_dirty.get("stage03_nodes", [])),
         },
         stage01_groups=list(state.get("stage01_groups", [])),
     )
