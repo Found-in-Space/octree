@@ -4,6 +4,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 from uuid import UUID, uuid4
 
 from .assembly.formats import (
@@ -12,9 +13,9 @@ from .assembly.formats import (
     SIDECAR_MANIFEST_FORMAT,
 )
 from .assembly.manifest import write_manifest
-from .assembly.meta_encoder import IdentifiersMap, build_meta_payload
+from .assembly.meta_encoder import IdentifiersMap, write_meta_payload
 from .assembly.plan import BuildPlan
-from .assembly.types import CellKey, EncodedCell
+from .assembly.types import CellKey
 from .assembly.writer import (
     IntermediateShardWriter,
     belongs_to_shard,
@@ -43,8 +44,18 @@ class _MetaBuilder:
             )
         )
 
-    def build_payload(self, identities: list[tuple[str, str]]) -> bytes:
-        return build_meta_payload(identities, self.ident_map)
+    def write_payload(
+        self,
+        identities: list[tuple[str, str]],
+        target: BinaryIO,
+    ) -> None:
+        write_meta_payload(identities, self.ident_map, target)
+
+    def __enter__(self) -> _MetaBuilder:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.ident_map.close()
 
 
 def _family_builder(project: OctreeProject, config: SidecarProjectConfig):
@@ -93,10 +104,12 @@ def _build_family_intermediates(
         batch_size=project.stage01.batch_size,
         mag_limit=project.stage00.v_mag,
     )
-    builder = _family_builder(project, config)
     out_dir.mkdir(parents=True, exist_ok=True)
     shard_entries: list[dict] = []
-    with IdentifiersOrderReader(order_path) as reader:
+    with (
+        _family_builder(project, config) as builder,
+        IdentifiersOrderReader(order_path) as reader,
+    ):
         iter_cells = reader.iter_cells()
         current_level = -1
         shard_keys = ()
@@ -136,12 +149,12 @@ def _build_family_intermediates(
                     filename_fn=sidecar_shard_filenames(config.name),
                 )
 
-            current_writer.write_cell(
-                EncodedCell(
-                    key=CellKey(level=record.level, node_id=record.node_id),
-                    payload=builder.build_payload(identities),
-                    star_count=record.star_count,
-                )
+            current_writer.write_generated_cell(
+                key=CellKey(level=record.level, node_id=record.node_id),
+                star_count=record.star_count,
+                write_payload=lambda target, identities=identities: (
+                    builder.write_payload(identities, target)
+                ),
             )
         close_current_writer()
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from typing import BinaryIO
 
 from .formats import (
     DEFAULT_FLAGS,
@@ -123,6 +124,30 @@ class IntermediateShardWriter:
             while chunk := source.read(1 << 20):
                 self._payload_fp.write(chunk)
                 payload_length += len(chunk)
+        self._write_index_record(
+            key=key,
+            payload_offset=payload_offset,
+            payload_length=payload_length,
+            star_count=star_count,
+        )
+
+    def write_generated_cell(
+        self,
+        *,
+        key: CellKey,
+        star_count: int,
+        write_payload: Callable[[BinaryIO], None],
+    ) -> None:
+        """Write a cell payload directly to the shard output stream."""
+        self._validate_cell_key(key)
+        payload_offset = self._payload_fp.tell()
+        try:
+            write_payload(self._payload_fp)
+        except BaseException:
+            self._payload_fp.seek(payload_offset)
+            self._payload_fp.truncate()
+            raise
+        payload_length = self._payload_fp.tell() - payload_offset
         self._write_index_record(
             key=key,
             payload_offset=payload_offset,

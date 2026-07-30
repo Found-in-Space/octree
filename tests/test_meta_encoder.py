@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import io
 import json
 
 import pyarrow as pa
@@ -11,6 +12,7 @@ from foundinspace.octree.assembly.meta_encoder import (
     IdentifiersMap,
     build_meta_payload,
     iter_encoded_cells_with_meta,
+    write_meta_payload,
 )
 from foundinspace.octree.assembly.types import CellKey, EncodedCell
 
@@ -115,6 +117,36 @@ class TestIdentifiersMap:
         with pytest.raises(FileNotFoundError):
             IdentifiersMap(tmp_path / "nope.parquet")
 
+    def test_duplicate_key_uses_last_parquet_row(self, tmp_path):
+        p = tmp_path / "id.parquet"
+        _write_ident_map(
+            p,
+            [
+                {
+                    "source": "hip",
+                    "source_id": "1",
+                    "proper_name": "First",
+                },
+                {
+                    "source": "hip",
+                    "source_id": "1",
+                    "proper_name": "Last",
+                },
+            ],
+        )
+        with IdentifiersMap(p, fields=["proper_name"]) as ident_map:
+            assert len(ident_map) == 1
+            assert ident_map.lookup("hip", "1") == {"proper_name": "Last"}
+
+    def test_lookup_after_close_raises(self, tmp_path):
+        p = tmp_path / "id.parquet"
+        _write_ident_map(p, [])
+        ident_map = IdentifiersMap(p)
+        ident_map.close()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            ident_map.lookup("gaia", "1")
+
 
 class TestBuildMetaPayload:
     def test_empty_objects_for_unknown(self, tmp_path):
@@ -127,6 +159,26 @@ class TestBuildMetaPayload:
             {"source": "gaia", "source_id": "1"},
             {"source": "gaia", "source_id": "2"},
         ]
+
+    def test_streaming_writer_matches_bytes_wrapper(self, tmp_path):
+        p = tmp_path / "id.parquet"
+        _write_ident_map(
+            p,
+            [
+                {
+                    "source": "manual",
+                    "source_id": "sun",
+                    "proper_name": "Sol",
+                }
+            ],
+        )
+        identities = [("manual", "sun"), ("gaia", "1")]
+        with IdentifiersMap(p, fields=["proper_name"]) as ident_map:
+            expected = build_meta_payload(identities, ident_map)
+            target = io.BytesIO()
+            write_meta_payload(identities, ident_map, target)
+
+        assert target.getvalue() == expected
 
 
 class TestIterEncodedCellsWithMeta:
