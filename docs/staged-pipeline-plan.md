@@ -24,10 +24,17 @@ Implemented on the current work branch:
 - Stage 00 writes tree identity and mutable stage-state manifests.
 - Stage 00 supports explicit shard replacement and dirty Stage 01 group
   tracking.
+- Initial Stage 00 builds checkpoint after each input shard. Fragment changes
+  use a write-ahead journal, and the final semantic checksum pass uses
+  independent per-group checkpoints.
 - Stage 01 sorts and compacts Stage 00 groups into replaceable sorted parquet
   groups while preserving `(staging_node, input_shard_id, kind)` granularity.
   Ordinary groups retain the in-memory Arrow fast path; outlier groups switch to
   a disk-backed DuckDB external sort with a bounded default memory limit.
+- Stage 01 checkpoints each completed group independently and consolidates the
+  shared state once at completion.
+- Stage 01 stores a scalar natural maximum level per group rather than occupied
+  final-node lists. Downstream dirtiness is a bounded `clean`/`all` state.
 - The compatibility `stage-02` path materializes the traditional/classic
   level-capped output from tracked Stage 01 groups and writes `stars.octree`
   plus `identifiers.order` through the existing binary combine pipeline.
@@ -345,8 +352,7 @@ Outputs:
 
 - sorted compacted staged groups
 - updated Stage 01 group checksums
-- dirty Stage 03 node set, moving to per-profile dirty sets once Stage 03
-  profiles are introduced
+- bounded Stage 03 invalidation mode (`clean` or `all`)
 
 Stage 01 should not do a global catalogue sort. It should operate on local
 groups. DuckDB may still be used as a local sorting engine, but the query scope
@@ -362,7 +368,9 @@ Stage 01 behavior:
 4. Write replacement sorted files to temp paths.
 5. Compute sorted checksum.
 6. Atomically swap files.
-7. If checksum changed, mark affected final nodes dirty.
+7. Write a per-group recovery checkpoint.
+8. If any checksum changed, set bounded downstream invalidation to `all`.
+9. Consolidate the shared stage state once all target groups are complete.
 
 Stage 01 must preserve the raw fields needed to encode the final render record.
 It sorts rows but does not create node-relative coordinates.
@@ -456,8 +464,8 @@ Status: implemented.
 
 Remaining cleanup:
 
-- keep Stage 00 state compatible with Stage 03 profile dirty sets as those are
-  introduced
+- move future profile-selective dirtiness into disk-backed profile manifests;
+  do not restore occupied-node arrays to the shared JSON state
 
 ### B. Stage 01 Rewrite
 
@@ -467,8 +475,8 @@ Status: implemented.
 
 Remaining cleanup:
 
-- update Stage 01 dirty output from a single `stage03_nodes` list to per-profile
-  dirty sets once Stage 03 profile configs exist
+- replace the conservative `all` invalidation with disk-backed per-profile
+  invalidation once Stage 03 profile configs exist
 
 ### C. Stage 03 Profiles And Final Assembly
 

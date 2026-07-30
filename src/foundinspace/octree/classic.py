@@ -133,18 +133,22 @@ def _tracked_stage01_groups(
                 checksum=str(group["checksum"]),
                 row_count=int(group["row_count"]),
                 files=tuple(files),
-                natural_max_level=max(
-                    (
-                        int(str(node).split(":", 1)[0])
-                        for node in group.get("final_nodes", [])
-                    ),
-                    default=None,
-                ),
+                natural_max_level=_group_natural_max_level(group),
             )
         )
     if not groups:
         raise ValueError("Classic build found no Stage 01 groups")
     return groups
+
+
+def _group_natural_max_level(group: dict[str, Any]) -> int | None:
+    value = group.get("natural_max_level")
+    if value is not None:
+        return int(value)
+    return max(
+        (int(str(node).split(":", 1)[0]) for node in group.get("final_nodes", [])),
+        default=None,
+    )
 
 
 def _publish_intermediates(

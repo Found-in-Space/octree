@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -8,6 +9,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 import pyarrow as pa
@@ -37,6 +39,20 @@ TREE_DIR_NAME = "tree"
 REPORT_NAME = "stage00-report.json"
 TREE_MANIFEST_NAME = "tree-manifest.json"
 STAGE_STATE_NAME = "stage-state.json"
+STAGE00_BUILD_FORMAT = "foundinspace.octree.stage00-build/v1"
+STAGE00_TRANSACTION_FORMAT = "foundinspace.octree.stage00-transaction/v1"
+STAGE00_TRANSACTION_NAME = ".stage00-transaction.json"
+STAGE00_CHECKSUM_FORMAT = "foundinspace.octree.stage00-checksum/v1"
+STAGE00_CHECKSUM_DIR = ".stage00-checksums"
+STAGE00_PROGRESS_COUNTERS = (
+    "fragment_files_written",
+    "fragment_files_deleted_on_split",
+    "fragment_files_deleted_on_compaction",
+    "split_rewrites",
+    "compaction_rewrites",
+    "compaction_input_files",
+    "compaction_output_files",
+)
 LOWER_MAG_LIMITED_MARKER = "_LOWER_MAG_LIMITED"
 _FRAGMENT_RE = re.compile(
     r"^(?:shard-(?P<shard>.+?)|hp(?P<legacy_shard>.+?))"
@@ -132,6 +148,53 @@ class _OpenFragmentWriter:
     rows: int = 0
 
 
+class _Stage00Transaction:
+    def __init__(self, output_dir: Path) -> None:
+        self.output_dir = output_dir
+        self.transaction_id = uuid4().hex
+        self.journal_path = output_dir / STAGE00_TRANSACTION_NAME
+        self.created_files: list[str] = []
+        self.obsolete_files: list[str] = []
+        self._write_journal()
+
+    def register_created(self, path: Path) -> None:
+        rel_path = path.relative_to(self.output_dir).as_posix()
+        if rel_path not in self.created_files:
+            self.created_files.append(rel_path)
+            self._write_journal()
+
+    def register_obsolete(self, path: Path) -> None:
+        rel_path = path.relative_to(self.output_dir).as_posix()
+        if rel_path not in self.obsolete_files:
+            self.obsolete_files.append(rel_path)
+            self._write_journal()
+
+    def commit_state(
+        self,
+        state_path: Path,
+        state: dict[str, Any],
+    ) -> None:
+        state["stage00_build"]["last_committed_transaction"] = self.transaction_id
+        _atomic_write_json(state_path, state)
+        self._cleanup_obsolete()
+        self.journal_path.unlink(missing_ok=True)
+
+    def _cleanup_obsolete(self) -> None:
+        for rel_path in self.obsolete_files:
+            (self.output_dir / rel_path).unlink(missing_ok=True)
+
+    def _write_journal(self) -> None:
+        _atomic_write_json(
+            self.journal_path,
+            {
+                "format": STAGE00_TRANSACTION_FORMAT,
+                "transaction_id": self.transaction_id,
+                "created_files": self.created_files,
+                "obsolete_files": self.obsolete_files,
+            },
+        )
+
+
 class _Stage00Builder:
     def __init__(
         self,
@@ -139,12 +202,15 @@ class _Stage00Builder:
         *,
         existing_state: dict[str, Any] | None = None,
         preserve_existing_topology: bool = False,
+        transaction: _Stage00Transaction | None = None,
     ) -> None:
         self._config = config
         self._tree_dir = config.output_dir / TREE_DIR_NAME
         self._nodes: dict[tuple[int, ...], _BucketNode] = {}
         self._preserve_existing_topology = preserve_existing_topology
+        self._transaction = transaction
         self._open_writers: OrderedDict[_WriterKey, _OpenFragmentWriter] = OrderedDict()
+        self._file_rows: dict[Path, int] = {}
         self._rows_in = 0
         self._rows_after_filter = 0
         self._rows_written = 0
@@ -163,6 +229,14 @@ class _Stage00Builder:
     @property
     def rows_in(self) -> int:
         return self._rows_in
+
+    @property
+    def rows_after_filter(self) -> int:
+        return self._rows_after_filter
+
+    @property
+    def input_batches(self) -> int:
+        return self._batches
 
     def process_table(self, table: pa.Table, *, input_shard_id: str) -> None:
         if len(table) == 0:
@@ -189,7 +263,14 @@ class _Stage00Builder:
         self._compact_current_files(compact_shard_ids=compact_shard_ids)
 
     def report(
-        self, *, processed_input_shards: list[str], input_files: int
+        self,
+        *,
+        processed_input_shards: list[str],
+        input_files: int,
+        groups: list[dict[str, Any]] | None = None,
+        rows_in: int | None = None,
+        rows_after_filter: int | None = None,
+        input_batches: int | None = None,
     ) -> dict[str, Any]:
         by_depth: dict[int, dict[str, Any]] = {}
         for node in self._nodes.values():
@@ -235,10 +316,16 @@ class _Stage00Builder:
             "replacement_mode": self._config.replace_shards,
             "processed_input_shards": processed_input_shards,
             "input_files": input_files,
-            "input_batches": self._batches,
+            "input_batches": (
+                self._batches if input_batches is None else int(input_batches)
+            ),
             "input_filter": self._config.input_filter,
-            "rows_in": self._rows_in,
-            "rows_after_filter": self._rows_after_filter,
+            "rows_in": self._rows_in if rows_in is None else int(rows_in),
+            "rows_after_filter": (
+                self._rows_after_filter
+                if rows_after_filter is None
+                else int(rows_after_filter)
+            ),
             "rows_current": current_rows,
             "staging_nodes": len(self._nodes),
             "lower_mag_limited_nodes": lower_limited,
@@ -253,7 +340,7 @@ class _Stage00Builder:
             "compaction_output_files": self._compaction_output_files,
             "max_open_writers_seen": self._max_open_writers_seen,
             "by_depth": [by_depth[d] for d in sorted(by_depth)],
-            "groups": self._group_reports(),
+            "groups": self._group_reports() if groups is None else groups,
         }
 
     def nodes_report(self) -> list[dict[str, Any]]:
@@ -280,8 +367,7 @@ class _Stage00Builder:
             for rel_file in group.get("files", []):
                 path = self._config.output_dir / rel_file
                 node.current_files.discard(path)
-                if path.exists():
-                    path.unlink()
+                self._mark_obsolete(path)
             node.row_count = max(0, node.row_count - int(group.get("row_count", 0)))
 
     def _load_existing_state(self, state: dict[str, Any]) -> None:
@@ -297,14 +383,19 @@ class _Stage00Builder:
 
         for group in state.get("stage00_groups", []):
             node = self._node_for_path(tuple(int(v) for v in group["path_octants"]))
-            for rel_file in group.get("files", []):
+            file_rows = list(group.get("file_row_counts", []))
+            for index, rel_file in enumerate(group.get("files", [])):
                 path = self._config.output_dir / rel_file
                 node.current_files.add(path)
+                if index < len(file_rows):
+                    self._file_rows[path] = int(file_rows[index])
+                else:
+                    self._file_rows[path] = pq.read_metadata(path).num_rows
 
         for node in self._nodes.values():
             node.next_sequence = _next_fragment_sequence(node.current_files)
 
-    def _group_reports(self) -> list[dict[str, Any]]:
+    def _group_reports(self, *, checksums: bool = True) -> list[dict[str, Any]]:
         groups: dict[tuple[tuple[int, ...], str, str], list[Path]] = {}
         for node in self._nodes.values():
             for path in sorted(node.current_files):
@@ -319,24 +410,31 @@ class _Stage00Builder:
 
         rows: list[dict[str, Any]] = []
         for (path_octants, input_shard_id, kind), files in sorted(groups.items()):
-            checksum, row_count = _stage00_group_checksum(files)
-            rows.append(
-                {
-                    "key": _stage00_group_key(path_octants, input_shard_id, kind),
-                    "node_path": _node_path_label(path_octants),
-                    "path_octants": list(path_octants),
-                    "depth": len(path_octants),
-                    "input_shard_id": input_shard_id,
-                    "kind": kind,
-                    "file_count": len(files),
-                    "row_count": row_count,
-                    "content_checksum": checksum,
-                    "files": [
-                        path.relative_to(self._config.output_dir).as_posix()
-                        for path in files
-                    ],
-                }
-            )
+            row_count = sum(self._file_rows[path] for path in files)
+            row = {
+                "key": _stage00_group_key(path_octants, input_shard_id, kind),
+                "node_path": _node_path_label(path_octants),
+                "path_octants": list(path_octants),
+                "depth": len(path_octants),
+                "input_shard_id": input_shard_id,
+                "kind": kind,
+                "file_count": len(files),
+                "row_count": row_count,
+                "files": [
+                    path.relative_to(self._config.output_dir).as_posix()
+                    for path in files
+                ],
+                "file_row_counts": [self._file_rows[path] for path in files],
+            }
+            if checksums:
+                checksum, checksummed_rows = _stage00_group_checksum(files)
+                _ensure_equal_row_count(
+                    before=row_count,
+                    after=checksummed_rows,
+                    context=f"checksumming group {row['key']}",
+                )
+                row["content_checksum"] = checksum
+            rows.append(row)
         return rows
 
     def _node_for_path(self, path_octants: tuple[int, ...]) -> _BucketNode:
@@ -453,7 +551,7 @@ class _Stage00Builder:
             input_shard_id = _input_shard_id_from_fragment(path)
             table = pq.ParquetFile(path).read()
             rows_in_pack_files += len(table)
-            path.unlink()
+            self._mark_obsolete(path)
             self._files_deleted_on_split += 1
             self._route_into_lower_limited_node(
                 node,
@@ -526,6 +624,8 @@ class _Stage00Builder:
             input_shard_id=key.input_shard_id,
             kind=key.kind,
         )
+        if self._transaction is not None:
+            self._transaction.register_created(path)
         writer = _OpenFragmentWriter(
             key=key,
             node=node,
@@ -562,6 +662,7 @@ class _Stage00Builder:
         if writer is None:
             return
         writer.writer.close()
+        self._file_rows[writer.path] = writer.rows
 
     def _close_writers_for_node(
         self,
@@ -634,8 +735,11 @@ class _Stage00Builder:
                 input_shard_id=input_shard_id,
                 kind=kind,
             )
+            if self._transaction is not None:
+                self._transaction.register_created(path)
             pq.write_table(compacted, path, compression="zstd")
             new_files.append(path)
+            self._file_rows[path] = len(compacted)
             self._files_written += 1
             self._rows_written += len(compacted)
             output_rows += len(compacted)
@@ -673,12 +777,19 @@ class _Stage00Builder:
         )
 
         for path in files:
-            path.unlink()
+            self._mark_obsolete(path)
         node.current_files.difference_update(files)
         node.current_files.update(new_files)
         self._files_deleted_on_compaction += len(files)
         self._compaction_input_files += len(files)
         self._compaction_rewrites += 1
+
+    def _mark_obsolete(self, path: Path) -> None:
+        self._file_rows.pop(path, None)
+        if self._transaction is not None:
+            self._transaction.register_obsolete(path)
+        else:
+            path.unlink(missing_ok=True)
 
 
 def run_stage00(config: Stage00Config) -> Path:
@@ -695,47 +806,158 @@ def run_stage00(config: Stage00Config) -> Path:
 
     if config.force and config.output_dir.exists():
         shutil.rmtree(config.output_dir)
-    if config.output_dir.exists() and any(config.output_dir.iterdir()):
-        raise FileExistsError(
-            f"Output directory is not empty: {config.output_dir}. Use --force to replace it."
-        )
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
     selected_input_shards = _selected_input_shards(config)
-    builder = _Stage00Builder(config)
-    processed_input_shards, input_files = _process_input_shards(
-        builder,
-        selected_input_shards,
-        batch_size=config.batch_size,
-    )
-    builder.finish()
+    input_plan = [
+        _input_shard_metadata(config.input_root, shard)
+        for shard in selected_input_shards
+        if shard.parquet_files
+    ]
+    manifest_path = config.output_dir / TREE_MANIFEST_NAME
+    state_path = config.output_dir / STAGE_STATE_NAME
+    if manifest_path.is_file() and state_path.is_file():
+        state = _read_json(state_path)
+        _recover_stage00_transaction(config.output_dir, state)
+        state = _read_json(state_path)
+        _validate_resumable_stage00_state(
+            config,
+            state=state,
+            manifest=_read_json(manifest_path),
+            input_plan=input_plan,
+        )
+        _sync_topology_markers(config.output_dir, state)
+    elif any(config.output_dir.iterdir()):
+        raise FileExistsError(
+            f"Output directory is not a resumable Stage 00 build: {config.output_dir}. "
+            "Use --force to replace it."
+        )
+    else:
+        builder = _Stage00Builder(config)
+        manifest = _tree_manifest(config)
+        state = _stage_state(
+            config,
+            builder=builder,
+            input_shards=[],
+            groups=[],
+            dirty=_initial_dirty_state(),
+        )
+        state["stage00_build"] = {
+            "format": STAGE00_BUILD_FORMAT,
+            "status": "in_progress",
+            "input_plan": input_plan,
+            "completed_shards": [],
+            "progress": {
+                "rows_in": 0,
+                "rows_after_filter": 0,
+                "input_files": 0,
+                "input_batches": 0,
+            },
+        }
+        _atomic_write_json(manifest_path, manifest)
+        _atomic_write_json(state_path, state)
+
+    build_state = state["stage00_build"]
+    completed_shards = {str(value) for value in build_state.get("completed_shards", [])}
+    selected_by_id = {shard.shard_id: shard for shard in selected_input_shards}
+    if build_state.get("status") == "in_progress":
+        for shard_meta in input_plan:
+            shard_id = str(shard_meta["shard_id"])
+            if shard_id in completed_shards:
+                continue
+            shard = selected_by_id[shard_id]
+            transaction = _Stage00Transaction(config.output_dir)
+            builder = _Stage00Builder(
+                config,
+                existing_state=state,
+                preserve_existing_topology=False,
+                transaction=transaction,
+            )
+            try:
+                _processed, input_files = _process_input_shards(
+                    builder,
+                    [shard],
+                    batch_size=config.batch_size,
+                )
+                builder.finish(compact_shard_ids={shard_id})
+            except Exception:
+                builder._close_all_writers()
+                raise
+            groups = builder._group_reports(checksums=False)
+            shard_report = builder.report(
+                processed_input_shards=[shard_id],
+                input_files=input_files,
+                groups=groups,
+            )
+            progress = dict(build_state.get("progress", {}))
+            progress["rows_in"] = int(progress.get("rows_in", 0)) + builder.rows_in
+            progress["rows_after_filter"] = (
+                int(progress.get("rows_after_filter", 0)) + builder.rows_after_filter
+            )
+            progress["input_files"] = int(progress.get("input_files", 0)) + input_files
+            progress["input_batches"] = (
+                int(progress.get("input_batches", 0)) + builder.input_batches
+            )
+            for counter in STAGE00_PROGRESS_COUNTERS:
+                progress[counter] = int(progress.get(counter, 0)) + int(
+                    shard_report[counter]
+                )
+            progress["max_open_writers_seen"] = max(
+                int(progress.get("max_open_writers_seen", 0)),
+                int(shard_report["max_open_writers_seen"]),
+            )
+            completed_shards.add(shard_id)
+            state = _stage_state(
+                config,
+                builder=builder,
+                input_shards=_replace_input_shard_metadata(
+                    state.get("input_shards", []),
+                    target_shards={shard_id},
+                    replacements=[shard_meta],
+                ),
+                groups=groups,
+                dirty=_initial_dirty_state(),
+            )
+            state["stage00_build"] = {
+                "format": STAGE00_BUILD_FORMAT,
+                "status": "in_progress",
+                "input_plan": input_plan,
+                "completed_shards": sorted(completed_shards),
+                "progress": progress,
+            }
+            transaction.commit_state(state_path, state)
+            build_state = state["stage00_build"]
+
+        state["stage00_build"]["status"] = "checksumming"
+        _atomic_write_json(state_path, state)
+
+    if state["stage00_build"].get("status") == "checksumming":
+        state = _checkpoint_stage00_group_checksums(config, state)
+
+    if state["stage00_build"].get("status") != "complete":
+        raise ValueError("Stage 00 did not reach a complete checkpoint")
+
+    builder = _Stage00Builder(config, existing_state=state)
+    progress = state["stage00_build"]["progress"]
+    report_groups = [_report_group(group) for group in state["stage00_groups"]]
     report = builder.report(
-        processed_input_shards=processed_input_shards,
-        input_files=input_files,
+        processed_input_shards=[
+            str(row["shard_id"]) for row in state.get("input_shards", [])
+        ],
+        input_files=int(progress["input_files"]),
+        groups=report_groups,
+        rows_in=int(progress["rows_in"]),
+        rows_after_filter=int(progress["rows_after_filter"]),
+        input_batches=int(progress["input_batches"]),
     )
+    for counter in STAGE00_PROGRESS_COUNTERS:
+        report[counter] = int(progress.get(counter, 0))
+    report["max_open_writers_seen"] = int(progress.get("max_open_writers_seen", 0))
     report["replacement_mode"] = False
     report["changed_group_count"] = len(report["groups"])
     report["unchanged_group_count"] = 0
     report["deleted_group_count"] = 0
     _validate_stage00_full_row_counts(report)
-    manifest = _tree_manifest(config)
-    state = _stage_state(
-        config,
-        builder=builder,
-        input_shards=[
-            _input_shard_metadata(config.input_root, shard)
-            for shard in selected_input_shards
-            if shard.parquet_files
-        ],
-        groups=report["groups"],
-        dirty={
-            "stage01_groups": [group["key"] for group in report["groups"]],
-            "deleted_stage00_groups": [],
-            "stage03_nodes": [],
-        },
-    )
-    _atomic_write_json(config.output_dir / TREE_MANIFEST_NAME, manifest)
-    _atomic_write_json(config.output_dir / STAGE_STATE_NAME, state)
     report_path = config.output_dir / REPORT_NAME
     _atomic_write_json(report_path, report)
     return report_path
@@ -754,6 +976,8 @@ def _run_stage00_replacement(
 
     manifest = _read_json(manifest_path)
     state = _read_json(state_path)
+    _recover_stage00_transaction(config.output_dir, state)
+    state = _read_json(state_path)
     if manifest.get("format") != TREE_MANIFEST_FORMAT:
         raise ValueError(
             f"Unsupported Stage 00 tree manifest format: {manifest.get('format')!r}"
@@ -769,6 +993,9 @@ def _run_stage00_replacement(
         raise ValueError(f"Unsupported Stage 00 state format: {state.get('format')!r}")
     if state.get("tree_identity") != existing_identity:
         raise ValueError("Stage 00 state identity does not match tree manifest")
+    build_state = state.get("stage00_build")
+    if isinstance(build_state, dict) and build_state.get("status") != "complete":
+        raise ValueError("Stage 00 shard replacement requires a complete full build")
 
     target_shards = {shard.shard_id for shard in selected_input_shards}
     old_target_groups = {
@@ -834,6 +1061,12 @@ def _run_stage00_replacement(
         ],
     )
     existing_dirty = state.get("dirty", {})
+    legacy_stage03_nodes = list(existing_dirty.get("stage03_nodes", []))
+    existing_stage03 = existing_dirty.get("stage03")
+    if not isinstance(existing_stage03, dict):
+        existing_stage03 = {
+            "mode": "all" if legacy_stage03_nodes else "clean",
+        }
     current_group_keys = {str(group["key"]) for group in report["groups"]}
     pending_stage01_groups = sorted(
         (
@@ -857,12 +1090,25 @@ def _run_stage00_replacement(
         input_shards=input_shards,
         groups=report["groups"],
         dirty={
+            "stage01_all": bool(existing_dirty.get("stage01_all", False)),
             "stage01_groups": pending_stage01_groups,
             "deleted_stage00_groups": pending_deleted_stage00_groups,
-            "stage03_nodes": list(existing_dirty.get("stage03_nodes", [])),
+            "stage03": existing_stage03,
         },
         stage01_groups=list(state.get("stage01_groups", [])),
     )
+    build_state = dict(state.get("stage00_build", {}))
+    if build_state:
+        build_state["input_plan"] = input_shards
+        build_state["completed_shards"] = [str(row["shard_id"]) for row in input_shards]
+        progress = dict(build_state.get("progress", {}))
+        progress["rows_in"] = int(report["rows_current"])
+        progress["rows_after_filter"] = int(report["rows_current"])
+        progress["input_files"] = sum(
+            len(row.get("source_files", [])) for row in input_shards
+        )
+        build_state["progress"] = progress
+        next_state["stage00_build"] = build_state
     _atomic_write_json(state_path, next_state)
     _atomic_write_json(config.output_dir / REPORT_NAME, report)
     return config.output_dir / REPORT_NAME
@@ -952,7 +1198,7 @@ def _stage_state(
 
 
 def _state_group(group: dict[str, Any]) -> dict[str, Any]:
-    return {
+    row = {
         "key": group["key"],
         "node_path": group["node_path"],
         "path_octants": list(group["path_octants"]),
@@ -963,8 +1209,31 @@ def _state_group(group: dict[str, Any]) -> dict[str, Any]:
         "files": list(group["files"]),
         "file_count": group["file_count"],
         "row_count": group["row_count"],
-        "checksum": group["content_checksum"],
-        "content_checksum": group["content_checksum"],
+        "file_row_counts": list(group.get("file_row_counts", [])),
+    }
+    checksum = group.get("content_checksum")
+    if checksum is not None:
+        row["checksum"] = checksum
+        row["content_checksum"] = checksum
+    return row
+
+
+def _report_group(group: dict[str, Any]) -> dict[str, Any]:
+    checksum = group.get("content_checksum")
+    if checksum is None:
+        raise ValueError(f"Stage 00 group is not checksummed: {group['key']}")
+    return {
+        "key": group["key"],
+        "node_path": group["node_path"],
+        "path_octants": list(group["path_octants"]),
+        "depth": group["depth"],
+        "input_shard_id": group["input_shard_id"],
+        "kind": group["kind"],
+        "file_count": group["file_count"],
+        "row_count": group["row_count"],
+        "content_checksum": checksum,
+        "files": list(group["files"]),
+        "file_row_counts": list(group.get("file_row_counts", [])),
     }
 
 
@@ -1007,6 +1276,186 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _initial_dirty_state() -> dict[str, Any]:
+    return {
+        "stage01_all": True,
+        "stage01_groups": [],
+        "deleted_stage00_groups": [],
+        "stage03": {"mode": "clean"},
+    }
+
+
+def _validate_resumable_stage00_state(
+    config: Stage00Config,
+    *,
+    state: dict[str, Any],
+    manifest: dict[str, Any],
+    input_plan: list[dict[str, Any]],
+) -> None:
+    if manifest.get("format") != TREE_MANIFEST_FORMAT:
+        raise ValueError(
+            f"Unsupported Stage 00 tree manifest format: {manifest.get('format')!r}"
+        )
+    if state.get("format") != STAGE_STATE_FORMAT:
+        raise ValueError(f"Unsupported Stage 00 state format: {state.get('format')!r}")
+    expected_identity = _tree_identity(config)
+    if manifest.get("tree_identity") != expected_identity:
+        raise ValueError(
+            "Existing Stage 00 tree identity does not match current project config"
+        )
+    if state.get("tree_identity") != expected_identity:
+        raise ValueError("Stage 00 state identity does not match tree manifest")
+    build = state.get("stage00_build")
+    if not isinstance(build, dict) or build.get("format") != STAGE00_BUILD_FORMAT:
+        raise FileExistsError(
+            "Existing Stage 00 output predates resumable checkpoints; "
+            "use --force for a new full build."
+        )
+    if build.get("status") not in {"in_progress", "checksumming", "complete"}:
+        raise ValueError(f"Invalid Stage 00 build status: {build.get('status')!r}")
+    if build.get("input_plan") != input_plan:
+        raise ValueError(
+            "Stage 00 resume input plan changed; restore the original inputs "
+            "or use --force for a new build."
+        )
+
+
+def _recover_stage00_transaction(
+    output_dir: Path,
+    state: dict[str, Any],
+) -> None:
+    journal_path = output_dir / STAGE00_TRANSACTION_NAME
+    if not journal_path.is_file():
+        return
+    journal = _read_json(journal_path)
+    if journal.get("format") != STAGE00_TRANSACTION_FORMAT:
+        raise ValueError(f"Unsupported Stage 00 transaction: {journal_path}")
+    transaction_id = str(journal.get("transaction_id", ""))
+    committed_id = str(
+        state.get("stage00_build", {}).get("last_committed_transaction", "")
+    )
+    cleanup_key = (
+        "obsolete_files" if transaction_id == committed_id else "created_files"
+    )
+    for rel_path in journal.get(cleanup_key, []):
+        (output_dir / str(rel_path)).unlink(missing_ok=True)
+    journal_path.unlink(missing_ok=True)
+
+
+def _sync_topology_markers(output_dir: Path, state: dict[str, Any]) -> None:
+    expected: set[Path] = set()
+    tree_dir = output_dir / TREE_DIR_NAME
+    for node in state.get("nodes", []):
+        if not bool(node.get("lower_mag_limited", False)):
+            continue
+        directory = tree_dir
+        for octant in node.get("path_octants", []):
+            directory = directory / f"o={int(octant)}"
+        expected.add(directory / LOWER_MAG_LIMITED_MARKER)
+    if tree_dir.exists():
+        for path in tree_dir.rglob(LOWER_MAG_LIMITED_MARKER):
+            if path not in expected:
+                path.unlink()
+    for path in expected:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text("lower-mag-limited\n", encoding="utf-8")
+
+
+def _checkpoint_stage00_group_checksums(
+    config: Stage00Config,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    state_path = config.output_dir / STAGE_STATE_NAME
+    groups = list(state.get("stage00_groups", []))
+    checkpointed = _load_stage00_checksum_checkpoints(
+        config.output_dir,
+        groups,
+    )
+    for group in groups:
+        checkpoint_checksum = checkpointed.get(str(group["key"]))
+        if checkpoint_checksum is not None:
+            group["checksum"] = checkpoint_checksum
+            group["content_checksum"] = checkpoint_checksum
+        if group.get("content_checksum") is not None:
+            continue
+        paths = [config.output_dir / str(value) for value in group.get("files", [])]
+        checksum, row_count = _stage00_group_checksum(paths)
+        _ensure_equal_row_count(
+            before=int(group["row_count"]),
+            after=row_count,
+            context=f"checksumming group {group['key']}",
+        )
+        group["checksum"] = checksum
+        group["content_checksum"] = checksum
+        _write_stage00_checksum_checkpoint(
+            config.output_dir,
+            group=group,
+            checksum=checksum,
+        )
+    state["stage00_groups"] = groups
+    state["dirty"] = _initial_dirty_state()
+    state["stage00_build"]["status"] = "complete"
+    _atomic_write_json(state_path, state)
+    shutil.rmtree(
+        config.output_dir / STAGE00_CHECKSUM_DIR,
+        ignore_errors=True,
+    )
+    return state
+
+
+def _stage00_checksum_checkpoint_path(output_dir: Path, key: str) -> Path:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return output_dir / STAGE00_CHECKSUM_DIR / f"{digest}.json"
+
+
+def _write_stage00_checksum_checkpoint(
+    output_dir: Path,
+    *,
+    group: dict[str, Any],
+    checksum: str,
+) -> None:
+    _atomic_write_json(
+        _stage00_checksum_checkpoint_path(output_dir, str(group["key"])),
+        {
+            "format": STAGE00_CHECKSUM_FORMAT,
+            "key": group["key"],
+            "files": list(group.get("files", [])),
+            "row_count": int(group["row_count"]),
+            "content_checksum": checksum,
+        },
+    )
+
+
+def _load_stage00_checksum_checkpoints(
+    output_dir: Path,
+    groups: list[dict[str, Any]],
+) -> dict[str, str]:
+    expected = {str(group["key"]): group for group in groups}
+    checkpoint_dir = output_dir / STAGE00_CHECKSUM_DIR
+    out: dict[str, str] = {}
+    if not checkpoint_dir.is_dir():
+        return out
+    for path in sorted(checkpoint_dir.glob("*.json")):
+        try:
+            raw = _read_json(path)
+            key = str(raw["key"])
+            group = expected[key]
+            if raw.get("format") != STAGE00_CHECKSUM_FORMAT:
+                raise ValueError("unsupported checksum checkpoint format")
+            if raw.get("files") != group.get("files"):
+                raise ValueError("checksum checkpoint files changed")
+            if int(raw.get("row_count", -1)) != int(group["row_count"]):
+                raise ValueError("checksum checkpoint row count changed")
+            checksum = str(raw["content_checksum"])
+            if not checksum.startswith("sha256:"):
+                raise ValueError("invalid checksum checkpoint digest")
+            out[key] = checksum
+        except (KeyError, OSError, TypeError, ValueError):
+            path.unlink(missing_ok=True)
+    return out
 
 
 def _next_fragment_sequence(paths: set[Path]) -> int:

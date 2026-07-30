@@ -100,6 +100,7 @@ def _clear_stage01_dirty(output_dir: Path) -> None:
     state = json.loads(state_path.read_text(encoding="utf-8"))
     state["dirty"]["stage01_groups"] = []
     state["dirty"]["deleted_stage00_groups"] = []
+    state["dirty"]["stage01_all"] = False
     state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 
 
@@ -175,11 +176,11 @@ def test_stage00_writes_tree_manifest_and_state(tmp_path: Path) -> None:
         state["stage00_groups"][0]["checksum"]
         == report["groups"][0]["content_checksum"]
     )
-    assert state["dirty"]["stage01_groups"] == [
-        group["key"] for group in report["groups"]
-    ]
+    assert state["dirty"]["stage01_all"] is True
+    assert state["dirty"]["stage01_groups"] == []
     assert state["dirty"]["deleted_stage00_groups"] == []
-    assert state["dirty"]["stage03_nodes"] == []
+    assert state["dirty"]["stage03"] == {"mode": "clean"}
+    assert state["stage00_build"]["status"] == "complete"
 
 
 def test_stage00_fails_hard_without_required_routing_columns(
@@ -205,7 +206,10 @@ def test_stage00_fails_hard_without_required_routing_columns(
 
     with pytest.raises(ValueError, match="missing required routing columns"):
         run_stage00(config)
-    assert not (out_dir / "stage-state.json").exists()
+    state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
+    assert state["stage00_build"]["status"] == "in_progress"
+    assert state["stage00_build"]["completed_shards"] == []
+    assert (out_dir / ".stage00-transaction.json").is_file()
 
 
 def test_stage00_explicit_raw_filter_preserves_row_count_and_records_filter(
@@ -973,6 +977,142 @@ def test_stage00_replace_rejects_invalid_modes_and_identity_mismatch(
                 replace_shards=True,
             )
         )
+
+
+def test_stage00_resumes_after_uncommitted_shard_split(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_root = tmp_path / "input"
+    _write_stage00_pixel(
+        input_root,
+        "100",
+        [
+            {
+                "source": "gaia",
+                "source_id": "a",
+                "morton_code": _morton_for_node(1, 0),
+                "level": 1,
+                "mag_abs": 7.0,
+            }
+        ],
+    )
+    _write_stage00_pixel(
+        input_root,
+        "101",
+        [
+            {
+                "source": "gaia",
+                "source_id": "b",
+                "morton_code": _morton_for_node(1, 1),
+                "level": 1,
+                "mag_abs": 7.1,
+            }
+        ],
+    )
+    out_dir = tmp_path / "stage00"
+    config = _stage00_config(input_root, out_dir, bucket_size=2)
+    original = stage00_module._process_input_shards
+    failed = False
+
+    def fail_after_second_shard(*args, **kwargs):
+        nonlocal failed
+        result = original(*args, **kwargs)
+        input_shards = args[1]
+        if input_shards[0].shard_id == "101" and not failed:
+            failed = True
+            raise RuntimeError("simulated interruption")
+        return result
+
+    monkeypatch.setattr(
+        stage00_module,
+        "_process_input_shards",
+        fail_after_second_shard,
+    )
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        run_stage00(config)
+
+    state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
+    assert state["stage00_build"]["completed_shards"] == ["100"]
+    committed_path = out_dir / state["stage00_groups"][0]["files"][0]
+    assert committed_path.is_file()
+    assert (out_dir / ".stage00-transaction.json").is_file()
+
+    monkeypatch.setattr(stage00_module, "_process_input_shards", original)
+    report_path = run_stage00(config)
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
+    assert report["rows_current"] == 2
+    assert report["lower_mag_limited_nodes"] == 1
+    assert state["stage00_build"]["status"] == "complete"
+    assert state["stage00_build"]["completed_shards"] == ["100", "101"]
+    assert not (out_dir / ".stage00-transaction.json").exists()
+    assert not committed_path.exists()
+
+
+def test_stage00_resumes_group_checksums(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_root = tmp_path / "input"
+    for shard_id, node_id in (("100", 0), ("101", 1)):
+        _write_stage00_pixel(
+            input_root,
+            shard_id,
+            [
+                {
+                    "source": "gaia",
+                    "source_id": shard_id,
+                    "morton_code": _morton_for_node(1, node_id),
+                    "level": 1,
+                    "mag_abs": 7.0,
+                }
+            ],
+        )
+    out_dir = tmp_path / "stage00"
+    config = _stage00_config(input_root, out_dir)
+    original = stage00_module._stage00_group_checksum
+    calls = 0
+
+    def fail_on_second_group(paths):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("checksum interruption")
+        return original(paths)
+
+    monkeypatch.setattr(
+        stage00_module,
+        "_stage00_group_checksum",
+        fail_on_second_group,
+    )
+    with pytest.raises(RuntimeError, match="checksum interruption"):
+        run_stage00(config)
+
+    state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
+    assert state["stage00_build"]["status"] == "checksumming"
+    checkpoints = list((out_dir / ".stage00-checksums").glob("*.json"))
+    assert len(checkpoints) == 1
+
+    resumed_calls = 0
+
+    def count_resumed_group(paths):
+        nonlocal resumed_calls
+        resumed_calls += 1
+        return original(paths)
+
+    monkeypatch.setattr(
+        stage00_module,
+        "_stage00_group_checksum",
+        count_resumed_group,
+    )
+    run_stage00(config)
+
+    state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
+    assert resumed_calls == 1
+    assert state["stage00_build"]["status"] == "complete"
+    assert all("content_checksum" in group for group in state["stage00_groups"])
 
 
 def test_stage00_help_contains_packed_options() -> None:

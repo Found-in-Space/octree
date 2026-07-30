@@ -90,6 +90,10 @@ Current direction:
   the configured row cap.
 - Preserve enough input shard identity that one shard can be deleted and
   rebuilt without rewriting unrelated shards.
+- Commit initial builds after each input shard through a write-ahead fragment
+  journal. A restart rolls back only the uncommitted shard.
+- Checkpoint semantic checksums per group so the final validation pass can
+  resume without re-reading groups already verified.
 
 ## Stage 01: Sort And Pack
 
@@ -110,7 +114,12 @@ Current direction:
   normal row or uncompressed-byte limits through a disk-backed DuckDB external
   sort with bounded memory.
 - Use atomic temp files and renames for rewritten fragments.
-- Track fragment state in the stage-state manifest.
+- Write one small recovery checkpoint per completed group, then consolidate the
+  main stage-state manifest once at completion.
+- Store only bounded group summaries such as `natural_max_level`; do not store
+  occupied final-node arrays in shared JSON state.
+- Use a bounded `clean`/`all` downstream invalidation flag until Stage 03 owns a
+  disk-backed profile-specific invalidation index.
 - Use filename markers as an optimization, for example `unsorted`, `sorted`, or
   `packed`, while still validating against manifests.
 

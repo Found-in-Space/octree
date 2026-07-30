@@ -96,7 +96,8 @@ def _stage01_config(
 def _clear_stage03_dirty(stage00_dir: Path) -> None:
     state_path = stage00_dir / "stage-state.json"
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    state["dirty"]["stage03_nodes"] = []
+    state["dirty"].pop("stage03_nodes", None)
+    state["dirty"]["stage03"] = {"mode": "clean"}
     state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 
 
@@ -154,19 +155,53 @@ def test_stage01_first_run_writes_sorted_groups_and_state(tmp_path: Path) -> Non
     assert len(files) == 2
     assert report["processed_group_count"] == 1
     assert report["changed_group_count"] == 1
-    assert report["dirty_stage03_node_count"] == 3
+    assert report["dirty_stage03_mode"] == "all"
+    assert report["dirty_stage03_node_count"] == 0
     assert report["in_memory_sort_group_count"] == 1
     assert report["external_sort_group_count"] == 0
     assert state["dirty"]["stage01_groups"] == []
     assert state["dirty"]["deleted_stage00_groups"] == []
-    assert state["dirty"]["stage03_nodes"] == ["0:0", "1:0", "1:1"]
+    assert state["dirty"]["stage03"]["mode"] == "all"
     assert state["stage01_groups"][0]["files"] == [
         path.relative_to(stage01_dir).as_posix() for path in files
     ]
-    assert state["stage01_groups"][0]["final_nodes"] == ["0:0", "1:0", "1:1"]
+    assert state["stage01_groups"][0]["natural_max_level"] == 1
+    assert "final_nodes" not in state["stage01_groups"][0]
 
 
-def test_stage01_dirty_only_changed_group_marks_stage03_nodes(
+def test_stage01_all_rebuilds_existing_groups(tmp_path: Path) -> None:
+    input_root = tmp_path / "input"
+    _write_stage00_pixel(
+        input_root,
+        "100",
+        [
+            {
+                "source": "gaia",
+                "source_id": "a",
+                "morton_code": _morton_for_node(1, 0),
+                "level": 1,
+                "mag_abs": 7.0,
+            }
+        ],
+    )
+    stage00_dir = tmp_path / "stage00"
+    stage01_dir = tmp_path / "stage01"
+    run_stage00(_stage00_config(input_root, stage00_dir))
+    run_stage01(_stage01_config(stage00_dir, stage01_dir))
+
+    state_path = stage00_dir / "stage-state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["dirty"]["stage01_all"] = True
+    state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+    report_path = run_stage01(_stage01_config(stage00_dir, stage01_dir))
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["processed_group_count"] == 1
+    assert report["unchanged_group_count"] == 1
+
+
+def test_stage01_dirty_only_changed_group_marks_stage03_all(
     tmp_path: Path,
 ) -> None:
     input_root = tmp_path / "input"
@@ -235,7 +270,7 @@ def test_stage01_dirty_only_changed_group_marks_stage03_nodes(
     assert report["processed_group_count"] == 1
     assert report["changed_group_count"] == 1
     assert report["unchanged_group_count"] == 0
-    assert state["dirty"]["stage03_nodes"] == ["1:0"]
+    assert state["dirty"]["stage03"]["mode"] == "all"
     assert unchanged_file.stat().st_mtime_ns == unchanged_mtime
 
 
@@ -329,7 +364,7 @@ def test_stage01_processes_dirty_groups_accumulated_across_replacements(
     assert report["processed_group_count"] == 2
     assert report["changed_group_count"] == 2
     assert state["dirty"]["stage01_groups"] == []
-    assert state["dirty"]["stage03_nodes"] == ["1:0", "1:1"]
+    assert state["dirty"]["stage03"]["mode"] == "all"
     assert pq.read_table(
         next((stage01_dir / "tree").glob("shard-100-pack-sorted-*.parquet"))
     ).column("source_id").to_pylist() == ["a-changed"]
@@ -371,7 +406,7 @@ def test_stage01_unchanged_replacement_processes_no_groups(tmp_path: Path) -> No
     state = json.loads((stage00_dir / "stage-state.json").read_text(encoding="utf-8"))
     assert report["processed_group_count"] == 0
     assert report["changed_group_count"] == 0
-    assert state["dirty"]["stage03_nodes"] == []
+    assert state["dirty"]["stage03"] == {"mode": "clean"}
 
 
 def test_stage01_deleted_group_removes_sorted_files_and_dirties_old_nodes(
@@ -423,7 +458,7 @@ def test_stage01_deleted_group_removes_sorted_files_and_dirties_old_nodes(
     state = json.loads((stage00_dir / "stage-state.json").read_text(encoding="utf-8"))
     assert report["deleted_group_count"] == 1
     assert not any(path.exists() for path in deleted_files)
-    assert state["dirty"]["stage03_nodes"] == ["1:0"]
+    assert state["dirty"]["stage03"]["mode"] == "all"
     assert {group["key"] for group in state["stage01_groups"]} == {"|200|lim"}
 
 
@@ -631,3 +666,107 @@ def test_stage01_external_sort_ignores_hive_node_directories(
         for rel_path in group["files"]:
             schema = pq.read_schema(stage01_dir / rel_path)
             assert "o" not in schema.names
+
+
+def test_stage01_resumes_after_completed_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_root = tmp_path / "input"
+    for shard_id, node_id in (("100", 0), ("101", 1)):
+        _write_stage00_pixel(
+            input_root,
+            shard_id,
+            [
+                {
+                    "source": "gaia",
+                    "source_id": shard_id,
+                    "morton_code": _morton_for_node(1, node_id),
+                    "level": 1,
+                    "mag_abs": 7.0,
+                }
+            ],
+        )
+    stage00_dir = tmp_path / "stage00"
+    stage01_dir = tmp_path / "stage01"
+    run_stage00(_stage00_config(input_root, stage00_dir))
+    original = stage01_module._prepare_sorted_group
+    calls = 0
+
+    def fail_on_second_group(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated Stage 01 interruption")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        stage01_module,
+        "_prepare_sorted_group",
+        fail_on_second_group,
+    )
+    with pytest.raises(RuntimeError, match="Stage 01 interruption"):
+        run_stage01(_stage01_config(stage00_dir, stage01_dir))
+
+    state = json.loads((stage00_dir / "stage-state.json").read_text(encoding="utf-8"))
+    assert state["stage01_build"]["status"] == "in_progress"
+    assert state.get("stage01_groups", []) == []
+    checkpoints = list((stage01_dir / ".stage01-checkpoints").glob("*.json"))
+    assert len(checkpoints) == 1
+    completed_file = next(
+        (stage01_dir / "tree").glob("shard-100-pack-sorted-*.parquet")
+    )
+    completed_mtime = completed_file.stat().st_mtime_ns
+
+    monkeypatch.setattr(stage01_module, "_prepare_sorted_group", original)
+    report_path = run_stage01(_stage01_config(stage00_dir, stage01_dir))
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    state = json.loads((stage00_dir / "stage-state.json").read_text(encoding="utf-8"))
+    assert report["processed_group_count"] == 1
+    assert report["resumed"] is True
+    assert state["stage01_build"]["status"] == "complete"
+    assert len(state["stage01_groups"]) == 2
+    assert completed_file.stat().st_mtime_ns == completed_mtime
+
+
+def test_stage01_state_does_not_enumerate_final_nodes(tmp_path: Path) -> None:
+    input_root = tmp_path / "input"
+    rows = [
+        {
+            "source": "gaia",
+            "source_id": str(node_id),
+            "morton_code": _morton_for_node(8, node_id),
+            "level": 8,
+            "mag_abs": 10.0,
+        }
+        for node_id in range(256)
+    ]
+    _write_stage00_pixel(input_root, "100", rows)
+    stage00_dir = tmp_path / "stage00"
+    stage01_dir = tmp_path / "stage01"
+    run_stage00(
+        _stage00_config(
+            input_root,
+            stage00_dir,
+            bucket_size=10_000,
+            fragment_target_rows=1_000,
+        )
+    )
+    run_stage01(
+        _stage01_config(
+            stage00_dir,
+            stage01_dir,
+            bucket_size=10_000,
+            fragment_target_rows=1_000,
+        )
+    )
+
+    state_path = stage00_dir / "stage-state.json"
+    state_text = state_path.read_text(encoding="utf-8")
+    state = json.loads(state_text)
+    assert len(state_text) < 20_000
+    assert "final_nodes" not in state_text
+    assert "stage03_nodes" not in state_text
+    assert state["stage01_groups"][0]["natural_max_level"] == 8
+    assert state["dirty"]["stage03"]["mode"] == "all"

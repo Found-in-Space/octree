@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import shutil
 from collections.abc import Iterable
@@ -51,6 +52,9 @@ REPORT_NAME = "stage01-report.json"
 STAGE01_IN_MEMORY_MAX_ROWS = 1_000_000
 STAGE01_IN_MEMORY_MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 STAGE01_EXTERNAL_SORT_MEMORY_LIMIT = "512MB"
+STAGE01_BUILD_FORMAT = "foundinspace.octree.stage01-build/v1"
+STAGE01_CHECKPOINT_FORMAT = "foundinspace.octree.stage01-checkpoint/v1"
+STAGE01_CHECKPOINT_DIR = ".stage01-checkpoints"
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,7 +84,7 @@ class _PreparedSortedGroup:
     files: tuple[Path, ...]
     row_count: int
     checksum: str
-    final_nodes: tuple[str, ...]
+    natural_max_level: int | None
     external_sort: bool
 
 
@@ -100,40 +104,61 @@ def run_stage01(config: Stage01Config) -> Path:
 
     if config.force and config.output_dir.exists():
         shutil.rmtree(config.output_dir)
-    if (
-        not config.force
-        and not state.get("stage01_groups")
-        and config.output_dir.exists()
-        and any(config.output_dir.iterdir())
-    ):
-        raise FileExistsError(
-            f"Output directory is not empty: {config.output_dir}. Use --force to replace it."
-        )
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    _delete_stale_stage01_temp_files(config.output_dir)
 
     stage00_groups = {group["key"]: group for group in state.get("stage00_groups", [])}
-    existing_stage01_groups = {
-        group["key"]: group for group in state.get("stage01_groups", [])
+    baseline_stage01_groups = {
+        group["key"]: _bounded_stage01_group_state(group)
+        for group in state.get("stage01_groups", [])
     }
     if config.force:
-        existing_stage01_groups = {}
-    dirty = state.get("dirty", {})
-    deleted_keys = sorted(str(key) for key in dirty.get("deleted_stage00_groups", []))
+        baseline_stage01_groups = {}
+        state["stage01_groups"] = []
+    (
+        checkpoint_groups,
+        checkpoint_deleted_keys,
+        checkpoint_stage03_dirty,
+    ) = _load_stage01_checkpoints(config.output_dir, stage00_groups)
+    existing_stage01_groups = dict(baseline_stage01_groups)
+    existing_stage01_groups.update(checkpoint_groups)
+    for key in checkpoint_deleted_keys:
+        existing_stage01_groups.pop(key, None)
+    dirty = _normalized_dirty_state(state)
+    if checkpoint_stage03_dirty:
+        _mark_stage03_all(dirty, reason="resumed_stage01_checkpoint")
     if config.force or not existing_stage01_groups:
-        target_keys = sorted(stage00_groups)
-    else:
-        target_keys = sorted(
-            key for key in dirty.get("stage01_groups", []) if key in stage00_groups
-        )
+        dirty["stage01_all"] = True
+    deleted_keys = sorted(
+        str(key)
+        for key in dirty["deleted_stage00_groups"]
+        if str(key) not in checkpoint_deleted_keys
+    )
+    explicit_dirty_keys = {
+        str(key)
+        for key in dirty["stage01_groups"]
+        if key in stage00_groups and str(key) not in checkpoint_groups
+    }
+    if dirty["stage01_all"]:
+        explicit_dirty_keys.update(set(stage00_groups) - set(checkpoint_groups))
+    missing_keys = set(stage00_groups) - set(existing_stage01_groups)
+    target_keys = sorted(explicit_dirty_keys | missing_keys)
 
-    dirty_stage03_nodes: set[str] = {str(v) for v in dirty.get("stage03_nodes", [])}
     deleted_count = 0
     for key in deleted_keys:
         old_group = existing_stage01_groups.pop(key, None)
         if old_group is None:
             continue
         _delete_stage01_group_files(config.output_dir, old_group)
-        dirty_stage03_nodes.update(str(v) for v in old_group.get("final_nodes", []))
+        _mark_stage03_all(dirty, reason="stage01_group_deleted")
+        _write_stage01_checkpoint(
+            config.output_dir,
+            key=key,
+            input_checksum=None,
+            group=None,
+            changed=True,
+        )
+        checkpoint_deleted_keys.add(key)
         deleted_count += 1
 
     processed = 0
@@ -143,14 +168,18 @@ def run_stage01(config: Stage01Config) -> Path:
     files_written = 0
     in_memory_sort_groups = 0
     external_sort_groups = 0
-    next_stage01_groups = dict(existing_stage01_groups)
+    resumed = bool(
+        state.get("stage01_build", {}).get("status") == "in_progress"
+        or checkpoint_groups
+        or checkpoint_deleted_keys
+    )
+    _checkpoint_stage01_state(state_path, state, status="in_progress")
 
     for key in target_keys:
         stage00_group = stage00_groups[key]
-        old_group = existing_stage01_groups.get(key)
+        old_group = baseline_stage01_groups.get(key)
         prepared = _prepare_sorted_group(config, stage00_group)
         checksum = prepared.checksum
-        final_nodes = list(prepared.final_nodes)
         new_files = list(prepared.files)
         if old_group is not None:
             _delete_stage01_group_files(config.output_dir, old_group)
@@ -163,36 +192,52 @@ def run_stage01(config: Stage01Config) -> Path:
         group_changed = old_group is None or old_group.get("checksum") != checksum
         if group_changed:
             changed += 1
-            dirty_stage03_nodes.update(final_nodes)
-            if old_group is not None:
-                dirty_stage03_nodes.update(
-                    str(v) for v in old_group.get("final_nodes", [])
-                )
+            _mark_stage03_all(dirty, reason="stage01_group_changed")
         else:
             unchanged += 1
 
-        next_stage01_groups[key] = _stage01_group_state(
+        existing_stage01_groups[key] = _stage01_group_state(
             stage00_group,
             files=[
                 path.relative_to(config.output_dir).as_posix() for path in new_files
             ],
             row_count=prepared.row_count,
             checksum=checksum,
-            final_nodes=final_nodes,
+            natural_max_level=prepared.natural_max_level,
+        )
+        _write_stage01_checkpoint(
+            config.output_dir,
+            key=key,
+            input_checksum=str(stage00_group["content_checksum"]),
+            group=existing_stage01_groups[key],
+            changed=group_changed,
+        )
+        _delete_untracked_stage01_group_files(
+            config,
+            stage00_group,
+            keep=set(new_files),
         )
         processed += 1
         rows_written += prepared.row_count
         files_written += len(new_files)
 
-    state["stage01_groups"] = [
-        next_stage01_groups[key] for key in sorted(next_stage01_groups)
-    ]
-    state["dirty"] = {
-        "stage01_groups": [],
-        "deleted_stage00_groups": [],
-        "stage03_nodes": sorted(dirty_stage03_nodes, key=_final_node_sort_key),
-    }
-    _atomic_write_json(state_path, state)
+    remaining_keys = set(stage00_groups) - set(existing_stage01_groups)
+    if remaining_keys:
+        raise ValueError(
+            "Stage 01 checkpoint is incomplete after processing: "
+            f"{len(remaining_keys)} group(s) remain"
+        )
+    dirty["stage01_all"] = False
+    dirty["stage01_groups"] = []
+    dirty["deleted_stage00_groups"] = []
+    state["stage01_groups"] = _sorted_group_state(existing_stage01_groups)
+    _checkpoint_stage01_state(state_path, state, status="complete")
+    _delete_untracked_stage01_files(config.output_dir, state["stage01_groups"])
+    shutil.rmtree(
+        config.output_dir / STAGE01_CHECKPOINT_DIR,
+        ignore_errors=True,
+    )
+    dirty_stage03_mode = str(dirty["stage03"]["mode"])
 
     report = {
         "format": STAGE01_FORMAT,
@@ -204,6 +249,7 @@ def run_stage01(config: Stage01Config) -> Path:
         "sort_key": STAGE01_SORT_KEY,
         "group_checksum_algorithm": STAGE01_GROUP_CHECKSUM_ALGORITHM,
         "force": config.force,
+        "resumed": resumed,
         "processed_group_count": processed,
         "changed_group_count": changed,
         "unchanged_group_count": unchanged,
@@ -213,7 +259,8 @@ def run_stage01(config: Stage01Config) -> Path:
         "rows_written": rows_written,
         "in_memory_sort_group_count": in_memory_sort_groups,
         "external_sort_group_count": external_sort_groups,
-        "dirty_stage03_node_count": len(dirty_stage03_nodes),
+        "dirty_stage03_mode": dirty_stage03_mode,
+        "dirty_stage03_node_count": 0,
     }
     report_path = config.output_dir / REPORT_NAME
     _atomic_write_json(report_path, report)
@@ -243,6 +290,9 @@ def _validate_stage00_identity(
         )
     if state.get("tree_identity") != existing:
         raise ValueError("Stage 00 state identity does not match tree manifest")
+    stage00_build = state.get("stage00_build")
+    if isinstance(stage00_build, dict) and stage00_build.get("status") != "complete":
+        raise ValueError("Stage 01 requires a complete Stage 00 checkpoint")
 
 
 def _prepare_sorted_group(
@@ -255,13 +305,12 @@ def _prepare_sorted_group(
     if _should_sort_in_memory(config, stats):
         sorted_table = _sorted_stage00_group_files(files)
         checksum = _stage01_group_checksum(sorted_table)
-        final_nodes = _final_node_keys(sorted_table)
         output_files = _write_sorted_group(config, group, sorted_table)
         return _PreparedSortedGroup(
             files=tuple(output_files),
             row_count=len(sorted_table),
             checksum=checksum,
-            final_nodes=tuple(final_nodes),
+            natural_max_level=_natural_max_level(sorted_table),
             external_sort=False,
         )
     return _externally_sort_stage00_group(
@@ -365,21 +414,11 @@ def _final_node_id_array(table: pa.Table) -> np.ndarray:
     return out
 
 
-def _final_node_keys(table: pa.Table) -> list[str]:
+def _natural_max_level(table: pa.Table) -> int | None:
     if len(table) == 0:
-        return []
+        return None
     levels = np.asarray(table.column("level"), dtype=np.int32)
-    final_node_ids = _final_node_id_array(table)
-    keys = {
-        f"{int(level)}:{int(node_id)}"
-        for level, node_id in zip(levels, final_node_ids, strict=True)
-    }
-    return sorted(keys, key=_final_node_sort_key)
-
-
-def _final_node_sort_key(value: str) -> tuple[int, int]:
-    level, node_id = str(value).split(":", 1)
-    return int(level), int(node_id)
+    return int(levels.max())
 
 
 def _stage01_group_checksum(table: pa.Table) -> str:
@@ -475,8 +514,7 @@ def _write_externally_sorted_batches(
     expected_schema: pa.Schema,
 ) -> _PreparedSortedGroup:
     output_files: list[Path] = []
-    final_nodes: list[str] = []
-    last_final_node: str | None = None
+    natural_max_level: int | None = None
     checksum = ArrowIpcChecksum(expected_schema)
     writer: pq.ParquetWriter | None = None
     writer_rows = 0
@@ -497,10 +535,13 @@ def _write_externally_sorted_batches(
                 table = table.cast(expected_schema)
             table = table.replace_schema_metadata(None)
             checksum.update(table)
-            for final_node in _final_node_keys(table):
-                if final_node != last_final_node:
-                    final_nodes.append(final_node)
-                    last_final_node = final_node
+            batch_max_level = _natural_max_level(table)
+            if batch_max_level is not None:
+                natural_max_level = (
+                    batch_max_level
+                    if natural_max_level is None
+                    else max(natural_max_level, batch_max_level)
+                )
             row_count += len(table)
             offset = 0
             while offset < len(table):
@@ -536,7 +577,7 @@ def _write_externally_sorted_batches(
             files=tuple(output_files),
             row_count=row_count,
             checksum=digest,
-            final_nodes=tuple(final_nodes),
+            natural_max_level=natural_max_level,
             external_sort=True,
         )
     except Exception:
@@ -610,7 +651,7 @@ def _stage01_group_state(
     files: list[str],
     row_count: int,
     checksum: str,
-    final_nodes: list[str],
+    natural_max_level: int | None,
 ) -> dict[str, Any]:
     return {
         "key": stage00_group["key"],
@@ -625,5 +666,152 @@ def _stage01_group_state(
         "row_count": row_count,
         "checksum": checksum,
         "sorted_checksum": checksum,
-        "final_nodes": final_nodes,
+        "natural_max_level": natural_max_level,
     }
+
+
+def _bounded_stage01_group_state(group: dict[str, Any]) -> dict[str, Any]:
+    bounded = dict(group)
+    legacy_nodes = bounded.pop("final_nodes", [])
+    if bounded.get("natural_max_level") is None and legacy_nodes:
+        bounded["natural_max_level"] = max(
+            int(str(node).split(":", 1)[0]) for node in legacy_nodes
+        )
+    return bounded
+
+
+def _normalized_dirty_state(state: dict[str, Any]) -> dict[str, Any]:
+    raw = state.setdefault("dirty", {})
+    legacy_nodes = raw.pop("stage03_nodes", [])
+    stage03 = raw.get("stage03")
+    if not isinstance(stage03, dict) or stage03.get("mode") not in {"clean", "all"}:
+        stage03 = {"mode": "all" if legacy_nodes else "clean"}
+    elif legacy_nodes:
+        stage03 = {"mode": "all", "reason": "legacy_stage03_nodes"}
+    raw["stage03"] = stage03
+    raw["stage01_groups"] = list(raw.get("stage01_groups", []))
+    raw["deleted_stage00_groups"] = list(raw.get("deleted_stage00_groups", []))
+    raw["stage01_all"] = bool(raw.get("stage01_all", False))
+    return raw
+
+
+def _mark_stage03_all(dirty: dict[str, Any], *, reason: str) -> None:
+    dirty["stage03"] = {"mode": "all", "reason": reason}
+
+
+def _sorted_group_state(groups: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    return [groups[key] for key in sorted(groups)]
+
+
+def _checkpoint_stage01_state(
+    state_path: Path,
+    state: dict[str, Any],
+    *,
+    status: str,
+) -> None:
+    state["stage01_build"] = {
+        "format": STAGE01_BUILD_FORMAT,
+        "status": status,
+    }
+    _atomic_write_json(state_path, state)
+
+
+def _stage01_checkpoint_path(output_dir: Path, key: str) -> Path:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return output_dir / STAGE01_CHECKPOINT_DIR / f"{digest}.json"
+
+
+def _write_stage01_checkpoint(
+    output_dir: Path,
+    *,
+    key: str,
+    input_checksum: str | None,
+    group: dict[str, Any] | None,
+    changed: bool,
+) -> None:
+    _atomic_write_json(
+        _stage01_checkpoint_path(output_dir, key),
+        {
+            "format": STAGE01_CHECKPOINT_FORMAT,
+            "key": key,
+            "input_checksum": input_checksum,
+            "deleted": group is None,
+            "changed": changed,
+            "group": group,
+        },
+    )
+
+
+def _load_stage01_checkpoints(
+    output_dir: Path,
+    stage00_groups: dict[str, dict[str, Any]],
+) -> tuple[dict[str, dict[str, Any]], set[str], bool]:
+    checkpoint_dir = output_dir / STAGE01_CHECKPOINT_DIR
+    groups: dict[str, dict[str, Any]] = {}
+    deleted_keys: set[str] = set()
+    stage03_dirty = False
+    if not checkpoint_dir.is_dir():
+        return groups, deleted_keys, stage03_dirty
+    for path in sorted(checkpoint_dir.glob("*.json")):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if raw.get("format") != STAGE01_CHECKPOINT_FORMAT:
+                raise ValueError("unsupported checkpoint format")
+            key = str(raw["key"])
+            if bool(raw.get("deleted", False)):
+                if key in stage00_groups:
+                    raise ValueError("deleted checkpoint has a current Stage 00 group")
+                deleted_keys.add(key)
+            else:
+                stage00_group = stage00_groups.get(key)
+                if stage00_group is None:
+                    raise ValueError("checkpoint input group no longer exists")
+                if raw.get("input_checksum") != stage00_group.get("content_checksum"):
+                    raise ValueError("checkpoint input checksum changed")
+                group = raw.get("group")
+                if not isinstance(group, dict):
+                    raise ValueError("checkpoint group is missing")
+                for rel_path in group.get("files", []):
+                    if not (output_dir / str(rel_path)).is_file():
+                        raise ValueError("checkpoint output file is missing")
+                groups[key] = group
+            stage03_dirty = stage03_dirty or bool(raw.get("changed", False))
+        except (KeyError, OSError, TypeError, ValueError):
+            path.unlink(missing_ok=True)
+    return groups, deleted_keys, stage03_dirty
+
+
+def _delete_stale_stage01_temp_files(output_dir: Path) -> None:
+    for path in output_dir.rglob(".*.tmp"):
+        if path.is_file():
+            path.unlink()
+
+
+def _delete_untracked_stage01_group_files(
+    config: Stage01Config,
+    group: dict[str, Any],
+    *,
+    keep: set[Path],
+) -> None:
+    first = _sorted_fragment_path(config, group, 1)
+    prefix = first.name.rsplit("000001.parquet", 1)[0]
+    for path in first.parent.glob(f"{prefix}*.parquet"):
+        if path not in keep:
+            path.unlink()
+
+
+def _delete_untracked_stage01_files(
+    output_dir: Path,
+    groups: list[dict[str, Any]],
+) -> None:
+    referenced = {
+        output_dir / str(rel_path)
+        for group in groups
+        for rel_path in group.get("files", [])
+    }
+    tree_dir = output_dir / TREE_DIR_NAME
+    if not tree_dir.exists():
+        return
+    for path in tree_dir.rglob("*-sorted-*.parquet"):
+        if path not in referenced:
+            path.unlink()

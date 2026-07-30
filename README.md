@@ -39,12 +39,26 @@ across parquet fragment boundaries. Their memory use therefore does not grow
 with an outlier group, and parquet metadata or different fragment boundaries do
 not change the semantic checksum.
 
+Initial Stage 00 builds commit after every upstream input shard. A small
+write-ahead journal tracks newly created and superseded fragments, so restart
+either rolls back an uncommitted shard or finishes cleanup for a committed one.
+The final checksum pass uses per-group checkpoint records and resumes without
+rehashing completed groups.
+
 Stage 01 keeps the existing in-memory Arrow sort for ordinary groups. Groups
 above the normal row or uncompressed-byte limits automatically use DuckDB's
 disk-backed external sort instead. The fallback respects the `DUCKDB_MEMORY_LIMIT`,
 `DUCKDB_TEMP_DIR`, and `DUCKDB_MAX_TEMP_DIRECTORY_SIZE` settings; without an
 explicit memory limit it uses a bounded 512 MB default. The Stage 01 report and
-CLI summary show how many groups used each path.
+CLI summary show how many groups used each path. Each completed group gets a
+small independent checkpoint; the main state is consolidated once at
+completion, avoiding repeated rewrites of a growing global manifest.
+
+Stage 01 state stores only each group's scalar `natural_max_level`. It does not
+enumerate occupied final nodes. Downstream invalidation is currently a bounded
+`clean`/`all` flag; selective profile invalidation can later be represented in a
+profile-specific disk-backed manifest without making the shared JSON state grow
+with the star count.
 
 Stage 00 calculates only the routing fields (`morton_code` and natural
 `level`) from raw Cartesian input. Stage 01 preserves the raw position,

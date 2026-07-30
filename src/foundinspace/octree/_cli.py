@@ -272,7 +272,7 @@ def stage_01(
         f"deleted_groups={report['deleted_group_count']:,}, "
         f"in_memory_sorts={report['in_memory_sort_group_count']:,}, "
         f"external_sorts={report['external_sort_group_count']:,}, "
-        f"dirty_stage03_nodes={report['dirty_stage03_node_count']:,}, "
+        f"dirty_stage03={report['dirty_stage03_mode']}, "
         f"files_written={report['output_files_written']:,}"
     )
     click.echo(f"Stage 01 report written to {report_path}")
