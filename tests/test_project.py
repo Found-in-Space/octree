@@ -76,6 +76,7 @@ def test_load_project_resolves_relative_paths_from_project_file_dir(
     assert project.stage00.max_open_writers == 128
     assert project.stage00.compact_after_files == 64
     assert project.stage00.input_filter == "none"
+    assert project.stage02.classic_max_level == 14
     assert project.stage03.sidecars[0].name == "meta"
     assert project.stage03.sidecars[0].fields == ("proper_name",)
 
@@ -172,6 +173,7 @@ def test_render_project_template_contains_complete_v1_config() -> None:
     assert "max_open_writers = 128" in rendered
     assert "compact_after_files = 64" in rendered
     assert 'input_filter = "none"' in rendered
+    assert "classic_max_level = 14" in rendered
     assert 'identifiers_order_output_path = "artifacts/identifiers.order"' in rendered
     assert 'stage03_output_dir = "artifacts/stage03"' in rendered
     assert 'name = "meta"' in rendered

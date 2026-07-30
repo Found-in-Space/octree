@@ -3,16 +3,11 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from uuid import uuid4
 
 import click
 from rich.console import Console
 from rich.table import Table
 
-from foundinspace.octree.assembly.formats import (
-    IDENTIFIERS_MANIFEST_NAME,
-    RENDER_MANIFEST_NAME,
-)
 from foundinspace.octree.config import MORTON_BITS
 from foundinspace.octree.mag_levels import MagLevelConfig
 from foundinspace.octree.project import load_project, render_project_template
@@ -294,44 +289,50 @@ def stage_01(
     is_flag=True,
     help="Keep intermediate relocation files created during combine.",
 )
+@click.option(
+    "--max-level",
+    type=click.IntRange(min=0, max=MORTON_BITS),
+    default=None,
+    help="Classic output level cap. Defaults to stage02.classic_max_level.",
+)
 def stage_02(
     project_path: Path,
     retain_relocation_files: bool,
+    max_level: int | None,
 ) -> None:
-    """Combine intermediates into final stars.octree output using project config."""
-    from foundinspace.octree.combine import CombinePlan, combine_octree
-    from foundinspace.octree.combine.records import PackedDescriptorFields
-    from foundinspace.octree.identifiers_order import combine_identifiers_order
+    """Build the classic stars.octree from sorted Stage 01 groups."""
+    from foundinspace.octree.classic import (
+        ClassicBuildConfig,
+        build_classic_artifacts,
+    )
 
     project = _load_project_or_die(project_path)
-    render_manifest_path = project.paths.stage01_output_dir / RENDER_MANIFEST_NAME
-    identifiers_manifest_path = (
-        project.paths.stage01_output_dir / IDENTIFIERS_MANIFEST_NAME
+    resolved_max_level = (
+        max_level if max_level is not None else project.stage02.classic_max_level
     )
-    output_path = project.paths.stage02_output_path
-    identifiers_order_path = project.paths.identifiers_order_output_path
-    dataset_uuid = uuid4()
-    plan = CombinePlan(
-        max_open_files=project.stage02.max_open_files,
-        retain_relocation_files=retain_relocation_files,
+    result = build_classic_artifacts(
+        ClassicBuildConfig(
+            stage00_output_dir=project.paths.stage00_output_dir,
+            stage01_output_dir=project.paths.stage01_output_dir,
+            output_path=project.paths.stage02_output_path,
+            identifiers_order_path=project.paths.identifiers_order_output_path,
+            mag_limit=project.stage00.v_mag,
+            max_level=resolved_max_level,
+            batch_size=project.stage01.batch_size,
+            max_open_files=project.stage02.max_open_files,
+            retain_relocation_files=retain_relocation_files,
+        )
     )
-    combine_octree(
-        render_manifest_path,
-        output_path,
-        plan=plan,
-        descriptor=PackedDescriptorFields(
-            artifact_kind="render",
-            dataset_uuid=dataset_uuid,
-        ),
+    click.echo(
+        "Stage 02 classic summary: "
+        f"rows={result.row_count:,}, "
+        f"folded_rows={result.folded_row_count:,}, "
+        f"cells={result.cell_count:,}, "
+        f"max_level={resolved_max_level}, "
+        f"dataset_uuid={result.dataset_uuid}"
     )
-    click.echo(f"Wrote {output_path}")
-    combine_identifiers_order(
-        identifiers_manifest_path,
-        identifiers_order_path,
-        parent_dataset_uuid=dataset_uuid,
-        artifact_uuid=uuid4(),
-    )
-    click.echo(f"Wrote {identifiers_order_path}")
+    click.echo(f"Wrote {result.output_path}")
+    click.echo(f"Wrote {result.identifiers_order_path}")
 
 
 @cli.command("stage-03")

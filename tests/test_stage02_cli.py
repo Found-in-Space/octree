@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from uuid import UUID
 
 from click.testing import CliRunner
 
 from foundinspace.octree._cli import cli
-from foundinspace.octree.assembly.formats import (
-    IDENTIFIERS_MANIFEST_NAME,
-    RENDER_MANIFEST_NAME,
-)
 
 
 def _write_project(
@@ -62,6 +60,7 @@ def test_stage02_help() -> None:
     assert result.exit_code == 0
     assert "--project" in result.output
     assert "--retain-relocation-files" in result.output
+    assert "--max-level" in result.output
 
 
 def test_stage02_requires_project() -> None:
@@ -71,13 +70,11 @@ def test_stage02_requires_project() -> None:
     assert "--project" in result.output
 
 
-def test_stage02_invokes_render_and_identifiers_outputs(
+def test_stage02_builds_classic_output_from_project(
     monkeypatch, tmp_path: Path
 ) -> None:
     stage01_dir = tmp_path / "stage01"
     stage01_dir.mkdir()
-    (stage01_dir / RENDER_MANIFEST_NAME).write_text("{}")
-    (stage01_dir / IDENTIFIERS_MANIFEST_NAME).write_text("{}")
     output = tmp_path / "stars.octree"
     identifiers_output = tmp_path / "identifiers.order"
     project_path = tmp_path / "project.toml"
@@ -88,46 +85,22 @@ def test_stage02_invokes_render_and_identifiers_outputs(
         identifiers_output=identifiers_output,
         max_open_files=7,
     )
-    render_calls: list[dict[str, object]] = []
-    ident_calls: list[dict[str, object]] = []
+    calls = []
 
-    def _fake_combine(
-        manifest_path: Path,
-        output_path: Path,
-        *,
-        plan,
-        descriptor,
-    ) -> None:
-        render_calls.append(
-            {
-                "manifest": manifest_path,
-                "output": output_path,
-                "max_open_files": plan.max_open_files,
-                "retain": plan.retain_relocation_files,
-                "descriptor": descriptor,
-            }
+    def _fake_build(config):
+        calls.append(config)
+        return SimpleNamespace(
+            row_count=12,
+            folded_row_count=3,
+            cell_count=4,
+            dataset_uuid=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            output_path=config.output_path,
+            identifiers_order_path=config.identifiers_order_path,
         )
 
-    def _fake_identifiers(
-        manifest_path: Path,
-        output_path: Path,
-        *,
-        parent_dataset_uuid,
-        artifact_uuid,
-    ) -> None:
-        ident_calls.append(
-            {
-                "manifest": manifest_path,
-                "output": output_path,
-                "parent_dataset_uuid": parent_dataset_uuid,
-                "artifact_uuid": artifact_uuid,
-            }
-        )
-
-    monkeypatch.setattr("foundinspace.octree.combine.combine_octree", _fake_combine)
     monkeypatch.setattr(
-        "foundinspace.octree.identifiers_order.combine_identifiers_order",
-        _fake_identifiers,
+        "foundinspace.octree.classic.build_classic_artifacts",
+        _fake_build,
     )
 
     runner = CliRunner()
@@ -138,17 +111,17 @@ def test_stage02_invokes_render_and_identifiers_outputs(
             "--project",
             str(project_path),
             "--retain-relocation-files",
+            "--max-level",
+            "13",
         ],
     )
 
     assert result.exit_code == 0
-    assert render_calls[0]["manifest"] == stage01_dir / RENDER_MANIFEST_NAME
-    assert render_calls[0]["output"] == output
-    assert render_calls[0]["max_open_files"] == 7
-    assert render_calls[0]["retain"] is True
-    assert ident_calls[0]["manifest"] == stage01_dir / IDENTIFIERS_MANIFEST_NAME
-    assert ident_calls[0]["output"] == identifiers_output
-    assert (
-        ident_calls[0]["parent_dataset_uuid"]
-        == render_calls[0]["descriptor"].dataset_uuid
-    )
+    assert calls[0].stage01_output_dir == stage01_dir
+    assert calls[0].output_path == output
+    assert calls[0].identifiers_order_path == identifiers_output
+    assert calls[0].max_open_files == 7
+    assert calls[0].retain_relocation_files is True
+    assert calls[0].max_level == 13
+    assert "rows=12" in result.output
+    assert "folded_rows=3" in result.output

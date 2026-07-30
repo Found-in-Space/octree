@@ -12,7 +12,7 @@ from typing import Any
 
 import duckdb
 
-from foundinspace.octree.config import MORTON_BITS
+from foundinspace.octree.config import DEFAULT_CLASSIC_MAX_LEVEL, MORTON_BITS
 from foundinspace.octree.duckdb_util import configure_connection
 from foundinspace.octree.reader.stats import (
     DEFAULT_SHELL_COALESCE_GAP_BYTES,
@@ -32,7 +32,7 @@ DEFAULT_TILE_PREFIX_DEPTH = 4
 PROFILES = ("classic", "unbounded")
 PACKING_ORDERS = ("dfs", "level-major", "tile-level-major")
 SCENARIOS = ("observer-shell", "target-frustum")
-CLASSIC_MAX_LEVEL = 14
+CLASSIC_MAX_LEVEL = DEFAULT_CLASSIC_MAX_LEVEL
 RENDER_RECORD_SIZE = 16
 
 
@@ -329,7 +329,7 @@ def _compressed_node(
         level=key[0],
         node_id=key[1],
         star_count=star_count,
-        payload_length=len(gzip.compress(bytes(renders))),
+        payload_length=len(gzip.compress(bytes(renders), mtime=0)),
     )
 
 

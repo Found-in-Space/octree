@@ -6,7 +6,12 @@ from typing import Any
 
 import tomllib
 
-from .config import DEFAULT_DEEP_SHARD_FROM_LEVEL, DEFAULT_MAG_VIS
+from .config import (
+    DEFAULT_CLASSIC_MAX_LEVEL,
+    DEFAULT_DEEP_SHARD_FROM_LEVEL,
+    DEFAULT_MAG_VIS,
+    MORTON_BITS,
+)
 
 FORMAT_VERSION = 1
 _DEFAULT_MERGED_HEALPIX_DIR = "../data/processed/merged/healpix"
@@ -50,7 +55,7 @@ _STAGE01_KEYS = {
     "deep_shard_from_level",
     "deep_prefix_bits",
 }
-_STAGE02_KEYS = {"max_open_files"}
+_STAGE02_KEYS = {"max_open_files", "classic_max_level"}
 _STAGE03_KEYS = {"sidecars"}
 _STAGE03_SIDECAR_KEYS = {"name", "fields"}
 
@@ -88,6 +93,7 @@ class Stage01ProjectConfig:
 @dataclass(frozen=True, slots=True)
 class Stage02ProjectConfig:
     max_open_files: int
+    classic_max_level: int = DEFAULT_CLASSIC_MAX_LEVEL
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,9 +316,16 @@ def load_project(project_path: Path) -> OctreeProject:
 
     stage02 = Stage02ProjectConfig(
         max_open_files=_require_int(stage02_raw, "max_open_files"),
+        classic_max_level=_optional_int(
+            stage02_raw,
+            "classic_max_level",
+            DEFAULT_CLASSIC_MAX_LEVEL,
+        ),
     )
     if stage02.max_open_files <= 0:
         raise ValueError("stage02.max_open_files must be > 0")
+    if stage02.classic_max_level < 0 or stage02.classic_max_level > MORTON_BITS:
+        raise ValueError(f"stage02.classic_max_level must be in 0..{MORTON_BITS}")
 
     sidecars_raw = stage03_raw.get("sidecars", [])
     if not isinstance(sidecars_raw, list):
@@ -387,7 +400,8 @@ def render_project_template() -> str:
         f"deep_shard_from_level = {DEFAULT_DEEP_SHARD_FROM_LEVEL}\n"
         "deep_prefix_bits = 3\n\n"
         "[stage02]\n"
-        "max_open_files = 32\n\n"
+        "max_open_files = 32\n"
+        f"classic_max_level = {DEFAULT_CLASSIC_MAX_LEVEL}\n\n"
         "[stage03]\n\n"
         "[[stage03.sidecars]]\n"
         'name = "meta"\n'

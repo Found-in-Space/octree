@@ -8,7 +8,7 @@ from .types import CellKey, EncodedCell
 
 def _flush_cell(level: int, node_id: int, renders: list[bytes]) -> EncodedCell:
     raw = b"".join(renders)
-    payload = gzip.compress(raw)
+    payload = gzip.compress(raw, mtime=0)
     return EncodedCell(
         key=CellKey(level=level, node_id=node_id),
         payload=payload,

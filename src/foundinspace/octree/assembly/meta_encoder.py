@@ -116,7 +116,7 @@ def build_meta_payload(
         entry.update(ident_map.lookup(source, source_id))
         entries.append(entry)
     raw = json.dumps(entries, separators=(",", ":")).encode("utf-8")
-    return gzip.compress(raw)
+    return gzip.compress(raw, mtime=0)
 
 
 def iter_encoded_cells_with_meta(

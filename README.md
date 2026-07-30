@@ -26,15 +26,18 @@ materialization and packaging:
 |-------|-------|--------|---------|
 | **Stage 00** | Input-sharded merged parquet | `(node, input_shard_id, kind)` staging groups | Partitions input rows into the octree staging tree |
 | **Stage 01** | Stage 00 staging folders | Canonical staged parts | Sorts and compacts staged data in place |
-| **Stage 02** | Stage 01 staged parts | Updated payload fragments | Optionally rewrites payload bytes without re-indexing |
-| **Stage 03** | Sorted staged parts | Payload-order byte arrays + identity indexes | Materializes canonical node payload order |
-| **Stage 04** | Stage 03 node outputs | `stars.octree` + identity/order artifacts | Packs the final base dataset package |
-| **Stage 05** | Stage 04 outputs | Named sidecar files (e.g. `meta`) | Builds optional sidecar families |
+| **Stage 02** | Sorted Stage 01 groups | `stars.octree` + `identifiers.order` | Materializes and packs the traditional/classic output |
+| **Stage 03** | Stage 02 outputs | Named sidecar files (e.g. `meta`) | Builds optional sidecar families |
 
 Stage 00 keys replaceability by upstream input shard id. That id comes from the
 input directory name or root-level parquet filename stem, so HEALPix files,
 batch shards, or another stable upstream layout all work; the upstream pipeline
 chooses the rebuild granularity by choosing its shard layout.
+
+The classic Stage 02 output clamps rows below `stage02.classic_max_level`
+(default 14) into their ancestor node and promotes their cell-relative render
+coordinates accordingly. A packed final-output variant can be added alongside
+this path later without changing Stage 00 or Stage 01.
 
 Each render octree carries a `dataset_uuid`. Sidecars carry a `parent_dataset_uuid` so readers can validate the pairing before opening them.
 
@@ -107,6 +110,7 @@ src/foundinspace/octree/
   _cli.py             # Click root; stage-00, stage-01, stage-02, stage-03, stats, project subcommands
   project.py          # TOML project file loading and validation
   config.py           # Build defaults (world size, Morton bits, max level)
+  classic.py          # Stage 02 — classic node materialization and final build
   mag_levels.py       # Magnitude/level threshold calculations
   duckdb_util.py      # Shared DuckDB connection helper with env-variable tuning
   sources/            # Stage 00 — packed octree staging

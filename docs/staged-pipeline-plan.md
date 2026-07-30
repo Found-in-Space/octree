@@ -24,10 +24,16 @@ Implemented on the current work branch:
   tracking.
 - Stage 01 sorts and compacts Stage 00 groups into replaceable sorted parquet
   groups while preserving `(staging_node, input_shard_id, kind)` granularity.
+- The compatibility `stage-02` path materializes the traditional/classic
+  level-capped output from tracked Stage 01 groups and writes `stars.octree`
+  plus `identifiers.order` through the existing binary combine pipeline.
+- Classic materialization promotes render coordinates from deeper source cells
+  into the configured ancestor cell before encoding the final payload.
 
 Not implemented yet:
 
-- Stage 03 final octree assembly from Stage 01 sorted groups
+- the alternative packed final-output variant
+- profile-oriented Stage 03 assembly and manifests
 - named Stage 03 output profiles
 - dedicated sidecar builds per Stage 03 output profile
 - removal of the obsolete Stage 02 command and old intermediate-shard pipeline

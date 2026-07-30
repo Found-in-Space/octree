@@ -19,7 +19,7 @@ def encode_identity_rows(identities: list[tuple[str, str]]) -> bytes:
         raw.extend(source_bytes)
         raw.extend(_LEN_FMT.pack(len(source_id_bytes)))
         raw.extend(source_id_bytes)
-    return gzip.compress(bytes(raw))
+    return gzip.compress(bytes(raw), mtime=0)
 
 
 def decode_identity_rows(raw: bytes, *, star_count: int) -> list[tuple[str, str]]:

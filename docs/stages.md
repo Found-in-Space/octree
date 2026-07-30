@@ -8,6 +8,10 @@ The durable idea is that the expensive spatial indexing work should produce a
 reusable staging tree. Later stages should sort, encode, materialize, and pack
 that staged data without repeatedly duplicating the whole catalogue.
 
+The current compatibility CLI collapses materialization and packing for the
+traditional level-capped output into `stage-02`. The finer-grained stages below
+remain the target decomposition for additional output variants.
+
 The implementation plan, manifest sketches, and work streams are tracked in
 [`staged-pipeline-plan.md`](staged-pipeline-plan.md).
 
