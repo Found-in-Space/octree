@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import struct
 from pathlib import Path
 from uuid import UUID
@@ -59,6 +60,47 @@ def _render(
     pad: int = 0,
 ) -> bytes:
     return _RENDER.pack(x, y, z, magnitude, teff, pad)
+
+
+def _write_compact_run(path: Path, rows: list[tuple[float | None, str, int]]) -> None:
+    row_count = len(rows)
+    pq.write_table(
+        pa.table(
+            {
+                "final_level": pa.array([14] * row_count, type=pa.int16()),
+                "final_node_id": pa.array([0] * row_count, type=pa.uint64()),
+                "mag_abs": pa.array([row[0] for row in rows], type=pa.float64()),
+                "source": pa.array(["gaia"] * row_count, type=pa.string()),
+                "source_id": pa.array([row[1] for row in rows], type=pa.string()),
+                "render": pa.array(
+                    [bytes([row[2]]) * 16 for row in rows],
+                    type=pa.binary(16),
+                ),
+            },
+            schema=classic_materialization._COMPACT_SCHEMA,
+        ),
+        path,
+        compression="zstd",
+    )
+
+
+def _merged_compact_runs(
+    paths: list[Path],
+    *,
+    spill_dir: Path,
+    batch_size: int,
+) -> pa.Table:
+    return pa.concat_tables(
+        [
+            batch
+            for _key, batch in classic_materialization._iter_merged_batches(
+                paths,
+                batch_size=batch_size,
+                spill_dir=spill_dir,
+            )
+        ],
+        promote_options="none",
+    )
 
 
 def _node_center(level: int, node_id: int) -> tuple[float, float, float]:
@@ -510,6 +552,89 @@ def test_classic_build_merges_sorted_stage01_groups_in_canonical_order(
         ("gaia", "m"),
         ("gaia", "z"),
     ]
+
+
+def test_classic_overlap_spill_matches_in_memory_sort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = tmp_path / "first.parquet"
+    second = tmp_path / "second.parquet"
+    _write_compact_run(
+        first,
+        [
+            (-math.inf, "negative", 1),
+            (1.0, "same", 2),
+            (1.0, "same", 3),
+            (math.nan, "nan", 4),
+            (None, "null", 5),
+        ],
+    )
+    _write_compact_run(
+        second,
+        [
+            (0.0, "zero", 11),
+            (1.0, "same", 12),
+            (math.nan, "nan", 13),
+            (None, "null", 14),
+        ],
+    )
+    spill_dir = tmp_path / "spill"
+    spill_dir.mkdir()
+    paths = [first, second]
+
+    in_memory = _merged_compact_runs(
+        paths,
+        spill_dir=spill_dir,
+        batch_size=100,
+    )
+    original_external_sort = classic_materialization._iter_externally_sorted_overlap
+    external_sort_calls = 0
+
+    def track_external_sort(*args, **kwargs):
+        nonlocal external_sort_calls
+        external_sort_calls += 1
+        yield from original_external_sort(*args, **kwargs)
+
+    monkeypatch.setattr(
+        classic_materialization,
+        "CLASSIC_OVERLAP_IN_MEMORY_MAX_BYTES",
+        1,
+    )
+    monkeypatch.setattr(
+        classic_materialization,
+        "_iter_externally_sorted_overlap",
+        track_external_sort,
+    )
+    spilled = _merged_compact_runs(
+        paths,
+        spill_dir=spill_dir,
+        batch_size=100,
+    )
+
+    assert external_sort_calls == 1
+    assert spilled.schema == in_memory.schema
+    assert (
+        spilled.column("render").to_pylist() == in_memory.column("render").to_pylist()
+    )
+    assert spilled.column("render").to_pylist() == [
+        bytes([value]) * 16 for value in (1, 11, 2, 3, 12, 4, 13, 5, 14)
+    ]
+    assert [
+        "null" if value is None else "nan" if math.isnan(value) else value
+        for value in spilled.column("mag_abs").to_pylist()
+    ] == [
+        -math.inf,
+        0.0,
+        1.0,
+        1.0,
+        1.0,
+        "nan",
+        "nan",
+        "null",
+        "null",
+    ]
+    assert list(spill_dir.iterdir()) == []
 
 
 def test_classic_build_externally_merges_folded_group_batches(

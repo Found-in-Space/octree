@@ -158,6 +158,9 @@ Current direction:
   does not change it; do not introduce a full-catalogue sort.
 - Reorder only bounded group runs affected by output-profile level folding,
   then combine final cells with a bounded fan-in merge.
+- Keep disjoint cells on the Arrow chunk path. Sort overlapping cells with
+  native Arrow operations, spilling oversized cells through DuckDB rather than
+  merging their rows in Python.
 - Fan out rows from packed staging nodes into their final payload nodes when the
   final render level is deeper than the staging node.
 - Encode node-relative coordinates once, after the output profile has selected

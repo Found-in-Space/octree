@@ -71,8 +71,10 @@ Stage 01 rows without changing Stage 00 or Stage 01.
 Classic materialization consumes Stage 01 as checksum-tracked sorted groups. It
 does not globally re-sort the catalogue: groups that do not need level folding
 remain in their Stage 01 order, folded groups are reordered locally, and final
-cells are combined with a bounded fan-in merge. Deep output levels are split
-into spatial partitions using `stage02.partition_from_level` and
+cells are combined with a bounded fan-in merge. Disjoint cells stay on the
+Arrow chunk path; overlapping cells use a native Arrow sort and spill through
+DuckDB when they exceed the configured batch or memory bound. Deep output
+levels are split into spatial partitions using `stage02.partition_from_level` and
 `stage02.partition_prefix_bits`. Completed group runs and output partitions are
 checkpointed in `.classic-intermediates.work`, so an interrupted build resumes
 without repeating completed work. Final payload relocation reuses a bounded LRU

@@ -3,15 +3,19 @@ from __future__ import annotations
 import gzip
 import hashlib
 import heapq
+import io
 import json
 import os
 import shutil
+import tempfile
 from collections.abc import Iterator, Sequence
+from contextlib import redirect_stdout
 from dataclasses import dataclass
 from itertools import groupby
 from pathlib import Path
 from typing import Any
 
+import duckdb
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -35,6 +39,12 @@ from .assembly.manifest import (
 from .assembly.types import CellKey, ShardKey
 from .assembly.writer import IntermediateShardWriter, identifiers_shard_filenames
 from .config import MORTON_BITS
+from .duckdb_util import (
+    MEMORY_LIMIT,
+    PRESERVE_INSERTION_ORDER,
+    TEMP_DIR,
+    configure_connection,
+)
 from .encoding.render import RENDER_RECORD_SIZE, encode_render_records
 from .sources.stage00 import _atomic_write_json
 
@@ -43,6 +53,8 @@ CLASSIC_BUILD_STATE_FORMAT = "foundinspace.octree.classic-build/v1"
 CLASSIC_WORK_STATE_NAME = "classic-work-state.json"
 CLASSIC_WORK_STATE_FORMAT = "foundinspace.octree.classic-work/v1"
 CLASSIC_ALGORITHM_VERSION = "sorted-cell-merge/v2"
+CLASSIC_OVERLAP_IN_MEMORY_MAX_BYTES = 256 * 1024 * 1024
+CLASSIC_OVERLAP_EXTERNAL_SORT_MEMORY_LIMIT = "512MB"
 
 _RAW_COLUMNS = (
     "x_icrs_pc",
@@ -72,6 +84,20 @@ _CANONICAL_SORT_KEYS = [
     ("mag_abs", "ascending"),
     ("source", "ascending"),
     ("source_id", "ascending"),
+]
+_CONTRIBUTOR_COLUMN = "_classic_contributor_index"
+_CONTRIBUTOR_ROW_COLUMN = "_classic_contributor_row"
+_OVERLAP_SCHEMA = _COMPACT_SCHEMA.append(
+    pa.field(_CONTRIBUTOR_COLUMN, pa.int32(), nullable=False)
+).append(
+    pa.field(_CONTRIBUTOR_ROW_COLUMN, pa.int64(), nullable=False),
+)
+_OVERLAP_SORT_KEYS = [
+    ("mag_abs", "ascending"),
+    ("source", "ascending"),
+    ("source_id", "ascending"),
+    (_CONTRIBUTOR_COLUMN, "ascending"),
+    (_CONTRIBUTOR_ROW_COLUMN, "ascending"),
 ]
 
 
@@ -141,22 +167,6 @@ class _RunCursor:
             int(table.column("final_node_id")[self._offset].as_py()),
         )
 
-    @property
-    def order_key(self) -> tuple[int, float, str, str]:
-        table = self._require_table()
-        magnitude = table.column("mag_abs")[self._offset].as_py()
-        if magnitude is None:
-            magnitude_key = (2, 0.0)
-        elif np.isnan(magnitude):
-            magnitude_key = (1, 0.0)
-        else:
-            magnitude_key = (0, float(magnitude))
-        return (
-            *magnitude_key,
-            str(table.column("source")[self._offset].as_py()),
-            str(table.column("source_id")[self._offset].as_py()),
-        )
-
     def take_cell_chunk(self, key: tuple[int, int]) -> pa.Table:
         table = self._require_table()
         start = self._offset
@@ -166,18 +176,6 @@ class _RunCursor:
         self._offset = end
         self._load_batch_if_consumed()
         return chunk
-
-    def take_row(self) -> tuple[float | None, str, str, bytes]:
-        table = self._require_table()
-        row = (
-            table.column("mag_abs")[self._offset].as_py(),
-            str(table.column("source")[self._offset].as_py()),
-            str(table.column("source_id")[self._offset].as_py()),
-            bytes(table.column("render")[self._offset].as_py()),
-        )
-        self._offset += 1
-        self._load_batch_if_consumed()
-        return row
 
     def _load_batch_if_consumed(self) -> None:
         if self._table is not None and self._offset >= len(self._table):
@@ -814,6 +812,7 @@ def _materialize_partition(
         merged_batches = _iter_merged_batches(
             final_runs,
             batch_size=plan.batch_size,
+            spill_dir=partition_dir,
         )
         for key, keyed_batches in groupby(merged_batches, key=lambda item: item[0]):
             star_count = 0
@@ -922,7 +921,11 @@ def _write_merged_run(
     tmp_path = output.with_name(f".{output.name}.tmp")
     writer = pq.ParquetWriter(tmp_path, _COMPACT_SCHEMA, compression="zstd")
     try:
-        for _key, batch in _iter_merged_batches(paths, batch_size=batch_size):
+        for _key, batch in _iter_merged_batches(
+            paths,
+            batch_size=batch_size,
+            spill_dir=output.parent,
+        ):
             writer.write_table(batch, row_group_size=batch_size)
     except Exception:
         writer.close()
@@ -936,6 +939,7 @@ def _iter_merged_batches(
     paths: Sequence[Path],
     *,
     batch_size: int,
+    spill_dir: Path,
 ) -> Iterator[tuple[tuple[int, int], pa.Table]]:
     if batch_size <= 0:
         raise ValueError("Classic merge batch_size must be > 0")
@@ -967,6 +971,7 @@ def _iter_merged_batches(
                 contributors,
                 key=key,
                 batch_size=batch_size,
+                spill_dir=spill_dir,
             )
 
         for contributor in contributors:
@@ -985,79 +990,182 @@ def _merge_overlapping_cell(
     *,
     key: tuple[int, int],
     batch_size: int,
+    spill_dir: Path,
 ) -> Iterator[tuple[tuple[int, int], pa.Table]]:
-    row_heap: list[tuple[tuple[int, float, str, str], int]] = []
-    for index in contributors:
-        heapq.heappush(row_heap, (cursors[index].order_key, index))
+    buffered: list[pa.Table] = []
+    buffered_rows = 0
+    buffered_bytes = 0
+    temporary_dir: tempfile.TemporaryDirectory | None = None
+    spill_path: Path | None = None
+    spill_writer: pq.ParquetWriter | None = None
 
-    magnitudes: list[float | None] = []
-    sources: list[str] = []
-    source_ids: list[str] = []
-    renders: list[bytes] = []
-    while row_heap:
-        _order_key, index = heapq.heappop(row_heap)
-        magnitude, source, source_id, render = cursors[index].take_row()
-        magnitudes.append(magnitude)
-        sources.append(source)
-        source_ids.append(source_id)
-        renders.append(render)
-        cursor = cursors[index]
-        if not cursor.exhausted and cursor.cell_key == key:
-            heapq.heappush(row_heap, (cursor.order_key, index))
-        if len(magnitudes) == batch_size:
-            yield (
-                key,
-                _compact_row_batch(
-                    key,
-                    magnitudes=magnitudes,
-                    sources=sources,
-                    source_ids=source_ids,
-                    renders=renders,
-                ),
-            )
-            magnitudes = []
-            sources = []
-            source_ids = []
-            renders = []
-    if magnitudes:
-        yield (
-            key,
-            _compact_row_batch(
-                key,
-                magnitudes=magnitudes,
-                sources=sources,
-                source_ids=source_ids,
-                renders=renders,
-            ),
+    def start_spilling() -> None:
+        nonlocal temporary_dir, spill_path, spill_writer
+        temporary_dir = tempfile.TemporaryDirectory(
+            prefix=".classic-overlap-sort-",
+            dir=spill_dir,
         )
+        spill_path = Path(temporary_dir.name) / "cell.parquet"
+        spill_writer = pq.ParquetWriter(
+            spill_path,
+            _OVERLAP_SCHEMA,
+            compression="zstd",
+        )
+        for table in buffered:
+            spill_writer.write_table(table, row_group_size=batch_size)
+        buffered.clear()
+
+    try:
+        for index in contributors:
+            contributor_row = 0
+            cursor = cursors[index]
+            while not cursor.exhausted and cursor.cell_key == key:
+                chunk = cursor.take_cell_chunk(key)
+                tagged = _tag_overlap_chunk(
+                    chunk,
+                    contributor_index=index,
+                    contributor_row=contributor_row,
+                )
+                contributor_row += len(tagged)
+                if spill_writer is None and (
+                    buffered_rows + len(tagged) > batch_size
+                    or buffered_bytes + tagged.nbytes
+                    > CLASSIC_OVERLAP_IN_MEMORY_MAX_BYTES
+                ):
+                    start_spilling()
+                if spill_writer is None:
+                    buffered.append(tagged)
+                    buffered_rows += len(tagged)
+                    buffered_bytes += tagged.nbytes
+                else:
+                    spill_writer.write_table(tagged, row_group_size=batch_size)
+
+        if spill_writer is None:
+            yield from _iter_in_memory_sorted_overlap(
+                buffered,
+                key=key,
+                batch_size=batch_size,
+            )
+            return
+
+        spill_writer.close()
+        spill_writer = None
+        assert spill_path is not None
+        yield from _iter_externally_sorted_overlap(
+            spill_path,
+            key=key,
+            batch_size=batch_size,
+        )
+    finally:
+        if spill_writer is not None:
+            spill_writer.close()
+        if temporary_dir is not None:
+            temporary_dir.cleanup()
 
 
-def _compact_row_batch(
-    key: tuple[int, int],
+def _tag_overlap_chunk(
+    chunk: pa.Table,
     *,
-    magnitudes: Sequence[float | None],
-    sources: Sequence[str],
-    source_ids: Sequence[str],
-    renders: Sequence[bytes],
+    contributor_index: int,
+    contributor_row: int,
 ) -> pa.Table:
-    row_count = len(magnitudes)
-    return pa.table(
-        {
-            "final_level": pa.array(
-                np.full(row_count, key[0], dtype=np.int16),
-                type=pa.int16(),
+    row_count = len(chunk)
+    return chunk.append_column(
+        pa.field(_CONTRIBUTOR_COLUMN, pa.int32(), nullable=False),
+        pa.array(
+            np.full(row_count, contributor_index, dtype=np.int32),
+            type=pa.int32(),
+        ),
+    ).append_column(
+        pa.field(_CONTRIBUTOR_ROW_COLUMN, pa.int64(), nullable=False),
+        pa.array(
+            np.arange(
+                contributor_row,
+                contributor_row + row_count,
+                dtype=np.int64,
             ),
-            "final_node_id": pa.array(
-                np.full(row_count, key[1], dtype=np.uint64),
-                type=pa.uint64(),
-            ),
-            "mag_abs": pa.array(magnitudes, type=pa.float64()),
-            "source": pa.array(sources, type=pa.string()),
-            "source_id": pa.array(source_ids, type=pa.string()),
-            "render": pa.array(renders, type=pa.binary(RENDER_RECORD_SIZE)),
-        },
-        schema=_COMPACT_SCHEMA,
+            type=pa.int64(),
+        ),
     )
+
+
+def _iter_in_memory_sorted_overlap(
+    chunks: Sequence[pa.Table],
+    *,
+    key: tuple[int, int],
+    batch_size: int,
+) -> Iterator[tuple[tuple[int, int], pa.Table]]:
+    combined = pa.concat_tables(chunks, promote_options="none")
+    order = pc.sort_indices(
+        combined,
+        sort_keys=_OVERLAP_SORT_KEYS,
+        null_placement="at_end",
+    )
+    sorted_table = combined.take(order).select(_COMPACT_COLUMNS)
+    for offset in range(0, len(sorted_table), batch_size):
+        yield key, sorted_table.slice(offset, batch_size)
+
+
+def _iter_externally_sorted_overlap(
+    spill_path: Path,
+    *,
+    key: tuple[int, int],
+    batch_size: int,
+) -> Iterator[tuple[tuple[int, int], pa.Table]]:
+    local_spill_dir: Path | None = None
+    if TEMP_DIR is None:
+        local_spill_dir = spill_path.parent / "duckdb-spill"
+        local_spill_dir.mkdir()
+
+    con = duckdb.connect()
+    try:
+        with redirect_stdout(io.StringIO()):
+            configure_connection(con)
+        if local_spill_dir is not None:
+            con.execute("SET temp_directory = ?", [str(local_spill_dir)])
+        if MEMORY_LIMIT is None:
+            con.execute(
+                "SET memory_limit = ?",
+                [CLASSIC_OVERLAP_EXTERNAL_SORT_MEMORY_LIMIT],
+            )
+        if PRESERVE_INSERTION_ORDER is None:
+            con.execute("SET preserve_insertion_order = false")
+        con.execute(_overlap_sort_query(spill_path))
+        for batch in con.to_arrow_reader(batch_size=batch_size):
+            table = pa.Table.from_batches([batch])
+            if not table.schema.equals(_COMPACT_SCHEMA, check_metadata=False):
+                table = table.cast(_COMPACT_SCHEMA)
+            yield key, table.replace_schema_metadata(None)
+    finally:
+        con.close()
+        if local_spill_dir is not None:
+            shutil.rmtree(local_spill_dir, ignore_errors=True)
+
+
+def _overlap_sort_query(path: Path) -> str:
+    escaped = path.as_posix().replace("'", "''")
+    return f"""
+        SELECT
+            final_level,
+            final_node_id,
+            mag_abs,
+            source,
+            source_id,
+            render
+        FROM read_parquet(
+            '{escaped}',
+            hive_partitioning = false,
+            union_by_name = false
+        )
+        ORDER BY
+            final_level ASC,
+            final_node_id ASC,
+            mag_abs ASC NULLS LAST,
+            source ASC,
+            source_id ASC,
+            {_CONTRIBUTOR_COLUMN} ASC,
+            {_CONTRIBUTOR_ROW_COLUMN} ASC
+    """
 
 
 def _fixed_binary_bytes(column: pa.ChunkedArray) -> bytes:

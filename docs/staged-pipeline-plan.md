@@ -46,7 +46,9 @@ Implemented on the current work branch:
   not part of the staged-row contract.
 - Classic materialization preserves the sorted Stage 01 order for rows within
   the level cap, locally reorders only groups affected by level folding, and
-  combines compact group runs with a bounded fan-in cell merge.
+  combines compact group runs with a bounded fan-in cell merge. Disjoint cells
+  remain chunk-streamed; overlapping cells use native Arrow sorting with a
+  DuckDB spill fallback above the in-memory bound.
 - Deep classic output is spatially partitioned and checkpointed. Failed builds
   reuse completed group runs and completed output partitions.
 
