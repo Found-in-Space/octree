@@ -30,6 +30,7 @@ def encode_render_records(
     mag_abs: np.ndarray,
     teff: np.ndarray,
     levels: np.ndarray,
+    node_ids: np.ndarray | None = None,
     center: np.ndarray | None = None,
     half_size: float = WORLD_HALF_SIZE_PC,
 ) -> np.ndarray:
@@ -43,6 +44,9 @@ def encode_render_records(
     mag_abs = np.asarray(mag_abs, dtype=np.float64)
     teff = np.asarray(teff, dtype=np.float64)
     levels = np.asarray(levels, dtype=np.int32)
+    resolved_node_ids = (
+        None if node_ids is None else np.asarray(node_ids, dtype=np.uint64)
+    )
     n = len(morton_codes)
     if positions.shape != (n, 3):
         raise ValueError(f"positions must have shape ({n}, 3), got {positions.shape}")
@@ -53,6 +57,10 @@ def encode_render_records(
     ):
         if len(values) != n:
             raise ValueError(f"{name} must contain {n} values, got {len(values)}")
+    if resolved_node_ids is not None and len(resolved_node_ids) != n:
+        raise ValueError(
+            f"node_ids must contain {n} values, got {len(resolved_node_ids)}"
+        )
     if n == 0:
         return np.empty((0, RENDER_RECORD_SIZE), dtype=np.uint8)
     if np.any((levels < 0) | (levels > MORTON_BITS)):
@@ -77,10 +85,34 @@ def encode_render_records(
     for level_raw in np.unique(levels):
         level = int(level_raw)
         indices = np.flatnonzero(levels == level)
-        shift = 3 * (MORTON_BITS - level)
-        node_ids = morton_codes[indices] >> np.uint64(shift)
+        if resolved_node_ids is None:
+            shift = 3 * (MORTON_BITS - level)
+            selected_node_ids = morton_codes[indices] >> np.uint64(shift)
+        else:
+            selected_node_ids = resolved_node_ids[indices]
 
-        unique_nodes, inverse = np.unique(node_ids, return_inverse=True)
+        if len(selected_node_ids) < 2 or np.all(
+            selected_node_ids[1:] >= selected_node_ids[:-1]
+        ):
+            starts = np.concatenate(
+                (
+                    np.array([0], dtype=np.int64),
+                    np.flatnonzero(
+                        selected_node_ids[1:] != selected_node_ids[:-1]
+                    ).astype(np.int64)
+                    + 1,
+                )
+            )
+            unique_nodes = selected_node_ids[starts]
+            inverse = np.repeat(
+                np.arange(len(starts), dtype=np.int64),
+                np.diff(np.append(starts, len(selected_node_ids))),
+            )
+        else:
+            unique_nodes, inverse = np.unique(
+                selected_node_ids,
+                return_inverse=True,
+            )
         grid_x = np.zeros(len(unique_nodes), dtype=np.uint32)
         grid_y = np.zeros(len(unique_nodes), dtype=np.uint32)
         grid_z = np.zeros(len(unique_nodes), dtype=np.uint32)

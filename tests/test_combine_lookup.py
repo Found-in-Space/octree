@@ -121,6 +121,7 @@ def test_file_handle_cache_bounded(tmp_path) -> None:
     cache = FileHandleCache(1)
     f1 = cache.open(p1, "rb")
     assert not f1.closed
+    assert cache.open(p1, "rb") is f1
     _ = cache.open(p2, "rb")
     assert f1.closed
     cache.close_all()

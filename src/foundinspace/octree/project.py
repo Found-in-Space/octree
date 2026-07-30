@@ -8,6 +8,8 @@ import tomllib
 
 from .config import (
     DEFAULT_CLASSIC_MAX_LEVEL,
+    DEFAULT_CLASSIC_PARTITION_FROM_LEVEL,
+    DEFAULT_CLASSIC_PARTITION_PREFIX_BITS,
     DEFAULT_DEEP_SHARD_FROM_LEVEL,
     DEFAULT_MAG_VIS,
     MORTON_BITS,
@@ -55,7 +57,12 @@ _STAGE01_KEYS = {
     "deep_shard_from_level",
     "deep_prefix_bits",
 }
-_STAGE02_KEYS = {"max_open_files", "classic_max_level"}
+_STAGE02_KEYS = {
+    "max_open_files",
+    "classic_max_level",
+    "partition_from_level",
+    "partition_prefix_bits",
+}
 _STAGE03_KEYS = {"sidecars"}
 _STAGE03_SIDECAR_KEYS = {"name", "fields"}
 
@@ -94,6 +101,8 @@ class Stage01ProjectConfig:
 class Stage02ProjectConfig:
     max_open_files: int
     classic_max_level: int = DEFAULT_CLASSIC_MAX_LEVEL
+    partition_from_level: int = DEFAULT_CLASSIC_PARTITION_FROM_LEVEL
+    partition_prefix_bits: int = DEFAULT_CLASSIC_PARTITION_PREFIX_BITS
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,11 +330,25 @@ def load_project(project_path: Path) -> OctreeProject:
             "classic_max_level",
             DEFAULT_CLASSIC_MAX_LEVEL,
         ),
+        partition_from_level=_optional_int(
+            stage02_raw,
+            "partition_from_level",
+            DEFAULT_CLASSIC_PARTITION_FROM_LEVEL,
+        ),
+        partition_prefix_bits=_optional_int(
+            stage02_raw,
+            "partition_prefix_bits",
+            DEFAULT_CLASSIC_PARTITION_PREFIX_BITS,
+        ),
     )
     if stage02.max_open_files <= 0:
         raise ValueError("stage02.max_open_files must be > 0")
     if stage02.classic_max_level < 0 or stage02.classic_max_level > MORTON_BITS:
         raise ValueError(f"stage02.classic_max_level must be in 0..{MORTON_BITS}")
+    if stage02.partition_from_level < 0:
+        raise ValueError("stage02.partition_from_level must be >= 0")
+    if stage02.partition_prefix_bits < 0:
+        raise ValueError("stage02.partition_prefix_bits must be >= 0")
 
     sidecars_raw = stage03_raw.get("sidecars", [])
     if not isinstance(sidecars_raw, list):
@@ -401,7 +424,9 @@ def render_project_template() -> str:
         "deep_prefix_bits = 3\n\n"
         "[stage02]\n"
         "max_open_files = 32\n"
-        f"classic_max_level = {DEFAULT_CLASSIC_MAX_LEVEL}\n\n"
+        f"classic_max_level = {DEFAULT_CLASSIC_MAX_LEVEL}\n"
+        f"partition_from_level = {DEFAULT_CLASSIC_PARTITION_FROM_LEVEL}\n"
+        f"partition_prefix_bits = {DEFAULT_CLASSIC_PARTITION_PREFIX_BITS}\n\n"
         "[stage03]\n\n"
         "[[stage03.sidecars]]\n"
         'name = "meta"\n'

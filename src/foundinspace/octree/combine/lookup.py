@@ -161,7 +161,7 @@ class _FixedRecordCache:
         record_struct,
         magic: bytes,
     ) -> FixedRecordFile:
-        key = path.resolve()
+        key = path
         existing = self._cache.pop(key, None)
         if existing is None:
             existing = FixedRecordFile(
@@ -308,7 +308,7 @@ class FileHandleCache:
         self._entries: OrderedDict[Path, object] = OrderedDict()
 
     def open(self, path: Path, mode: str):
-        key = path.resolve()
+        key = path
         fp = self._entries.pop(key, None)
         if fp is None:
             fp = open(path, mode)  # noqa: SIM115

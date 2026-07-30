@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from .dfs import iter_cells_dfs
-from .lookup import IntermediateLookup, RelocationLookup
+from .lookup import FileHandleCache, IntermediateLookup, RelocationLookup
 from .manifest import read_combine_manifest
 from .records import (
     DESCRIPTOR_SIZE,
@@ -111,21 +111,27 @@ class _RelocAppender:
             )
 
     def append(
-        self, *, node_id: int, output_offset: int, payload_length: int, star_count: int
+        self,
+        *,
+        node_id: int,
+        output_offset: int,
+        payload_length: int,
+        star_count: int,
+        file_cache: FileHandleCache,
     ) -> None:
         if self._last_node_id is not None and node_id <= self._last_node_id:
             raise ValueError(
                 f"Relocation node_id must be increasing: {node_id} <= {self._last_node_id}"
             )
-        with open(self.path, "ab") as fp:
-            fp.write(
-                RELOC_RECORD_FMT.pack(
-                    int(node_id),
-                    int(output_offset),
-                    int(payload_length),
-                    int(star_count),
-                )
+        fp = file_cache.open(self.path, "ab")
+        fp.write(
+            RELOC_RECORD_FMT.pack(
+                int(node_id),
+                int(output_offset),
+                int(payload_length),
+                int(star_count),
             )
+        )
         self.count += 1
         self._last_node_id = node_id
 
@@ -260,14 +266,17 @@ def relocate_payloads_dfs(
     progress_every_seconds = 2.0
     next_report_cell = progress_every_cells
     last_report_t = time.perf_counter()
+    payload_files = FileHandleCache(plan.max_open_files)
+    relocation_files = FileHandleCache(plan.max_open_files)
 
-    for cell in iter_cells_dfs(
-        manifest_path,
-        max_open_files=plan.max_open_files,
-    ):
-        key = (cell.shard.level, cell.shard.prefix_bits, cell.shard.prefix)
-        shard = shard_by_key[key]
-        with open(shard.payload_path, "rb") as src_fp:
+    try:
+        for cell in iter_cells_dfs(
+            manifest_path,
+            max_open_files=plan.max_open_files,
+        ):
+            key = (cell.shard.level, cell.shard.prefix_bits, cell.shard.prefix)
+            shard = shard_by_key[key]
+            src_fp = payload_files.open(shard.payload_path, "rb")
             src_fp.seek(cell.payload_offset)
             output_offset = output_fp.tell()
 
@@ -280,49 +289,53 @@ def relocate_payloads_dfs(
                     )
                 output_fp.write(chunk)
                 remaining -= len(chunk)
-        copied_cells += 1
-        copied_bytes += int(cell.payload_length)
-        now = time.perf_counter()
-        if (
-            copied_cells >= next_report_cell
-            or now - last_report_t >= progress_every_seconds
-        ):
-            print(
-                (
-                    "Combine: Phase A progress "
-                    f"cells={copied_cells:,}, "
-                    f"bytes={_format_bytes(copied_bytes)}, "
-                    f"out_offset={output_fp.tell():,}"
-                ),
-                flush=True,
-            )
-            while copied_cells >= next_report_cell:
-                next_report_cell += progress_every_cells
-            last_report_t = now
+            copied_cells += 1
+            copied_bytes += int(cell.payload_length)
+            now = time.perf_counter()
+            if (
+                copied_cells >= next_report_cell
+                or now - last_report_t >= progress_every_seconds
+            ):
+                print(
+                    (
+                        "Combine: Phase A progress "
+                        f"cells={copied_cells:,}, "
+                        f"bytes={_format_bytes(copied_bytes)}, "
+                        f"out_offset={output_fp.tell():,}"
+                    ),
+                    flush=True,
+                )
+                while copied_cells >= next_report_cell:
+                    next_report_cell += progress_every_cells
+                last_report_t = now
 
-        reloc = reloc_by_key.get(key)
-        if reloc is None:
-            stem = shard.index_path.name
-            reloc_path = manifest.root_dir / f"{stem}.reloc"
-            reloc = _RelocAppender(
-                reloc_path,
-                level=cell.shard.level,
-                prefix_bits=cell.shard.prefix_bits,
-                prefix=cell.shard.prefix,
+            reloc = reloc_by_key.get(key)
+            if reloc is None:
+                stem = shard.index_path.name
+                reloc_path = manifest.root_dir / f"{stem}.reloc"
+                reloc = _RelocAppender(
+                    reloc_path,
+                    level=cell.shard.level,
+                    prefix_bits=cell.shard.prefix_bits,
+                    prefix=cell.shard.prefix,
+                )
+                reloc_by_key[key] = reloc
+            reloc.append(
+                node_id=cell.node_id,
+                output_offset=output_offset,
+                payload_length=cell.payload_length,
+                star_count=cell.star_count,
+                file_cache=relocation_files,
             )
-            reloc_by_key[key] = reloc
-        reloc.append(
-            node_id=cell.node_id,
-            output_offset=output_offset,
-            payload_length=cell.payload_length,
-            star_count=cell.star_count,
-        )
+    finally:
+        payload_files.close_all()
+        relocation_files.close_all()
 
-    relocation_files: list[Path] = []
+    relocation_paths: list[Path] = []
     for key in sorted(reloc_by_key):
         app = reloc_by_key[key]
         app.finalize()
-        relocation_files.append(app.path)
+        relocation_paths.append(app.path)
 
     print(
         (
@@ -336,7 +349,7 @@ def relocate_payloads_dfs(
 
     return PayloadPassResult(
         payload_end_offset=output_fp.tell(),
-        relocation_files=tuple(relocation_files),
+        relocation_files=tuple(relocation_paths),
     )
 
 

@@ -142,6 +142,10 @@ Current direction:
 - Read all `(node, input_shard_id, kind)` staged parts that contribute to a
   node.
 - Interleave shard fragments into canonical payload order.
+- Preserve each Stage 01 group's existing canonical order when profile mapping
+  does not change it; do not introduce a full-catalogue sort.
+- Reorder only bounded group runs affected by output-profile level folding,
+  then combine final cells with a bounded fan-in merge.
 - Fan out rows from packed staging nodes into their final payload nodes when the
   final render level is deeper than the staging node.
 - Encode node-relative coordinates once, after the output profile has selected
@@ -149,6 +153,10 @@ Current direction:
 - Write raw payload bytes directly to disk in payload order.
 - Write an identity index or order file beside those payload bytes.
 - Record per-node offsets, row counts, checksums, and dirty state in a manifest.
+- Checkpoint normalized group runs and completed spatial output partitions so
+  interrupted materialization can resume.
+- Keep bounded caches of payload and relocation file handles during final DFS
+  packing; do not perform an open/close cycle for every output cell.
 
 The useful handoff to Stage 04 is a file layout like:
 

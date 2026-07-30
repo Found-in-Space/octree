@@ -320,6 +320,8 @@ def stage_02(
             max_level=resolved_max_level,
             batch_size=project.stage01.batch_size,
             max_open_files=project.stage02.max_open_files,
+            partition_from_level=project.stage02.partition_from_level,
+            partition_prefix_bits=project.stage02.partition_prefix_bits,
             retain_relocation_files=retain_relocation_files,
         )
     )

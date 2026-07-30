@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import struct
 from pathlib import Path
 from uuid import UUID
@@ -9,6 +10,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+import foundinspace.octree.classic_materialization as classic_materialization
 from foundinspace.octree.assembly import BuildPlan, build_intermediates
 from foundinspace.octree.classic import (
     ClassicBuildConfig,
@@ -71,8 +73,14 @@ def _node_center(level: int, node_id: int) -> tuple[float, float, float]:
     )
 
 
-def _write_input(root: Path, rows: list[dict], *, include_routing: bool = True) -> None:
-    shard_dir = root / "100"
+def _write_input(
+    root: Path,
+    rows: list[dict],
+    *,
+    include_routing: bool = True,
+    shard_id: str = "100",
+) -> None:
+    shard_dir = root / shard_id
     shard_dir.mkdir(parents=True, exist_ok=True)
     columns = {
         "source": pa.array(
@@ -243,6 +251,24 @@ def test_classic_build_matches_legacy_builder_when_rows_are_within_cap(
             "y_icrs_pc": 125_000.0,
             "z_icrs_pc": 100_000.0,
         },
+        {
+            "source_id": "deep-a",
+            "morton_code": _morton_for_node(8, 0),
+            "level": 8,
+            "mag_abs": 9.0,
+            "x_icrs_pc": _node_center(8, 0)[0],
+            "y_icrs_pc": _node_center(8, 0)[1],
+            "z_icrs_pc": _node_center(8, 0)[2],
+        },
+        {
+            "source_id": "deep-b",
+            "morton_code": _morton_for_node(8, 32 << 18),
+            "level": 8,
+            "mag_abs": 9.1,
+            "x_icrs_pc": _node_center(8, 32 << 18)[0],
+            "y_icrs_pc": _node_center(8, 32 << 18)[1],
+            "z_icrs_pc": _node_center(8, 32 << 18)[2],
+        },
     ]
     _input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
     classic_output = tmp_path / "classic.octree"
@@ -255,7 +281,7 @@ def test_classic_build_matches_legacy_builder_when_rows_are_within_cap(
             output_path=classic_output,
             identifiers_order_path=classic_identifiers,
             mag_limit=6.5,
-            max_level=1,
+            max_level=8,
             batch_size=10,
             max_open_files=4,
         ),
@@ -264,13 +290,13 @@ def test_classic_build_matches_legacy_builder_when_rows_are_within_cap(
     )
 
     legacy_input_root = tmp_path / "legacy-input"
-    _write_legacy_input(legacy_input_root, rows, max_level=1)
+    _write_legacy_input(legacy_input_root, rows, max_level=8)
     legacy_intermediates = tmp_path / "legacy-intermediates"
     legacy_render_manifest = build_intermediates(
         (legacy_input_root / "**" / "*.parquet").as_posix(),
         legacy_intermediates,
         plan=BuildPlan(
-            max_level=1,
+            max_level=8,
             deep_shard_from_level=99,
             deep_prefix_bits=3,
             batch_size=10,
@@ -370,6 +396,311 @@ def test_classic_build_folds_deep_rows_into_capped_node(tmp_path: Path) -> None:
             star.position.y,
             star.position.z,
         ) == pytest.approx(expected, abs=1e-5)
+
+
+def test_classic_build_merges_sorted_stage01_groups_in_canonical_order(
+    tmp_path: Path,
+) -> None:
+    input_root = tmp_path / "input"
+    stage00_dir = tmp_path / "stage00"
+    stage01_dir = tmp_path / "stage01"
+    level14_center = _node_center(14, 0)
+    level15_center = _node_center(15, 0)
+    level16_center = _node_center(16, 0)
+    _write_input(
+        input_root,
+        [
+            {
+                "source_id": "z",
+                "morton_code": _morton_for_node(15, 0),
+                "level": 15,
+                "mag_abs": 8.0,
+                "x_icrs_pc": level15_center[0],
+                "y_icrs_pc": level15_center[1],
+                "z_icrs_pc": level15_center[2],
+            }
+        ],
+        shard_id="100",
+    )
+    _write_input(
+        input_root,
+        [
+            {
+                "source_id": "a",
+                "morton_code": _morton_for_node(16, 0),
+                "level": 16,
+                "mag_abs": 7.0,
+                "x_icrs_pc": level16_center[0],
+                "y_icrs_pc": level16_center[1],
+                "z_icrs_pc": level16_center[2],
+            },
+            {
+                "source_id": "m",
+                "morton_code": _morton_for_node(14, 0),
+                "level": 14,
+                "mag_abs": 7.5,
+                "x_icrs_pc": level14_center[0],
+                "y_icrs_pc": level14_center[1],
+                "z_icrs_pc": level14_center[2],
+            },
+        ],
+        shard_id="101",
+    )
+    _write_input(
+        input_root,
+        [
+            {
+                "source_id": "b",
+                "morton_code": _morton_for_node(15, 0),
+                "level": 15,
+                "mag_abs": 7.25,
+                "x_icrs_pc": level15_center[0],
+                "y_icrs_pc": level15_center[1],
+                "z_icrs_pc": level15_center[2],
+            }
+        ],
+        shard_id="102",
+    )
+    run_stage00(
+        Stage00Config(
+            input_root=input_root,
+            output_dir=stage00_dir,
+            mag_config=MagLevelConfig(v_mag=6.5),
+            bucket_size=100,
+            batch_size=2,
+            fragment_target_rows=1,
+            compact_after_files=0,
+        )
+    )
+    run_stage01(
+        Stage01Config(
+            stage00_output_dir=stage00_dir,
+            output_dir=stage01_dir,
+            v_mag=6.5,
+            bucket_size=100,
+            batch_size=2,
+            fragment_target_rows=1,
+        )
+    )
+    identifiers_path = tmp_path / "identifiers.order"
+
+    result = build_classic_artifacts(
+        ClassicBuildConfig(
+            stage00_output_dir=stage00_dir,
+            stage01_output_dir=stage01_dir,
+            output_path=tmp_path / "stars.octree",
+            identifiers_order_path=identifiers_path,
+            mag_limit=6.5,
+            max_level=14,
+            batch_size=2,
+            max_open_files=2,
+        ),
+        dataset_uuid=_DATASET_UUID,
+        identifiers_uuid=_IDENTIFIERS_UUID,
+    )
+
+    assert result.row_count == 4
+    assert result.folded_row_count == 3
+    with IdentifiersOrderReader(identifiers_path) as reader:
+        cells = list(reader.iter_cells())
+    assert len(cells) == 1
+    assert cells[0][1] == [
+        ("gaia", "a"),
+        ("gaia", "b"),
+        ("gaia", "m"),
+        ("gaia", "z"),
+    ]
+
+
+def test_classic_build_externally_merges_folded_group_batches(
+    tmp_path: Path,
+) -> None:
+    rows = []
+    for level, magnitude, source_id in (
+        (15, 9.0, "z"),
+        (15, 8.0, "y"),
+        (16, 7.0, "a"),
+        (16, 6.0, "b"),
+    ):
+        center = _node_center(level, 0)
+        rows.append(
+            {
+                "source_id": source_id,
+                "morton_code": _morton_for_node(level, 0),
+                "level": level,
+                "mag_abs": magnitude,
+                "x_icrs_pc": center[0],
+                "y_icrs_pc": center[1],
+                "z_icrs_pc": center[2],
+            }
+        )
+    _input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
+    identifiers_path = tmp_path / "identifiers.order"
+
+    result = build_classic_artifacts(
+        ClassicBuildConfig(
+            stage00_output_dir=stage00_dir,
+            stage01_output_dir=stage01_dir,
+            output_path=tmp_path / "stars.octree",
+            identifiers_order_path=identifiers_path,
+            mag_limit=6.5,
+            max_level=14,
+            batch_size=2,
+            max_open_files=2,
+        ),
+        dataset_uuid=_DATASET_UUID,
+        identifiers_uuid=_IDENTIFIERS_UUID,
+    )
+
+    assert result.folded_row_count == 4
+    with IdentifiersOrderReader(identifiers_path) as reader:
+        cells = list(reader.iter_cells())
+    assert len(cells) == 1
+    assert cells[0][1] == [
+        ("gaia", "b"),
+        ("gaia", "a"),
+        ("gaia", "y"),
+        ("gaia", "z"),
+    ]
+
+
+def test_classic_build_reuses_completed_sorted_materialization(tmp_path: Path) -> None:
+    rows = [
+        {
+            "source_id": "a",
+            "morton_code": _morton_for_node(1, 0),
+            "level": 1,
+            "mag_abs": 7.0,
+            "x_icrs_pc": -100_000.0,
+            "y_icrs_pc": -100_000.0,
+            "z_icrs_pc": -100_000.0,
+        }
+    ]
+    _input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
+    config = ClassicBuildConfig(
+        stage00_output_dir=stage00_dir,
+        stage01_output_dir=stage01_dir,
+        output_path=tmp_path / "stars.octree",
+        identifiers_order_path=tmp_path / "identifiers.order",
+        mag_limit=6.5,
+        max_level=1,
+        batch_size=10,
+        max_open_files=2,
+    )
+    build_classic_artifacts(
+        config,
+        dataset_uuid=_DATASET_UUID,
+        identifiers_uuid=_IDENTIFIERS_UUID,
+    )
+    intermediates_dir = stage01_dir / "classic-intermediates"
+    mtimes = {
+        path.name: path.stat().st_mtime_ns
+        for path in intermediates_dir.iterdir()
+        if path.is_file()
+    }
+
+    build_classic_artifacts(
+        config,
+        dataset_uuid=_DATASET_UUID,
+        identifiers_uuid=_IDENTIFIERS_UUID,
+    )
+
+    assert {
+        path.name: path.stat().st_mtime_ns
+        for path in intermediates_dir.iterdir()
+        if path.is_file()
+    } == mtimes
+
+
+def test_classic_build_resumes_completed_spatial_partitions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    node_zero_center = _node_center(2, 0)
+    node_thirty_two_center = _node_center(2, 32)
+    rows = [
+        {
+            "source_id": "a",
+            "morton_code": _morton_for_node(2, 0),
+            "level": 2,
+            "mag_abs": 7.0,
+            "x_icrs_pc": node_zero_center[0],
+            "y_icrs_pc": node_zero_center[1],
+            "z_icrs_pc": node_zero_center[2],
+        },
+        {
+            "source_id": "b",
+            "morton_code": _morton_for_node(2, 32),
+            "level": 2,
+            "mag_abs": 7.1,
+            "x_icrs_pc": node_thirty_two_center[0],
+            "y_icrs_pc": node_thirty_two_center[1],
+            "z_icrs_pc": node_thirty_two_center[2],
+        },
+    ]
+    _input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
+    config = ClassicBuildConfig(
+        stage00_output_dir=stage00_dir,
+        stage01_output_dir=stage01_dir,
+        output_path=tmp_path / "stars.octree",
+        identifiers_order_path=tmp_path / "identifiers.order",
+        mag_limit=6.5,
+        max_level=2,
+        batch_size=1,
+        max_open_files=2,
+        partition_from_level=1,
+        partition_prefix_bits=1,
+    )
+    original = classic_materialization._materialize_partition
+    calls = 0
+
+    def fail_second_partition(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("simulated partition failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        classic_materialization,
+        "_materialize_partition",
+        fail_second_partition,
+    )
+    with pytest.raises(RuntimeError, match="simulated partition failure"):
+        build_classic_artifacts(config)
+
+    work_dir = stage01_dir / ".classic-intermediates.work"
+    state = json.loads(
+        (work_dir / "classic-work-state.json").read_text(encoding="utf-8")
+    )
+    assert len(state["completed_partitions"]) == 1
+    monkeypatch.setattr(
+        classic_materialization,
+        "_materialize_partition",
+        original,
+    )
+    monkeypatch.setattr(
+        classic_materialization,
+        "_normalize_group",
+        lambda *_args, **_kwargs: pytest.fail(
+            "completed Stage 01 groups should be reused"
+        ),
+    )
+
+    build_classic_artifacts(
+        config,
+        dataset_uuid=_DATASET_UUID,
+        identifiers_uuid=_IDENTIFIERS_UUID,
+    )
+
+    assert not work_dir.exists()
+    manifest = json.loads(
+        (stage01_dir / "classic-intermediates" / "render-manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    level_two = next(row for row in manifest["levels"] if row["level"] == 2)
+    assert [shard["prefix"] for shard in level_two["shards"]] == [0, 1]
 
 
 def test_classic_build_rejects_stage01_without_raw_fields(tmp_path: Path) -> None:

@@ -42,6 +42,16 @@ and creates the node-relative 16-byte render record once, for that final node.
 A packed final-output variant can choose different nodes from the same raw
 Stage 01 rows without changing Stage 00 or Stage 01.
 
+Classic materialization consumes Stage 01 as checksum-tracked sorted groups. It
+does not globally re-sort the catalogue: groups that do not need level folding
+remain in their Stage 01 order, folded groups are reordered locally, and final
+cells are combined with a bounded fan-in merge. Deep output levels are split
+into spatial partitions using `stage02.partition_from_level` and
+`stage02.partition_prefix_bits`. Completed group runs and output partitions are
+checkpointed in `.classic-intermediates.work`, so an interrupted build resumes
+without repeating completed work. Final payload relocation reuses a bounded LRU
+set of open shard and relocation files instead of reopening files per cell.
+
 Each render octree carries a `dataset_uuid`. Sidecars carry a `parent_dataset_uuid` so readers can validate the pairing before opening them.
 
 ## Installation

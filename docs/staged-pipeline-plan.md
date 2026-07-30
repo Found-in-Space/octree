@@ -33,6 +33,11 @@ Implemented on the current work branch:
 - Classic materialization selects the capped final node and encodes its
   node-relative render record once. Precomputed Stage 01 `render` records are
   not part of the staged-row contract.
+- Classic materialization preserves the sorted Stage 01 order for rows within
+  the level cap, locally reorders only groups affected by level folding, and
+  combines compact group runs with a bounded fan-in cell merge.
+- Deep classic output is spatially partitioned and checkpointed. Failed builds
+  reuse completed group runs and completed output partitions.
 
 Not implemented yet:
 
