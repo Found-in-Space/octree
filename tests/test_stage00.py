@@ -393,7 +393,7 @@ def test_stage00_rewrites_packed_files_when_node_becomes_lower_mag_limited(
 
     child_table = pq.read_table(next((tree / "o=0").glob("shard-123-pack-*.parquet")))
     assert "healpix_id" in child_table.schema.names
-    assert report["group_checksum_algorithm"] == "arrow-ipc-sha256/v0"
+    assert report["group_checksum_algorithm"] == "arrow-ipc-sha256/fixed-batches-v1"
     assert {
         (row["node_path"], row["input_shard_id"], row["kind"])
         for row in report["groups"]

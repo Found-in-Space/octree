@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -12,16 +11,20 @@ from typing import Any
 
 import numpy as np
 import pyarrow as pa
-import pyarrow.ipc as pa_ipc
 import pyarrow.parquet as pq
 
 from foundinspace.octree.config import MORTON_BITS, WORLD_CENTER, WORLD_HALF_SIZE_PC
 from foundinspace.octree.mag_levels import MagLevelConfig
 
+from .semantic_checksum import (
+    SEMANTIC_CHECKSUM_ALGORITHM,
+    checksum_parquet_files,
+)
+
 STAGE00_FORMAT = "foundinspace.octree.stage00/v0"
 TREE_MANIFEST_FORMAT = "foundinspace.octree.stage-tree/v0"
 STAGE_STATE_FORMAT = "foundinspace.octree.stage-state/v0"
-STAGE00_GROUP_CHECKSUM_ALGORITHM = "arrow-ipc-sha256/v0"
+STAGE00_GROUP_CHECKSUM_ALGORITHM = SEMANTIC_CHECKSUM_ALGORITHM
 STAGE00_ROW_SCHEMA_VERSION = "stage00-row-schema/v2"
 STAGE00_SPLIT_POLICY = "lower-mag-limited-bucket/v0"
 STAGE00_INPUT_FILTER_NONE = "none"
@@ -918,6 +921,7 @@ def _tree_identity_values(
         "input_filter": input_filter,
         "split_policy": STAGE00_SPLIT_POLICY,
         "row_schema_version": STAGE00_ROW_SCHEMA_VERSION,
+        "group_checksum_algorithm": STAGE00_GROUP_CHECKSUM_ALGORITHM,
     }
 
 
@@ -1173,13 +1177,7 @@ def _node_path_label(path_octants: tuple[int, ...]) -> str:
 
 
 def _stage00_group_checksum(paths: list[Path]) -> tuple[str, int]:
-    tables = [pq.read_table(path) for path in sorted(paths)]
-    canonical = _align_tables_to_union_schema(tables)
-    sink = pa.BufferOutputStream()
-    with pa_ipc.new_stream(sink, canonical.schema) as writer:
-        writer.write_table(canonical)
-    digest = hashlib.sha256(sink.getvalue()).hexdigest()
-    return f"sha256:{digest}", len(canonical)
+    return checksum_parquet_files(sorted(paths))
 
 
 def _align_tables_to_union_schema(tables: list[pa.Table]) -> pa.Table:

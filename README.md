@@ -34,6 +34,18 @@ input directory name or root-level parquet filename stem, so HEALPix files,
 batch shards, or another stable upstream layout all work; the upstream pipeline
 chooses the rebuild granularity by choosing its shard layout.
 
+Stage 00 group checksums are computed from fixed logical Arrow batches, streamed
+across parquet fragment boundaries. Their memory use therefore does not grow
+with an outlier group, and parquet metadata or different fragment boundaries do
+not change the semantic checksum.
+
+Stage 01 keeps the existing in-memory Arrow sort for ordinary groups. Groups
+above the normal row or uncompressed-byte limits automatically use DuckDB's
+disk-backed external sort instead. The fallback respects the `DUCKDB_MEMORY_LIMIT`,
+`DUCKDB_TEMP_DIR`, and `DUCKDB_MAX_TEMP_DIRECTORY_SIZE` settings; without an
+explicit memory limit it uses a bounded 512 MB default. The Stage 01 report and
+CLI summary show how many groups used each path.
+
 Stage 00 calculates only the routing fields (`morton_code` and natural
 `level`) from raw Cartesian input. Stage 01 preserves the raw position,
 magnitude, and temperature fields. The classic Stage 02 output then clamps

@@ -7,6 +7,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+import foundinspace.octree.sources.stage01 as stage01_module
 from foundinspace.octree.config import MORTON_BITS
 from foundinspace.octree.mag_levels import MagLevelConfig
 from foundinspace.octree.sources.stage00 import Stage00Config, run_stage00
@@ -154,6 +155,8 @@ def test_stage01_first_run_writes_sorted_groups_and_state(tmp_path: Path) -> Non
     assert report["processed_group_count"] == 1
     assert report["changed_group_count"] == 1
     assert report["dirty_stage03_node_count"] == 3
+    assert report["in_memory_sort_group_count"] == 1
+    assert report["external_sort_group_count"] == 0
     assert state["dirty"]["stage01_groups"] == []
     assert state["dirty"]["deleted_stage00_groups"] == []
     assert state["dirty"]["stage03_nodes"] == ["0:0", "1:0", "1:1"]
@@ -523,3 +526,108 @@ def test_stage01_force_rebuilds_all_groups(tmp_path: Path) -> None:
     assert report["processed_group_count"] == 1
     assert report["changed_group_count"] == 1
     assert report["force"] is True
+
+
+def test_stage01_uses_external_sort_for_oversized_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_root = tmp_path / "input"
+    _write_stage00_pixel(
+        input_root,
+        "100",
+        [
+            {
+                "source": "gaia",
+                "source_id": source_id,
+                "morton_code": _morton_for_node(level, node_id),
+                "level": level,
+                "mag_abs": magnitude,
+            }
+            for source_id, level, node_id, magnitude in (
+                ("z", 2, 1, 9.0),
+                ("b", 1, 0, 8.0),
+                ("a", 1, 0, 7.0),
+                ("y", 2, 0, 6.0),
+                ("x", 2, 1, 5.0),
+            )
+        ],
+    )
+    stage00_dir = tmp_path / "stage00"
+    stage01_dir = tmp_path / "stage01"
+    run_stage00(_stage00_config(input_root, stage00_dir))
+    stage00_state = json.loads(
+        (stage00_dir / "stage-state.json").read_text(encoding="utf-8")
+    )
+    expected_sorted = stage01_module._sorted_stage00_group(
+        stage00_dir,
+        stage00_state["stage00_groups"][0],
+    )
+    expected_checksum = stage01_module._stage01_group_checksum(expected_sorted)
+    monkeypatch.setattr(
+        stage01_module,
+        "STAGE01_IN_MEMORY_MAX_UNCOMPRESSED_BYTES",
+        1,
+    )
+    monkeypatch.setattr(
+        stage01_module,
+        "_sorted_stage00_group_files",
+        lambda *_args, **_kwargs: pytest.fail("in-memory sort path was used"),
+    )
+
+    report_path = run_stage01(
+        _stage01_config(
+            stage00_dir,
+            stage01_dir,
+            fragment_target_rows=2,
+        )
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    state = json.loads((stage00_dir / "stage-state.json").read_text(encoding="utf-8"))
+    files = [stage01_dir / path for path in state["stage01_groups"][0]["files"]]
+    sorted_table = pa.concat_tables([pq.read_table(path) for path in files])
+    assert report["external_sort_group_count"] == 1
+    assert report["in_memory_sort_group_count"] == 0
+    assert [pq.read_metadata(path).num_rows for path in files] == [2, 2, 1]
+    assert sorted_table.column("source_id").to_pylist() == ["a", "b", "y", "x", "z"]
+    assert state["stage01_groups"][0]["checksum"] == expected_checksum
+
+
+def test_stage01_external_sort_ignores_hive_node_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_root = tmp_path / "input"
+    _write_stage00_pixel(
+        input_root,
+        "100",
+        [
+            {
+                "source": "gaia",
+                "source_id": str(node_id),
+                "morton_code": _morton_for_node(2, node_id),
+                "level": 2,
+                "mag_abs": 7.0 + node_id,
+            }
+            for node_id in range(3)
+        ],
+    )
+    stage00_dir = tmp_path / "stage00"
+    stage01_dir = tmp_path / "stage01"
+    run_stage00(_stage00_config(input_root, stage00_dir, bucket_size=1))
+    monkeypatch.setattr(
+        stage01_module,
+        "STAGE01_IN_MEMORY_MAX_UNCOMPRESSED_BYTES",
+        1,
+    )
+
+    report_path = run_stage01(_stage01_config(stage00_dir, stage01_dir, bucket_size=1))
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    state = json.loads((stage00_dir / "stage-state.json").read_text(encoding="utf-8"))
+    assert report["external_sort_group_count"] == 3
+    for group in state["stage01_groups"]:
+        for rel_path in group["files"]:
+            schema = pq.read_schema(stage01_dir / rel_path)
+            assert "o" not in schema.names

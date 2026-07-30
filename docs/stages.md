@@ -106,6 +106,9 @@ Current direction:
 - Preserve the `(node, input_shard_id, kind)` replaceability boundary.
 - Preserve raw position and photometry columns; do not encode a 16-byte render
   record while final node placement is still profile-dependent.
+- Keep the in-memory Arrow sort for ordinary groups, but route groups above the
+  normal row or uncompressed-byte limits through a disk-backed DuckDB external
+  sort with bounded memory.
 - Use atomic temp files and renames for rewritten fragments.
 - Track fragment state in the stage-state manifest.
 - Use filename markers as an optimization, for example `unsorted`, `sorted`, or

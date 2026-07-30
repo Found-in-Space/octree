@@ -18,12 +18,16 @@ Implemented on the current work branch:
   stable upstream rebuild unit.
 - Stage 00 preserves the input shard id in output fragment names.
 - Stage 00 reports group-level content checksums for current staged fragments.
+  Checksums stream fixed logical Arrow batches, so memory use and digest identity
+  do not depend on physical parquet fragment boundaries.
 - Stage 00 has been smoke-tested against a 31M-row real parquet shard.
 - Stage 00 writes tree identity and mutable stage-state manifests.
 - Stage 00 supports explicit shard replacement and dirty Stage 01 group
   tracking.
 - Stage 01 sorts and compacts Stage 00 groups into replaceable sorted parquet
   groups while preserving `(staging_node, input_shard_id, kind)` granularity.
+  Ordinary groups retain the in-memory Arrow fast path; outlier groups switch to
+  a disk-backed DuckDB external sort with a bounded default memory limit.
 - The compatibility `stage-02` path materializes the traditional/classic
   level-capped output from tracked Stage 01 groups and writes `stars.octree`
   plus `identifiers.order` through the existing binary combine pipeline.
@@ -351,8 +355,10 @@ should be one group or one staging node, not the full tree.
 Stage 01 behavior:
 
 1. Walk Stage 00 groups.
-2. For each dirty or unsorted group, read all fragment files.
-3. Sort by the Stage 01 canonical key.
+2. For each dirty or unsorted group, inspect parquet metadata to choose the
+   ordinary in-memory path or the outlier external-sort path.
+3. Sort by the Stage 01 canonical key. The external path streams sorted Arrow
+   batches and can spill to the configured DuckDB temporary directory.
 4. Write replacement sorted files to temp paths.
 5. Compute sorted checksum.
 6. Atomically swap files.
