@@ -28,7 +28,7 @@ _DEFAULT_STAGE00_COMPACT_AFTER_FILES = 64
 _DEFAULT_STAGE00_INPUT_FILTER = "none"
 _STAGE00_INPUT_FILTERS = {
     "none",
-    "raw-cartesian-to-stage00-enriched/v0",
+    "raw-cartesian-to-stage00-routing/v1",
 }
 
 _PATH_KEYS = {

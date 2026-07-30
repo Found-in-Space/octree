@@ -9,7 +9,11 @@ import pytest
 from click.testing import CliRunner
 
 from foundinspace.octree._cli import cli
-from foundinspace.octree.config import MORTON_BITS
+from foundinspace.octree.config import (
+    MORTON_BITS,
+    WORLD_CENTER,
+    WORLD_HALF_SIZE_PC,
+)
 from foundinspace.octree.mag_levels import MagLevelConfig
 from foundinspace.octree.sources.stage00 import Stage00Config, run_stage00
 from foundinspace.octree.sources.stage01 import Stage01Config, run_stage01
@@ -25,18 +29,43 @@ def _morton_for_node(level: int, node_id: int) -> int:
     return int(node_id) << (3 * (MORTON_BITS - level))
 
 
+def _node_center(level: int, node_id: int) -> tuple[float, float, float]:
+    grid = [0, 0, 0]
+    for bit in range(level):
+        for axis in range(3):
+            grid[axis] |= ((node_id >> (3 * bit + axis)) & 1) << bit
+    width = 2.0 * WORLD_HALF_SIZE_PC / (2**level)
+    return tuple(
+        float(WORLD_CENTER[axis] - WORLD_HALF_SIZE_PC + (value + 0.5) * width)
+        for axis, value in enumerate(grid)
+    )
+
+
 def _stage00_table(rows: list[dict], *, shard_id: str) -> pa.Table:
+    positions = [
+        _node_center(
+            int(row["level"]),
+            int(row["morton_code"]) >> (3 * (MORTON_BITS - int(row["level"]))),
+        )
+        for row in rows
+    ]
     return pa.table(
         {
             "source": pa.array([r.get("source", "gaia") for r in rows], pa.string()),
             "source_id": pa.array([r["source_id"] for r in rows], pa.string()),
             "morton_code": pa.array([r["morton_code"] for r in rows], pa.uint64()),
-            "render": pa.array(
-                [bytes([idx + 1]) * 16 for idx, _row in enumerate(rows)],
-                pa.binary(16),
-            ),
             "level": pa.array([r["level"] for r in rows], pa.int32()),
             "mag_abs": pa.array([r.get("mag_abs", 7.0) for r in rows], pa.float64()),
+            "x_icrs_pc": pa.array(
+                [position[0] for position in positions], pa.float64()
+            ),
+            "y_icrs_pc": pa.array(
+                [position[1] for position in positions], pa.float64()
+            ),
+            "z_icrs_pc": pa.array(
+                [position[2] for position in positions], pa.float64()
+            ),
+            "teff": pa.array([r.get("teff", 5800.0) for r in rows], pa.float64()),
             "healpix_id": pa.array([shard_id for _row in rows], pa.string()),
         }
     )

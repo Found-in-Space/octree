@@ -22,10 +22,10 @@ STAGE00_FORMAT = "foundinspace.octree.stage00/v0"
 TREE_MANIFEST_FORMAT = "foundinspace.octree.stage-tree/v0"
 STAGE_STATE_FORMAT = "foundinspace.octree.stage-state/v0"
 STAGE00_GROUP_CHECKSUM_ALGORITHM = "arrow-ipc-sha256/v0"
-STAGE00_ROW_SCHEMA_VERSION = "stage00-row-schema/v1"
+STAGE00_ROW_SCHEMA_VERSION = "stage00-row-schema/v2"
 STAGE00_SPLIT_POLICY = "lower-mag-limited-bucket/v0"
 STAGE00_INPUT_FILTER_NONE = "none"
-STAGE00_INPUT_FILTER_RAW_CARTESIAN = "raw-cartesian-to-stage00-enriched/v0"
+STAGE00_INPUT_FILTER_RAW_CARTESIAN = "raw-cartesian-to-stage00-routing/v1"
 STAGE00_INPUT_FILTERS = (
     STAGE00_INPUT_FILTER_NONE,
     STAGE00_INPUT_FILTER_RAW_CARTESIAN,
@@ -1131,13 +1131,11 @@ def _apply_input_filter(table: pa.Table, config: Stage00Config) -> pa.Table:
     if config.input_filter == STAGE00_INPUT_FILTER_NONE:
         return table
     if config.input_filter == STAGE00_INPUT_FILTER_RAW_CARTESIAN:
-        from .add_shard_columns import _enrich_table
+        from .add_shard_columns import _add_routing_columns
 
-        return _enrich_table(
+        return _add_routing_columns(
             table,
             mag_config=config.mag_config,
-            center=WORLD_CENTER.copy(),
-            half_size=WORLD_HALF_SIZE_PC,
         )
     raise ValueError(f"Unsupported Stage 00 input_filter: {config.input_filter!r}")
 

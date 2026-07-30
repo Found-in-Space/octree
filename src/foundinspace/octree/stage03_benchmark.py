@@ -11,9 +11,12 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
+import numpy as np
+import pyarrow.parquet as pq
 
 from foundinspace.octree.config import DEFAULT_CLASSIC_MAX_LEVEL, MORTON_BITS
 from foundinspace.octree.duckdb_util import configure_connection
+from foundinspace.octree.encoding.render import encode_render_records
 from foundinspace.octree.reader.stats import (
     DEFAULT_SHELL_COALESCE_GAP_BYTES,
     coalesce_payload_ranges,
@@ -33,7 +36,16 @@ PROFILES = ("classic", "unbounded")
 PACKING_ORDERS = ("dfs", "level-major", "tile-level-major")
 SCENARIOS = ("observer-shell", "target-frustum")
 CLASSIC_MAX_LEVEL = DEFAULT_CLASSIC_MAX_LEVEL
-RENDER_RECORD_SIZE = 16
+_RAW_RENDER_COLUMNS = {
+    "x_icrs_pc",
+    "y_icrs_pc",
+    "z_icrs_pc",
+    "mag_abs",
+    "source",
+    "source_id",
+    "morton_code",
+    "level",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,18 +248,24 @@ def _iter_final_nodes(
     batch_size: int,
 ) -> Iterator[_FinalNode]:
     cap_level = CLASSIC_MAX_LEVEL if profile == "classic" else MORTON_BITS
+    has_teff = _validate_raw_stage01_schema(files)
     source = _duckdb_read_parquet_source(files)
     final_level_expr = f"CASE WHEN level > {cap_level} THEN {cap_level} ELSE level END"
+    teff_expr = "teff" if has_teff else "NULL::DOUBLE AS teff"
     query = f"""
         WITH staged AS (
             SELECT
                 {final_level_expr} AS final_level,
+                level AS source_level,
                 morton_code,
-                render,
+                x_icrs_pc,
+                y_icrs_pc,
+                z_icrs_pc,
                 mag_abs,
+                {teff_expr},
                 source,
                 source_id
-            FROM read_parquet({source})
+            FROM read_parquet({source}, union_by_name = true)
         )
         SELECT
             final_level,
@@ -255,8 +273,13 @@ def _iter_final_nodes(
                 morton_code
                 >> CAST((3 * ({MORTON_BITS} - final_level)) AS INTEGER)
             ) AS final_node_id,
-            render,
+            source_level,
+            morton_code,
+            x_icrs_pc,
+            y_icrs_pc,
+            z_icrs_pc,
             mag_abs,
+            teff,
             source,
             source_id
         FROM staged
@@ -274,19 +297,33 @@ def _iter_final_nodes(
             batch = con.fetchmany(batch_size)
             if not batch:
                 break
-            for (
+            parsed_rows: list[tuple[int, int]] = []
+            positions = np.empty((len(batch), 3), dtype=np.float64)
+            magnitudes = np.empty(len(batch), dtype=np.float64)
+            temperatures = np.empty(len(batch), dtype=np.float64)
+            final_levels = np.empty(len(batch), dtype=np.int32)
+            morton_codes = np.empty(len(batch), dtype=np.uint64)
+            for index, (
                 level_raw,
                 node_raw,
-                render_raw,
+                source_level_raw,
+                morton_code_raw,
+                x_raw,
+                y_raw,
+                z_raw,
                 mag_raw,
+                teff_raw,
                 source_raw,
                 source_id_raw,
-            ) in batch:
+            ) in enumerate(batch):
                 required = {
                     "level": level_raw,
-                    "morton_code/final_node_id": node_raw,
-                    "render": render_raw,
-                    "mag_abs": mag_raw,
+                    "final_node_id": node_raw,
+                    "source_level": source_level_raw,
+                    "morton_code": morton_code_raw,
+                    "x_icrs_pc": x_raw,
+                    "y_icrs_pc": y_raw,
+                    "z_icrs_pc": z_raw,
                     "source": source_raw,
                     "source_id": source_id_raw,
                 }
@@ -300,19 +337,37 @@ def _iter_final_nodes(
                 if level < 0 or level > MORTON_BITS:
                     raise ValueError(f"Invalid final node level {level}")
                 node_id = int(node_raw)
+                source_level = int(source_level_raw)
+                if source_level < level:
+                    raise ValueError(
+                        f"Final node level {level} exceeds source level {source_level}"
+                    )
+                parsed_rows.append((level, node_id))
+                positions[index] = (float(x_raw), float(y_raw), float(z_raw))
+                magnitudes[index] = np.nan if mag_raw is None else float(mag_raw)
+                temperatures[index] = np.nan if teff_raw is None else float(teff_raw)
+                final_levels[index] = level
+                morton_codes[index] = int(morton_code_raw)
+
+            encoded_renders = encode_render_records(
+                morton_codes=morton_codes,
+                positions=positions,
+                mag_abs=magnitudes,
+                teff=temperatures,
+                levels=final_levels,
+            )
+            for (level, node_id), render in zip(
+                parsed_rows,
+                encoded_renders,
+                strict=True,
+            ):
                 key = (level, node_id)
                 if current_key is not None and key != current_key:
                     yield _compressed_node(current_key, renders, star_count)
                     renders = bytearray()
                     star_count = 0
                 current_key = key
-                render = bytes(render_raw)
-                if len(render) != RENDER_RECORD_SIZE:
-                    raise ValueError(
-                        "Render record length must be "
-                        f"{RENDER_RECORD_SIZE}, got {len(render)}"
-                    )
-                renders.extend(render)
+                renders.extend(render.tobytes())
                 star_count += 1
         if current_key is not None:
             yield _compressed_node(current_key, renders, star_count)
@@ -341,6 +396,20 @@ def _duckdb_read_parquet_source(files: list[Path]) -> str:
     if len(quoted) == 1:
         return quoted[0]
     return "[" + ", ".join(quoted) + "]"
+
+
+def _validate_raw_stage01_schema(files: list[Path]) -> bool:
+    has_teff = False
+    for path in files:
+        names = set(pq.read_schema(path).names)
+        missing = sorted(_RAW_RENDER_COLUMNS - names)
+        if missing:
+            raise ValueError(
+                "Stage 03 benchmark requires raw Stage 01 fields; "
+                f"{path} is missing {missing}. Rebuild Stage 00 and Stage 01."
+            )
+        has_teff = has_teff or "teff" in names
+    return has_teff
 
 
 def _payload_offsets(

@@ -77,11 +77,14 @@ but that is only an intermediate layout choice.
 
 Current direction:
 
-- Require upstream placement fields needed for routing, currently
-  `morton_code` and `level`.
+- Require placement fields needed for routing, currently `morton_code` and
+  natural `level`; the explicit raw Cartesian filter may calculate them.
 - Preserve every input row and pass non-routing columns through unchanged.
-- Allow enrichment or normalization only through an explicitly configured
-  pre-filter that must preserve row count.
+- Preserve raw `x_icrs_pc`, `y_icrs_pc`, `z_icrs_pc`, `mag_abs`, and optional
+  `teff` through staging so final output profiles can choose their actual node.
+- Allow routing enrichment only through an explicitly configured pre-filter
+  that must preserve row count and must not create node-relative render
+  coordinates.
 - Keep sparse regions shallow in the staging filesystem.
 - Let dense staging nodes become lower-magnitude limited only after they reach
   the configured row cap.
@@ -101,6 +104,8 @@ affected folders.
 Current direction:
 
 - Preserve the `(node, input_shard_id, kind)` replaceability boundary.
+- Preserve raw position and photometry columns; do not encode a 16-byte render
+  record while final node placement is still profile-dependent.
 - Use atomic temp files and renames for rewritten fragments.
 - Track fragment state in the stage-state manifest.
 - Use filename markers as an optimization, for example `unsorted`, `sorted`, or
@@ -139,6 +144,8 @@ Current direction:
 - Interleave shard fragments into canonical payload order.
 - Fan out rows from packed staging nodes into their final payload nodes when the
   final render level is deeper than the staging node.
+- Encode node-relative coordinates once, after the output profile has selected
+  each row's actual final node.
 - Write raw payload bytes directly to disk in payload order.
 - Write an identity index or order file beside those payload bytes.
 - Record per-node offsets, row counts, checksums, and dirty state in a manifest.

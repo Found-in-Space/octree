@@ -122,7 +122,7 @@ def _load_project_or_die(project_path: Path):
 )
 @click.option(
     "--input-filter",
-    type=click.Choice(["none", "raw-cartesian-to-stage00-enriched/v0"]),
+    type=click.Choice(["none", "raw-cartesian-to-stage00-routing/v1"]),
     default=None,
     help="Explicit pre-filter before Stage 00 routing. Defaults to stage00.input_filter.",
 )

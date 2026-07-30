@@ -27,8 +27,12 @@ Implemented on the current work branch:
 - The compatibility `stage-02` path materializes the traditional/classic
   level-capped output from tracked Stage 01 groups and writes `stars.octree`
   plus `identifiers.order` through the existing binary combine pipeline.
-- Classic materialization promotes render coordinates from deeper source cells
-  into the configured ancestor cell before encoding the final payload.
+- The raw Cartesian input filter computes only `morton_code` and natural
+  `level`; raw position, magnitude, and temperature fields remain available in
+  Stage 00 and Stage 01.
+- Classic materialization selects the capped final node and encodes its
+  node-relative render record once. Precomputed Stage 01 `render` records are
+  not part of the staged-row contract.
 
 Not implemented yet:
 
@@ -132,7 +136,9 @@ Stage 00 derives `input_shard_id` from the input directory name or root-level
 parquet filename stem. It does not derive the rebuild boundary from row-level
 HEALPix columns. It preserves row columns as supplied; enrichment or
 normalization is allowed only through an explicitly configured pre-filter, and
-that filter must preserve row count.
+that filter must preserve row count. The raw Cartesian filter adds routing
+columns only. It does not replace raw coordinates with node-relative payload
+coordinates.
 
 ### Canonical Ordering
 
@@ -306,7 +312,8 @@ Inputs:
 Outputs:
 
 - adaptive staging tree under `stage00/tree`
-- raw `pack` and `lim` parquet fragments
+- raw `pack` and `lim` parquet fragments containing source position,
+  photometry, identity, and routing fields
 - Stage 00 report
 - tree identity manifest
 - mutable stage state entries for affected groups
@@ -346,6 +353,9 @@ Stage 01 behavior:
 6. Atomically swap files.
 7. If checksum changed, mark affected final nodes dirty.
 
+Stage 01 must preserve the raw fields needed to encode the final render record.
+It sorts rows but does not create node-relative coordinates.
+
 ### Stage 03
 
 Inputs:
@@ -372,10 +382,10 @@ must route those rows to final node payloads for each output profile.
 Profile behavior:
 
 - `classic` clamps output to level 14. Rows with deeper final levels are
-  materialized into the corresponding level-14 node using the Stage 03
-  canonical order for that profile.
+  materialized into the corresponding level-14 node and encoded relative to
+  that selected node using the Stage 03 canonical order for that profile.
 - `unbounded` materializes rows at their Stage 00 final levels through level
-  21.
+  21 and encodes them relative to those selected nodes.
 - Both profiles can use the same sidecar definitions, but each profile writes
   its own sidecar artifacts because profile identity order can differ.
 

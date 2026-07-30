@@ -5,13 +5,14 @@ import json
 import math
 import os
 import shutil
-import struct
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 import duckdb
+import numpy as np
+import pyarrow.parquet as pq
 
 from .assembly.formats import (
     IDENTIFIERS_ARTIFACT_KIND,
@@ -29,6 +30,7 @@ from .combine import CombinePlan, combine_octree
 from .combine.records import PackedDescriptorFields
 from .config import DEFAULT_CLASSIC_MAX_LEVEL, MORTON_BITS
 from .duckdb_util import configure_connection
+from .encoding.render import encode_render_records
 from .identifiers_order import combine_identifiers_order
 from .sources.stage00 import (
     STAGE_STATE_FORMAT,
@@ -38,8 +40,16 @@ from .sources.stage00 import (
 )
 
 CLASSIC_INTERMEDIATES_DIR_NAME = "classic-intermediates"
-_RENDER_POSITION_FMT = struct.Struct("<fff")
-_RENDER_RECORD_SIZE = 16
+_RAW_RENDER_COLUMNS = {
+    "x_icrs_pc",
+    "y_icrs_pc",
+    "z_icrs_pc",
+    "mag_abs",
+    "source",
+    "source_id",
+    "morton_code",
+    "level",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,55 +160,18 @@ def _duckdb_read_parquet_source(files: list[Path]) -> str:
     return "[" + ", ".join(quoted) + "]"
 
 
-def promote_render_to_ancestor(
-    render: bytes,
-    *,
-    morton_code: int,
-    source_level: int,
-    target_level: int,
-) -> bytes:
-    """Re-express one render record relative to an ancestor cell.
-
-    The final four bytes (magnitude, temperature and padding) are copied
-    unchanged. Only the three normalized cell-relative coordinates are
-    promoted.
-    """
-    raw = bytes(render)
-    if len(raw) != _RENDER_RECORD_SIZE:
-        raise ValueError(
-            f"Render record length must be {_RENDER_RECORD_SIZE}, got {len(raw)}"
-        )
-    if source_level < 0 or source_level > MORTON_BITS:
-        raise ValueError(f"source_level must be in 0..{MORTON_BITS}")
-    if target_level < 0 or target_level > source_level:
-        raise ValueError(f"target_level must be in 0..{source_level}")
-    if source_level == target_level:
-        return raw
-
-    x_rel, y_rel, z_rel = _RENDER_POSITION_FMT.unpack_from(raw)
-    level_delta = source_level - target_level
-    cells_per_axis = 1 << level_delta
-    source_node_id = int(morton_code) >> (3 * (MORTON_BITS - source_level))
-
-    descendant_x = 0
-    descendant_y = 0
-    descendant_z = 0
-    for bit in range(level_delta):
-        shift = 3 * bit
-        descendant_x |= ((source_node_id >> shift) & 1) << bit
-        descendant_y |= ((source_node_id >> (shift + 1)) & 1) << bit
-        descendant_z |= ((source_node_id >> (shift + 2)) & 1) << bit
-
-    def promote(value: float, descendant: int) -> float:
-        promoted = -1.0 + ((2 * descendant + 1) + float(value)) / cells_per_axis
-        return min(1.0, max(-1.0, promoted))
-
-    promoted_position = _RENDER_POSITION_FMT.pack(
-        promote(x_rel, descendant_x),
-        promote(y_rel, descendant_y),
-        promote(z_rel, descendant_z),
-    )
-    return promoted_position + raw[_RENDER_POSITION_FMT.size :]
+def _validate_raw_stage01_schema(stage01_files: list[Path]) -> bool:
+    has_teff = False
+    for path in stage01_files:
+        names = set(pq.read_schema(path).names)
+        missing = sorted(_RAW_RENDER_COLUMNS - names)
+        if missing:
+            raise ValueError(
+                "Classic materialization requires raw Stage 01 fields; "
+                f"{path} is missing {missing}. Rebuild Stage 00 and Stage 01."
+            )
+        has_teff = has_teff or "teff" in names
+    return has_teff
 
 
 def materialize_classic_intermediates(
@@ -219,19 +192,24 @@ def materialize_classic_intermediates(
         raise FileExistsError(f"Classic intermediate directory is not empty: {out_dir}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    has_teff = _validate_raw_stage01_schema(stage01_files)
     source = _duckdb_read_parquet_source(stage01_files)
     final_level_expr = f"CASE WHEN level > {max_level} THEN {max_level} ELSE level END"
+    teff_expr = "teff" if has_teff else "NULL::DOUBLE AS teff"
     query = f"""
         WITH staged AS (
             SELECT
                 {final_level_expr} AS final_level,
                 level AS source_level,
                 morton_code,
-                render,
+                x_icrs_pc,
+                y_icrs_pc,
+                z_icrs_pc,
                 mag_abs,
+                {teff_expr},
                 source,
                 source_id
-            FROM read_parquet({source})
+            FROM read_parquet({source}, union_by_name = true)
         )
         SELECT
             final_level,
@@ -241,7 +219,11 @@ def materialize_classic_intermediates(
             ) AS final_node_id,
             source_level,
             morton_code,
-            render,
+            x_icrs_pc,
+            y_icrs_pc,
+            z_icrs_pc,
+            mag_abs,
+            teff,
             source,
             source_id
         FROM staged
@@ -332,21 +314,33 @@ def materialize_classic_intermediates(
             rows = con.fetchmany(batch_size)
             if not rows:
                 break
-            for (
+            parsed_rows: list[tuple[int, int, int, str, str]] = []
+            positions = np.empty((len(rows), 3), dtype=np.float64)
+            magnitudes = np.empty(len(rows), dtype=np.float64)
+            temperatures = np.empty(len(rows), dtype=np.float64)
+            final_levels = np.empty(len(rows), dtype=np.int32)
+            morton_codes = np.empty(len(rows), dtype=np.uint64)
+            for index, (
                 final_level_raw,
                 final_node_id_raw,
                 source_level_raw,
                 morton_code_raw,
-                render_raw,
+                x_raw,
+                y_raw,
+                z_raw,
+                mag_abs_raw,
+                teff_raw,
                 source_raw,
                 source_id_raw,
-            ) in rows:
+            ) in enumerate(rows):
                 required = {
                     "final_level": final_level_raw,
                     "final_node_id": final_node_id_raw,
                     "source_level": source_level_raw,
                     "morton_code": morton_code_raw,
-                    "render": render_raw,
+                    "x_icrs_pc": x_raw,
+                    "y_icrs_pc": y_raw,
+                    "z_icrs_pc": z_raw,
                     "source": source_raw,
                     "source_id": source_id_raw,
                 }
@@ -359,6 +353,43 @@ def materialize_classic_intermediates(
                 final_level = int(final_level_raw)
                 final_node_id = int(final_node_id_raw)
                 source_level = int(source_level_raw)
+                morton_code = int(morton_code_raw)
+                if source_level < final_level:
+                    raise ValueError(
+                        f"Classic final level {final_level} exceeds source level "
+                        f"{source_level}"
+                    )
+                parsed_rows.append(
+                    (
+                        final_level,
+                        final_node_id,
+                        source_level,
+                        str(source_raw),
+                        str(source_id_raw),
+                    )
+                )
+                positions[index] = (float(x_raw), float(y_raw), float(z_raw))
+                magnitudes[index] = (
+                    np.nan if mag_abs_raw is None else float(mag_abs_raw)
+                )
+                temperatures[index] = np.nan if teff_raw is None else float(teff_raw)
+                final_levels[index] = final_level
+                morton_codes[index] = morton_code
+
+            encoded_renders = encode_render_records(
+                morton_codes=morton_codes,
+                positions=positions,
+                mag_abs=magnitudes,
+                teff=temperatures,
+                levels=final_levels,
+            )
+            for (
+                final_level,
+                final_node_id,
+                source_level,
+                source,
+                source_id,
+            ), render in zip(parsed_rows, encoded_renders, strict=True):
                 key = (final_level, final_node_id)
                 if current_key is not None and key < current_key:
                     raise ValueError(
@@ -368,27 +399,11 @@ def materialize_classic_intermediates(
                     flush_cell()
                 current_key = key
 
-                render = bytes(render_raw)
                 if source_level > final_level:
-                    render = promote_render_to_ancestor(
-                        render,
-                        morton_code=int(morton_code_raw),
-                        source_level=source_level,
-                        target_level=final_level,
-                    )
                     folded_row_count += 1
-                elif source_level < final_level:
-                    raise ValueError(
-                        f"Classic final level {final_level} exceeds source level {source_level}"
-                    )
-                elif len(render) != _RENDER_RECORD_SIZE:
-                    raise ValueError(
-                        "Render record length must be "
-                        f"{_RENDER_RECORD_SIZE}, got {len(render)}"
-                    )
 
-                current_renders.extend(render)
-                current_identities.append((str(source_raw), str(source_id_raw)))
+                current_renders.extend(render.tobytes())
+                current_identities.append((source, source_id))
                 row_count += 1
         flush_cell()
         close_writers()

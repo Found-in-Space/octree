@@ -97,8 +97,15 @@ def test_run_enrich_healpix_per_pixel_non_destructive_and_resumable(tmp_path: Pa
         parts = sorted(pixel_dir.glob("*.parquet"))
         assert parts
         out_df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
-        assert {"morton_code", "render", "level", "mag_abs"}.issubset(out_df.columns)
-        assert out_df["render"].map(len).eq(16).all()
+        assert {
+            "x_icrs_pc",
+            "y_icrs_pc",
+            "z_icrs_pc",
+            "mag_abs",
+            "morton_code",
+            "level",
+        }.issubset(out_df.columns)
+        assert "render" not in out_df.columns
 
         sorted_index = (
             out_df[["morton_code", "mag_abs"]]

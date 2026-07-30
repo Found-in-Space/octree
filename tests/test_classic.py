@@ -4,6 +4,7 @@ import struct
 from pathlib import Path
 from uuid import UUID
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -12,11 +13,15 @@ from foundinspace.octree.assembly import BuildPlan, build_intermediates
 from foundinspace.octree.classic import (
     ClassicBuildConfig,
     build_classic_artifacts,
-    promote_render_to_ancestor,
 )
 from foundinspace.octree.combine import CombinePlan, combine_octree
 from foundinspace.octree.combine.records import PackedDescriptorFields
-from foundinspace.octree.config import MORTON_BITS
+from foundinspace.octree.config import (
+    MORTON_BITS,
+    WORLD_CENTER,
+    WORLD_HALF_SIZE_PC,
+)
+from foundinspace.octree.encoding.render import encode_render_records
 from foundinspace.octree.identifiers_order import (
     IdentifiersOrderReader,
     combine_identifiers_order,
@@ -25,8 +30,12 @@ from foundinspace.octree.identifiers_order import (
     read_header as read_identifiers_header,
 )
 from foundinspace.octree.mag_levels import MagLevelConfig
-from foundinspace.octree.reader import read_header
-from foundinspace.octree.sources.stage00 import Stage00Config, run_stage00
+from foundinspace.octree.reader import OctreeReader, Point, read_header
+from foundinspace.octree.sources.stage00 import (
+    STAGE00_INPUT_FILTER_RAW_CARTESIAN,
+    Stage00Config,
+    run_stage00,
+)
 from foundinspace.octree.sources.stage01 import Stage01Config, run_stage01
 
 _RENDER = struct.Struct("<fffhBB")
@@ -50,35 +59,111 @@ def _render(
     return _RENDER.pack(x, y, z, magnitude, teff, pad)
 
 
-def _write_input(root: Path, rows: list[dict]) -> None:
+def _node_center(level: int, node_id: int) -> tuple[float, float, float]:
+    grid = [0, 0, 0]
+    for bit in range(level):
+        for axis in range(3):
+            grid[axis] |= ((node_id >> (3 * bit + axis)) & 1) << bit
+    width = 2.0 * WORLD_HALF_SIZE_PC / (2**level)
+    return tuple(
+        float(WORLD_CENTER[axis] - WORLD_HALF_SIZE_PC + (value + 0.5) * width)
+        for axis, value in enumerate(grid)
+    )
+
+
+def _write_input(root: Path, rows: list[dict], *, include_routing: bool = True) -> None:
+    shard_dir = root / "100"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    columns = {
+        "source": pa.array(
+            [row.get("source", "gaia") for row in rows],
+            type=pa.string(),
+        ),
+        "source_id": pa.array(
+            [row["source_id"] for row in rows],
+            type=pa.string(),
+        ),
+        "x_icrs_pc": pa.array([row["x_icrs_pc"] for row in rows], pa.float64()),
+        "y_icrs_pc": pa.array([row["y_icrs_pc"] for row in rows], pa.float64()),
+        "z_icrs_pc": pa.array([row["z_icrs_pc"] for row in rows], pa.float64()),
+        "mag_abs": pa.array(
+            [row.get("mag_abs", 7.0) for row in rows],
+            type=pa.float64(),
+        ),
+    }
+    if any("teff" in row for row in rows):
+        columns["teff"] = pa.array(
+            [row.get("teff") for row in rows],
+            pa.float64(),
+        )
+    if include_routing:
+        columns["morton_code"] = pa.array(
+            [row["morton_code"] for row in rows],
+            type=pa.uint64(),
+        )
+        columns["level"] = pa.array(
+            [row["level"] for row in rows],
+            type=pa.int32(),
+        )
+    pq.write_table(
+        pa.table(columns),
+        shard_dir / "part.parquet",
+        compression="zstd",
+    )
+
+
+def _write_legacy_input(root: Path, rows: list[dict], *, max_level: int) -> None:
+    levels = np.array(
+        [min(int(row["level"]), max_level) for row in rows],
+        dtype=np.int32,
+    )
+    morton_codes = np.array([row["morton_code"] for row in rows], dtype=np.uint64)
+    renders = encode_render_records(
+        morton_codes=morton_codes,
+        positions=np.array(
+            [[row["x_icrs_pc"], row["y_icrs_pc"], row["z_icrs_pc"]] for row in rows],
+            dtype=np.float64,
+        ),
+        mag_abs=np.array([row["mag_abs"] for row in rows], dtype=np.float64),
+        teff=np.array([row.get("teff", 5800.0) for row in rows], dtype=np.float64),
+        levels=levels,
+    )
+    legacy_rows = [
+        row
+        | {
+            "level": int(level),
+            "render": render.tobytes(),
+        }
+        for row, level, render in zip(rows, levels, renders, strict=True)
+    ]
     shard_dir = root / "100"
     shard_dir.mkdir(parents=True, exist_ok=True)
     pq.write_table(
         pa.table(
             {
                 "source": pa.array(
-                    [row.get("source", "gaia") for row in rows],
-                    type=pa.string(),
+                    [row.get("source", "gaia") for row in legacy_rows],
+                    pa.string(),
                 ),
                 "source_id": pa.array(
-                    [row["source_id"] for row in rows],
-                    type=pa.string(),
+                    [row["source_id"] for row in legacy_rows],
+                    pa.string(),
                 ),
                 "morton_code": pa.array(
-                    [row["morton_code"] for row in rows],
-                    type=pa.uint64(),
+                    [row["morton_code"] for row in legacy_rows],
+                    pa.uint64(),
                 ),
                 "render": pa.array(
-                    [row["render"] for row in rows],
-                    type=pa.binary(16),
+                    [row["render"] for row in legacy_rows],
+                    pa.binary(16),
                 ),
                 "level": pa.array(
-                    [row["level"] for row in rows],
-                    type=pa.int32(),
+                    [row["level"] for row in legacy_rows],
+                    pa.int32(),
                 ),
                 "mag_abs": pa.array(
-                    [row.get("mag_abs", 7.0) for row in rows],
-                    type=pa.float64(),
+                    [row["mag_abs"] for row in legacy_rows],
+                    pa.float64(),
                 ),
             }
         ),
@@ -87,11 +172,20 @@ def _write_input(root: Path, rows: list[dict]) -> None:
     )
 
 
-def _build_stages(tmp_path: Path, rows: list[dict]) -> tuple[Path, Path, Path]:
+def _build_stages(
+    tmp_path: Path,
+    rows: list[dict],
+    *,
+    input_filter: str = "none",
+) -> tuple[Path, Path, Path]:
     input_root = tmp_path / "input"
     stage00_dir = tmp_path / "stage00"
     stage01_dir = tmp_path / "stage01"
-    _write_input(input_root, rows)
+    _write_input(
+        input_root,
+        rows,
+        include_routing=input_filter == "none",
+    )
     run_stage00(
         Stage00Config(
             input_root=input_root,
@@ -101,6 +195,7 @@ def _build_stages(tmp_path: Path, rows: list[dict]) -> tuple[Path, Path, Path]:
             batch_size=10,
             fragment_target_rows=10,
             compact_after_files=0,
+            input_filter=input_filter,
         )
     )
     run_stage01(
@@ -109,29 +204,12 @@ def _build_stages(tmp_path: Path, rows: list[dict]) -> tuple[Path, Path, Path]:
             output_dir=stage01_dir,
             v_mag=6.5,
             bucket_size=100,
+            input_filter=input_filter,
             batch_size=10,
             fragment_target_rows=10,
         )
     )
     return input_root, stage00_dir, stage01_dir
-
-
-def test_promote_render_to_direct_ancestor_preserves_absolute_position() -> None:
-    source_level = 15
-    target_level = 14
-    source_node_id = 0b101
-    raw = _render(0.0, 0.0, 0.0, magnitude=-123, teff=44, pad=9)
-
-    promoted = promote_render_to_ancestor(
-        raw,
-        morton_code=_morton_for_node(source_level, source_node_id),
-        source_level=source_level,
-        target_level=target_level,
-    )
-
-    x, y, z, magnitude, teff, pad = _RENDER.unpack(promoted)
-    assert (x, y, z) == pytest.approx((0.5, -0.5, 0.5))
-    assert (magnitude, teff, pad) == (-123, 44, 9)
 
 
 def test_classic_build_matches_legacy_builder_when_rows_are_within_cap(
@@ -141,26 +219,32 @@ def test_classic_build_matches_legacy_builder_when_rows_are_within_cap(
         {
             "source_id": "root",
             "morton_code": _morton_for_node(0, 0),
-            "render": _render(0.1, 0.2, 0.3),
             "level": 0,
             "mag_abs": 1.0,
+            "x_icrs_pc": 20_000.0,
+            "y_icrs_pc": 40_000.0,
+            "z_icrs_pc": 60_000.0,
         },
         {
             "source_id": "a",
             "morton_code": _morton_for_node(1, 0),
-            "render": _render(-0.5, -0.25, 0.0),
             "level": 1,
             "mag_abs": 7.0,
+            "x_icrs_pc": -150_000.0,
+            "y_icrs_pc": -125_000.0,
+            "z_icrs_pc": -100_000.0,
         },
         {
             "source_id": "b",
             "morton_code": _morton_for_node(1, 7),
-            "render": _render(0.5, 0.25, 0.0),
             "level": 1,
             "mag_abs": 8.0,
+            "x_icrs_pc": 150_000.0,
+            "y_icrs_pc": 125_000.0,
+            "z_icrs_pc": 100_000.0,
         },
     ]
-    input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
+    _input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
     classic_output = tmp_path / "classic.octree"
     classic_identifiers = tmp_path / "classic.identifiers.order"
 
@@ -179,9 +263,11 @@ def test_classic_build_matches_legacy_builder_when_rows_are_within_cap(
         identifiers_uuid=_IDENTIFIERS_UUID,
     )
 
+    legacy_input_root = tmp_path / "legacy-input"
+    _write_legacy_input(legacy_input_root, rows, max_level=1)
     legacy_intermediates = tmp_path / "legacy-intermediates"
     legacy_render_manifest = build_intermediates(
-        (input_root / "**" / "*.parquet").as_posix(),
+        (legacy_input_root / "**" / "*.parquet").as_posix(),
         legacy_intermediates,
         plan=BuildPlan(
             max_level=1,
@@ -215,23 +301,31 @@ def test_classic_build_matches_legacy_builder_when_rows_are_within_cap(
 
 def test_classic_build_folds_deep_rows_into_capped_node(tmp_path: Path) -> None:
     source_level = 15
+    node_zero_center = _node_center(source_level, 0)
+    node_one_center = _node_center(source_level, 1)
     rows = [
         {
             "source_id": "b",
-            "morton_code": _morton_for_node(source_level, 1),
-            "render": _render(0.0, 0.0, 0.0),
-            "level": source_level,
+            "x_icrs_pc": node_one_center[0],
+            "y_icrs_pc": node_one_center[1],
+            "z_icrs_pc": node_one_center[2],
             "mag_abs": 8.0,
         },
         {
             "source_id": "a",
-            "morton_code": _morton_for_node(source_level, 0),
-            "render": _render(0.0, 0.0, 0.0),
-            "level": source_level,
+            "x_icrs_pc": node_zero_center[0],
+            "y_icrs_pc": node_zero_center[1],
+            "z_icrs_pc": node_zero_center[2],
             "mag_abs": 7.0,
         },
     ]
-    _input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
+    _input_root, stage00_dir, stage01_dir = _build_stages(
+        tmp_path,
+        rows,
+        input_filter=STAGE00_INPUT_FILTER_RAW_CARTESIAN,
+    )
+    stage01_file = next(stage01_dir.rglob("*.parquet"))
+    assert "render" not in pq.read_schema(stage01_file).names
     output_path = tmp_path / "stars.octree"
     identifiers_path = tmp_path / "identifiers.order"
 
@@ -264,3 +358,80 @@ def test_classic_build_folds_deep_rows_into_capped_node(tmp_path: Path) -> None:
     record, identities = cells[0]
     assert (record.level, record.node_id, record.star_count) == (14, 0, 2)
     assert identities == [("gaia", "a"), ("gaia", "b")]
+    with OctreeReader(output_path) as reader:
+        stars = sorted(
+            reader.stars_within_distance(Point(0.0, 0.0, 0.0), 1_000_000.0),
+            key=lambda star: star.magnitude,
+        )
+    assert len(stars) == 2
+    for star, expected in zip(stars, (node_zero_center, node_one_center), strict=True):
+        assert (
+            star.position.x,
+            star.position.y,
+            star.position.z,
+        ) == pytest.approx(expected, abs=1e-5)
+
+
+def test_classic_build_rejects_stage01_without_raw_fields(tmp_path: Path) -> None:
+    input_root = tmp_path / "input"
+    stage00_dir = tmp_path / "stage00"
+    stage01_dir = tmp_path / "stage01"
+    rows = [
+        {
+            "source_id": "legacy",
+            "morton_code": _morton_for_node(1, 0),
+            "render": _render(0.0, 0.0, 0.0),
+            "level": 1,
+            "mag_abs": 7.0,
+        }
+    ]
+    shard_dir = input_root / "100"
+    shard_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.table(
+            {
+                "source": pa.array(["gaia"], pa.string()),
+                "source_id": pa.array(["legacy"], pa.string()),
+                "morton_code": pa.array([rows[0]["morton_code"]], pa.uint64()),
+                "render": pa.array([rows[0]["render"]], pa.binary(16)),
+                "level": pa.array([1], pa.int32()),
+                "mag_abs": pa.array([7.0], pa.float64()),
+            }
+        ),
+        shard_dir / "part.parquet",
+    )
+    run_stage00(
+        Stage00Config(
+            input_root=input_root,
+            output_dir=stage00_dir,
+            mag_config=MagLevelConfig(v_mag=6.5),
+            bucket_size=100,
+            batch_size=10,
+            fragment_target_rows=10,
+            compact_after_files=0,
+        )
+    )
+    run_stage01(
+        Stage01Config(
+            stage00_output_dir=stage00_dir,
+            output_dir=stage01_dir,
+            v_mag=6.5,
+            bucket_size=100,
+            batch_size=10,
+            fragment_target_rows=10,
+        )
+    )
+
+    with pytest.raises(ValueError, match="requires raw Stage 01 fields"):
+        build_classic_artifacts(
+            ClassicBuildConfig(
+                stage00_output_dir=stage00_dir,
+                stage01_output_dir=stage01_dir,
+                output_path=tmp_path / "stars.octree",
+                identifiers_order_path=tmp_path / "identifiers.order",
+                mag_limit=6.5,
+                max_level=14,
+                batch_size=10,
+                max_open_files=4,
+            )
+        )

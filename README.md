@@ -34,10 +34,13 @@ input directory name or root-level parquet filename stem, so HEALPix files,
 batch shards, or another stable upstream layout all work; the upstream pipeline
 chooses the rebuild granularity by choosing its shard layout.
 
-The classic Stage 02 output clamps rows below `stage02.classic_max_level`
-(default 14) into their ancestor node and promotes their cell-relative render
-coordinates accordingly. A packed final-output variant can be added alongside
-this path later without changing Stage 00 or Stage 01.
+Stage 00 calculates only the routing fields (`morton_code` and natural
+`level`) from raw Cartesian input. Stage 01 preserves the raw position,
+magnitude, and temperature fields. The classic Stage 02 output then clamps
+rows below `stage02.classic_max_level` (default 14) into their ancestor node
+and creates the node-relative 16-byte render record once, for that final node.
+A packed final-output variant can choose different nodes from the same raw
+Stage 01 rows without changing Stage 00 or Stage 01.
 
 Each render octree carries a `dataset_uuid`. Sidecars carry a `parent_dataset_uuid` so readers can validate the pairing before opening them.
 

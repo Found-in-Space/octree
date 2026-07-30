@@ -265,6 +265,25 @@ def test_stage00_explicit_raw_filter_preserves_row_count_and_records_filter(
         "morton_code",
         "level",
     }.issubset(table.schema.names)
+    assert "render" not in table.schema.names
+    assert table.select(
+        ["x_icrs_pc", "y_icrs_pc", "z_icrs_pc", "mag_abs", "teff"]
+    ).to_pylist() == [
+        {
+            "x_icrs_pc": 0.0,
+            "y_icrs_pc": 0.0,
+            "z_icrs_pc": 0.0,
+            "mag_abs": 5.0,
+            "teff": 5500.0,
+        },
+        {
+            "x_icrs_pc": 1.0,
+            "y_icrs_pc": 0.0,
+            "z_icrs_pc": 0.0,
+            "mag_abs": 6.0,
+            "teff": 5000.0,
+        },
+    ]
 
 
 def test_stage00_fails_if_input_filter_changes_row_count(
