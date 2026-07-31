@@ -514,6 +514,196 @@ def stage_03_benchmark(
     _render_stage03_benchmark(console, report)
 
 
+@cli.command("terminal-memory-benchmark")
+@click.argument("octree_source", type=str)
+@click.option(
+    "--sample",
+    "sample_specs",
+    multiple=True,
+    required=True,
+    help=("Complete subtree sample as NAME:X,Y,Z@LEVEL. May be passed multiple times."),
+)
+@click.option(
+    "--trace",
+    "trace_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "Ordered observer trace JSON. Without it, each sample point is replayed "
+        "at the octree index magnitude."
+    ),
+)
+@click.option(
+    "--waterline",
+    "waterlines",
+    multiple=True,
+    type=click.IntRange(min=1),
+    help="Terminal subtree star cap. May be passed multiple times.",
+)
+@click.option(
+    "--chunk-stars",
+    "chunk_star_counts",
+    multiple=True,
+    type=click.IntRange(min=1),
+    help="Independently decompressible terminal chunk size.",
+)
+@click.option(
+    "--decoded-cache-mib",
+    type=click.FloatRange(min=0.0),
+    default=64.0,
+    show_default=True,
+    help="Decoded LRU cache budget used by the replay.",
+)
+@click.option(
+    "--terminal-directory-record-bytes",
+    type=click.IntRange(min=0),
+    default=24,
+    show_default=True,
+    help="Assumed bytes per logical payload entry in a terminal directory.",
+)
+@click.option(
+    "--max-inflight-payloads",
+    type=click.IntRange(min=1),
+    default=8,
+    show_default=True,
+    help="Largest simultaneously inflating entry wave used for peak estimates.",
+)
+@click.option(
+    "--workers",
+    type=click.IntRange(min=1),
+    default=16,
+    show_default=True,
+    help="Concurrent payload range readers during sample extraction.",
+)
+@click.option(
+    "--cache-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Optional directory for extracted subtree and magnitude caches.",
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Print machine-readable JSON instead of summary tables.",
+)
+def terminal_memory_benchmark(
+    octree_source: str,
+    sample_specs: tuple[str, ...],
+    trace_path: Path | None,
+    waterlines: tuple[int, ...],
+    chunk_star_counts: tuple[int, ...],
+    decoded_cache_mib: float,
+    terminal_directory_record_bytes: int,
+    max_inflight_payloads: int,
+    workers: int,
+    cache_dir: Path | None,
+    as_json: bool,
+) -> None:
+    """Replay virtual terminal packing against published STAR v1 subtrees."""
+    from foundinspace.octree.terminal_memory_benchmark import (
+        DEFAULT_CHUNK_STAR_COUNTS,
+        DEFAULT_WATERLINES,
+        TerminalMemoryBenchmarkConfig,
+        load_trace,
+        parse_sample_spec,
+        report_to_json,
+        run_terminal_memory_benchmark,
+    )
+
+    try:
+        source = _resolve_octree_source(octree_source)
+        samples = tuple(parse_sample_spec(value) for value in sample_specs)
+        views = load_trace(trace_path) if trace_path is not None else ()
+        report = run_terminal_memory_benchmark(
+            TerminalMemoryBenchmarkConfig(
+                source=source,
+                samples=samples,
+                views=views,
+                waterlines=waterlines or DEFAULT_WATERLINES,
+                chunk_star_counts=(chunk_star_counts or DEFAULT_CHUNK_STAR_COUNTS),
+                decoded_cache_bytes=round(decoded_cache_mib * 1024 * 1024),
+                terminal_directory_record_bytes=(terminal_directory_record_bytes),
+                max_inflight_payloads=max_inflight_payloads,
+                workers=workers,
+                cache_dir=cache_dir.expanduser() if cache_dir else None,
+            )
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if as_json:
+        click.echo(report_to_json(report), nl=False)
+        return
+
+    console = Console()
+    console.print(
+        "Terminal memory benchmark: "
+        f"{_format_source_label(source)} | "
+        f"samples={len(samples)} | "
+        f"views={'trace' if views else 'sample defaults'}"
+    )
+    _render_terminal_memory_benchmark(console, report)
+
+
+def _render_terminal_memory_benchmark(console: Console, report: dict) -> None:
+    for sample in report["samples"]:
+        classic = sample["classic"]
+        console.print(
+            f"[bold]{sample['name']}[/bold] "
+            f"level={sample['sample_level']} | "
+            f"nodes={classic['node_count']:,} | "
+            f"payloads={classic['payload_node_count']:,} | "
+            f"stars={classic['star_count']:,}"
+        )
+        table = Table()
+        table.add_column("Layout")
+        table.add_column("W", justify="right")
+        table.add_column("Chunk", justify="right")
+        table.add_column("External", justify="right")
+        table.add_column("Active", justify="right")
+        table.add_column("Resident", justify="right")
+        table.add_column("Peak", justify="right")
+        table.add_column("Overfetch", justify="right")
+        for scenario in sample["scenarios"]:
+            table.add_row(
+                _terminal_policy_label(str(scenario["policy"])),
+                (
+                    "-"
+                    if scenario["waterline"] is None
+                    else f"{scenario['waterline']:,}"
+                ),
+                (
+                    "-"
+                    if scenario["chunk_star_count"] is None
+                    else f"{scenario['chunk_star_count']:,}"
+                ),
+                f"{scenario['external_node_count']:,}",
+                f"{scenario['max_active_rows']:,}",
+                _format_memory_bytes(int(scenario["max_resident_bytes"])),
+                _format_memory_bytes(int(scenario["max_peak_bytes"])),
+                f"{float(scenario['max_overfetch_ratio']):.2f}x",
+            )
+        console.print(table)
+
+
+def _terminal_policy_label(policy: str) -> str:
+    return {
+        "v1": "v1",
+        "terminal-monolithic": "full",
+        "terminal-magnitude-chunked": "mag",
+        "terminal-logical-chunked": "logical",
+    }.get(policy, policy)
+
+
+def _format_memory_bytes(value: int) -> str:
+    if value < 1024:
+        return f"{value:,} B"
+    if value < 1024 * 1024:
+        return f"{value / 1024.0:,.1f} KB"
+    return _format_compact_mb(value)
+
+
 def _parse_point(value: str) -> Point:
     try:
         parts = [p.strip() for p in value.split(",")]

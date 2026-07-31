@@ -132,6 +132,20 @@ uv run fis-octree stats https://example.com/stars.octree --nearest 20 --radius 2
 uv run fis-octree stats stars.octree --meta-octree meta.octree --point "8.6,0,0"
 ```
 
+The terminal-memory testbed forms virtual packed STAR v2 subtrees over an
+existing artifact and replays headset-oriented memory policies without
+rewriting the octree:
+
+```bash
+uv run fis-octree terminal-memory-benchmark stars.octree \
+  --sample sun:1,1,1@11 \
+  --waterline 1000 \
+  --chunk-stars 256
+```
+
+See [`docs/terminal-memory-testbed.md`](docs/terminal-memory-testbed.md) for
+published-octree sampling, observer traces, caching, and model assumptions.
+
 ## Runtime configuration
 
 DuckDB memory and threading behaviour can be tuned at runtime via environment variables (or a `.env` file in the project root). All are optional:
@@ -172,6 +186,7 @@ Current stage overview and supporting notes:
 - [`docs/sidecars.md`](docs/sidecars.md)
 - [`docs/identifiers-order.md`](docs/identifiers-order.md)
 - [`docs/reader.md`](docs/reader.md)
+- [`docs/terminal-memory-testbed.md`](docs/terminal-memory-testbed.md)
 - [`docs/glow.md`](docs/glow.md)
 - [`docs/roadmap.md`](docs/roadmap.md)
 
