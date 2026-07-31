@@ -27,7 +27,7 @@ STAGE00_FORMAT = "foundinspace.octree.stage00/v0"
 TREE_MANIFEST_FORMAT = "foundinspace.octree.stage-tree/v0"
 STAGE_STATE_FORMAT = "foundinspace.octree.stage-state/v0"
 STAGE00_GROUP_CHECKSUM_ALGORITHM = SEMANTIC_CHECKSUM_ALGORITHM
-STAGE00_ROW_SCHEMA_VERSION = "stage00-row-schema/v2"
+STAGE00_ROW_SCHEMA_VERSION = "stage00-row-schema/v3"
 STAGE00_SPLIT_POLICY = "lower-mag-limited-bucket/v0"
 STAGE00_INPUT_FILTER_NONE = "none"
 STAGE00_INPUT_FILTER_RAW_CARTESIAN = "raw-cartesian-to-stage00-routing/v1"
@@ -61,6 +61,9 @@ _FRAGMENT_RE = re.compile(
 _ROUTING_COLUMN_TYPES = {
     "morton_code": pa.uint64(),
     "level": pa.int32(),
+}
+_CANONICAL_INPUT_COLUMN_TYPES = {
+    "quality_flags": pa.uint16(),
 }
 
 
@@ -251,7 +254,8 @@ class _Stage00Builder:
             context=f"Stage 00 input_filter {self._config.input_filter}",
         )
         self._rows_after_filter += len(filtered)
-        staged = _ensure_stage00_routing_columns(filtered)
+        normalized = _normalize_stage00_input_schema(filtered)
+        staged = _ensure_stage00_routing_columns(normalized)
         self._route_table(
             self._node_for_path(()),
             staged,
@@ -1591,6 +1595,35 @@ def _apply_input_filter(table: pa.Table, config: Stage00Config) -> pa.Table:
             mag_config=config.mag_config,
         )
     raise ValueError(f"Unsupported Stage 00 input_filter: {config.input_filter!r}")
+
+
+def _normalize_stage00_input_schema(table: pa.Table) -> pa.Table:
+    """Safely normalize canonical payload fields from compatible legacy inputs."""
+    for name, expected_type in _CANONICAL_INPUT_COLUMN_TYPES.items():
+        if name not in table.schema.names:
+            continue
+        index = table.schema.get_field_index(name)
+        field = table.schema.field(index)
+        if field.type.equals(expected_type) and field.nullable:
+            continue
+        try:
+            column = table.column(index).cast(expected_type, safe=True)
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError, TypeError) as exc:
+            raise ValueError(
+                "Stage 00 cannot safely normalize input column "
+                f"{name} from {field.type} to {expected_type}"
+            ) from exc
+        table = table.set_column(
+            index,
+            pa.field(
+                name,
+                expected_type,
+                nullable=True,
+                metadata=field.metadata,
+            ),
+            column,
+        )
+    return table
 
 
 def _ensure_stage00_routing_columns(table: pa.Table) -> pa.Table:

@@ -160,6 +160,7 @@ def test_stage00_writes_tree_manifest_and_state(tmp_path: Path) -> None:
             "v_mag": 6.5,
             "bucket_size": 100,
             "morton_bits": MORTON_BITS,
+            "row_schema_version": "stage00-row-schema/v3",
         }
         == manifest["tree_identity"]
     )
@@ -644,16 +645,18 @@ def test_stage00_rolls_fragments_by_target_rows(tmp_path: Path) -> None:
     assert [pq.ParquetFile(path).metadata.num_rows for path in files] == [2, 2, 1]
 
 
-def test_stage00_rejects_schema_drift_for_rolling_writers(tmp_path: Path) -> None:
+def test_stage00_normalizes_legacy_quality_flags_schema_drift(
+    tmp_path: Path,
+) -> None:
     input_root = tmp_path / "input"
     pixel_dir = input_root / "202"
     pixel_dir.mkdir(parents=True)
     common = {
         "source": pa.array(["gaia"], type=pa.string()),
         "source_id": pa.array(["a"], type=pa.string()),
-        "morton_code": pa.array([_morton_for_node(2, 0)], type=pa.uint64()),
-        "render": pa.array([b"\x00" * 16], type=pa.binary(16)),
-        "level": pa.array([2], type=pa.int32()),
+        "x_icrs_pc": pa.array([1.0], type=pa.float64()),
+        "y_icrs_pc": pa.array([0.0], type=pa.float64()),
+        "z_icrs_pc": pa.array([0.0], type=pa.float64()),
         "mag_abs": pa.array([8.0], type=pa.float64()),
     }
     pq.write_table(
@@ -666,16 +669,84 @@ def test_stage00_rejects_schema_drift_for_rolling_writers(tmp_path: Path) -> Non
     )
 
     out_dir = tmp_path / "stage00"
+    report_path = run_stage00(
+        Stage00Config(
+            input_root=input_root,
+            output_dir=out_dir,
+            mag_config=MagLevelConfig(v_mag=6.5),
+            bucket_size=100,
+            batch_size=10,
+            fragment_target_rows=10,
+            compact_after_files=0,
+            input_filter=STAGE00_INPUT_FILTER_RAW_CARTESIAN,
+        )
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    fragment = next((out_dir / "tree").glob("shard-202-pack-*.parquet"))
+    assert report["rows_current"] == 2
+    assert pq.read_schema(fragment).field("quality_flags").type == pa.uint16()
+
+
+def test_stage00_rejects_out_of_range_legacy_quality_flags(tmp_path: Path) -> None:
+    input_root = tmp_path / "input"
+    pixel_dir = input_root / "202"
+    pixel_dir.mkdir(parents=True)
+    pq.write_table(
+        pa.table(
+            {
+                "source": pa.array(["gaia"], type=pa.string()),
+                "source_id": pa.array(["a"], type=pa.string()),
+                "morton_code": pa.array([_morton_for_node(2, 0)], type=pa.uint64()),
+                "level": pa.array([2], type=pa.int32()),
+                "mag_abs": pa.array([8.0], type=pa.float64()),
+                "quality_flags": pa.array([65_536], type=pa.int64()),
+            }
+        ),
+        pixel_dir / "part.parquet",
+    )
+
+    with pytest.raises(ValueError, match="cannot safely normalize.*quality_flags"):
+        run_stage00(
+            Stage00Config(
+                input_root=input_root,
+                output_dir=tmp_path / "stage00",
+                mag_config=MagLevelConfig(v_mag=6.5),
+                bucket_size=100,
+                batch_size=10,
+            )
+        )
+
+
+def test_stage00_still_rejects_unrelated_schema_drift(tmp_path: Path) -> None:
+    input_root = tmp_path / "input"
+    pixel_dir = input_root / "202"
+    pixel_dir.mkdir(parents=True)
+    common = {
+        "source": pa.array(["gaia"], type=pa.string()),
+        "source_id": pa.array(["a"], type=pa.string()),
+        "morton_code": pa.array([_morton_for_node(2, 0)], type=pa.uint64()),
+        "level": pa.array([2], type=pa.int32()),
+        "mag_abs": pa.array([8.0], type=pa.float64()),
+        "quality_flags": pa.array([1], type=pa.uint16()),
+    }
+    pq.write_table(
+        pa.table(common | {"teff": pa.array([5_000], type=pa.float32())}),
+        pixel_dir / "part-0.parquet",
+    )
+    pq.write_table(
+        pa.table(common | {"teff": pa.array([5_000], type=pa.float64())}),
+        pixel_dir / "part-1.parquet",
+    )
+
     with pytest.raises(ValueError, match="schema changed"):
         run_stage00(
             Stage00Config(
                 input_root=input_root,
-                output_dir=out_dir,
+                output_dir=tmp_path / "stage00",
                 mag_config=MagLevelConfig(v_mag=6.5),
                 bucket_size=100,
                 batch_size=10,
-                fragment_target_rows=10,
-                compact_after_files=0,
             )
         )
 
