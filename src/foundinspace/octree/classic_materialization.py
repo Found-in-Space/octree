@@ -252,6 +252,7 @@ def load_published_materialization(
     out_dir: Path,
     *,
     input_identity: str,
+    plan: ClassicMaterializationPlan,
 ) -> ClassicMaterializationResult | None:
     state_path = out_dir / CLASSIC_BUILD_STATE_NAME
     if not state_path.is_file():
@@ -266,6 +267,11 @@ def load_published_materialization(
         identifiers_manifest = read_manifest(out_dir, name=IDENTIFIERS_MANIFEST_NAME)
         if render_manifest is None or identifiers_manifest is None:
             return None
+        _validate_published_terminal_map(
+            out_dir,
+            render_manifest,
+            plan=plan,
+        )
         for entry in manifest_entries(render_manifest):
             validate_shard(out_dir, entry, expected_magic=INDEX_MAGIC)
         for entry in manifest_entries(identifiers_manifest):
@@ -284,6 +290,30 @@ def load_published_materialization(
         )
     except (KeyError, OSError, TypeError, ValueError):
         return None
+
+
+def _validate_published_terminal_map(
+    out_dir: Path,
+    render_manifest: dict[str, Any],
+    *,
+    plan: ClassicMaterializationPlan,
+) -> None:
+    terminal_map_path_raw = render_manifest.get("terminal_map_path")
+    if plan.star_format_version == 1:
+        if terminal_map_path_raw is not None:
+            raise ValueError("STAR v1 materialization unexpectedly has a terminal map")
+        return
+    if not isinstance(terminal_map_path_raw, str) or not terminal_map_path_raw:
+        raise ValueError("STAR v2 materialization is missing its terminal map")
+    terminal_map = TerminalMap(out_dir / terminal_map_path_raw)
+    if terminal_map.max_level != plan.max_level:
+        raise ValueError(
+            "Published terminal map max_level does not match the materialization plan"
+        )
+    if terminal_map.waterline != plan.terminal_waterline:
+        raise ValueError(
+            "Published terminal map waterline does not match the materialization plan"
+        )
 
 
 def materialize_classic_groups(

@@ -24,23 +24,50 @@ class TerminalMap:
         self.manifest_path = Path(manifest_path)
         raw = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         if raw.get("format") != TERMINAL_MAP_FORMAT:
-            raise ValueError(
-                f"Unsupported terminal map format: {raw.get('format')!r}"
-            )
+            raise ValueError(f"Unsupported terminal map format: {raw.get('format')!r}")
         self.max_level = int(raw["max_level"])
+        self.waterline = int(raw["waterline"])
         self.terminal_count = int(raw["terminal_count"])
+        if self.max_level < 0 or self.max_level > MORTON_BITS:
+            raise ValueError(f"Invalid terminal map max_level: {self.max_level}")
+        if self.waterline <= 0:
+            raise ValueError(f"Invalid terminal map waterline: {self.waterline}")
+        if self.terminal_count < 0:
+            raise ValueError(
+                f"Invalid terminal map terminal_count: {self.terminal_count}"
+            )
+        level_entries = raw.get("levels")
+        if not isinstance(level_entries, list):
+            raise ValueError("Terminal map levels must be a list")
         self._by_level: dict[int, np.ndarray] = {}
-        for entry in raw.get("levels", []):
+        counted_terminals = 0
+        for entry in level_entries:
             level = int(entry["level"])
             count = int(entry["count"])
+            if level < 0 or level > self.max_level:
+                raise ValueError(f"Invalid terminal map level: {level}")
+            if level in self._by_level:
+                raise ValueError(f"Duplicate terminal map level: {level}")
+            if count <= 0:
+                raise ValueError(
+                    f"Invalid terminal map count at level {level}: {count}"
+                )
             path = self.manifest_path.parent / str(entry["path"])
             if path.stat().st_size != count * np.dtype("<u8").itemsize:
                 raise ValueError(f"Invalid terminal map byte length: {path}")
-            self._by_level[level] = np.memmap(
+            nodes = np.memmap(
                 path,
                 dtype="<u8",
                 mode="r",
                 shape=(count,),
+            )
+            _validate_terminal_level(nodes, level=level, path=path)
+            self._by_level[level] = nodes
+            counted_terminals += count
+        if counted_terminals != self.terminal_count:
+            raise ValueError(
+                "Terminal map count mismatch: "
+                f"manifest={self.terminal_count}, levels={counted_terminals}"
             )
 
     @property
@@ -63,17 +90,11 @@ class TerminalMap:
         mapped_nodes = np.asarray(node_ids, dtype=np.uint64).copy()
         unresolved = np.ones(len(mapped_levels), dtype=np.bool_)
         for terminal_level in self.levels:
-            candidates = np.flatnonzero(
-                unresolved & (mapped_levels >= terminal_level)
-            )
+            candidates = np.flatnonzero(unresolved & (mapped_levels >= terminal_level))
             if len(candidates) == 0:
                 continue
             shifts = (
-                3
-                * (
-                    mapped_levels[candidates].astype(np.int64)
-                    - int(terminal_level)
-                )
+                3 * (mapped_levels[candidates].astype(np.int64) - int(terminal_level))
             ).astype(np.uint64)
             ancestors = np.right_shift(mapped_nodes[candidates], shifts)
             terminals = self._by_level[terminal_level]
@@ -89,6 +110,25 @@ class TerminalMap:
             mapped_nodes[selected] = ancestors[matches]
             unresolved[selected] = False
         return mapped_levels, mapped_nodes
+
+
+def _validate_terminal_level(
+    nodes: np.ndarray,
+    *,
+    level: int,
+    path: Path,
+) -> None:
+    previous: int | None = None
+    for start in range(0, len(nodes), 1_000_000):
+        chunk = nodes[start : start + 1_000_000]
+        first = int(chunk[0])
+        if previous is not None and first <= previous:
+            raise ValueError(f"Non-ascending terminal node IDs: {path}")
+        if len(chunk) > 1 and np.any(chunk[1:] <= chunk[:-1]):
+            raise ValueError(f"Non-ascending terminal node IDs: {path}")
+        previous = int(chunk[-1])
+    if previous is not None and previous >= 1 << (3 * level):
+        raise ValueError(f"Terminal node ID exceeds level {level}: {path}")
 
 
 def build_terminal_map(
@@ -421,9 +461,8 @@ def _terminal_map_is_valid(
     try:
         terminal_map = TerminalMap(manifest_path)
         raw = json.loads(manifest_path.read_text(encoding="utf-8"))
-        return (
-            terminal_map.max_level == int(max_level)
-            and int(raw["waterline"]) == int(waterline)
-        )
+        return terminal_map.max_level == int(max_level) and int(
+            raw["waterline"]
+        ) == int(waterline)
     except (KeyError, OSError, TypeError, ValueError):
         return False

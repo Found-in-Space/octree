@@ -207,6 +207,7 @@ def build_classic_artifacts(
     materialized = load_published_materialization(
         intermediates_dir,
         input_identity=input_identity,
+        plan=materialization_plan,
     )
     if materialized is None:
         work_dir = config.stage01_output_dir / CLASSIC_WORK_DIR_NAME

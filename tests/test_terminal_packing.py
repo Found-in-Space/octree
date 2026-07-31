@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
 from foundinspace.octree.classic_materialization import Stage01GroupInput
 from foundinspace.octree.config import MORTON_BITS
@@ -133,3 +135,22 @@ def test_terminal_map_supports_maximum_depth_node_ids(tmp_path: Path) -> None:
     )
 
     assert terminal_map.contains(0, 0) is True
+
+
+def test_terminal_map_rejects_non_ascending_level_file(tmp_path: Path) -> None:
+    terminal_map = _build_map(
+        tmp_path,
+        [
+            (2, 0, 1),
+            (2, 63, 1),
+        ],
+        waterline=1,
+    )
+    manifest_path = terminal_map.manifest_path
+    manifest = json.loads(terminal_map.manifest_path.read_text(encoding="utf-8"))
+    level_path = terminal_map.manifest_path.parent / manifest["levels"][0]["path"]
+    del terminal_map
+    level_path.write_bytes(np.asarray([7, 0], dtype="<u8").tobytes())
+
+    with pytest.raises(ValueError, match="Non-ascending terminal node IDs"):
+        TerminalMap(manifest_path)

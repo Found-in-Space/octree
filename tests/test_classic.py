@@ -873,6 +873,75 @@ def test_classic_build_reuses_completed_sorted_materialization(tmp_path: Path) -
     } == mtimes
 
 
+@pytest.mark.parametrize("damage", ("missing-reference", "missing-level-file"))
+def test_classic_v2_rebuilds_damaged_published_terminal_map(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    center = _node_center(2, 0)
+    rows = [
+        {
+            "source_id": "a",
+            "morton_code": _morton_for_node(2, 0),
+            "level": 2,
+            "mag_abs": 7.0,
+            "x_icrs_pc": center[0],
+            "y_icrs_pc": center[1],
+            "z_icrs_pc": center[2],
+        }
+    ]
+    _input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
+    config = ClassicBuildConfig(
+        stage00_output_dir=stage00_dir,
+        stage01_output_dir=stage01_dir,
+        output_path=tmp_path / "stars.octree",
+        identifiers_order_path=tmp_path / "identifiers.order",
+        mag_limit=6.5,
+        max_level=2,
+        batch_size=10,
+        max_open_files=2,
+        star_format_version=2,
+        terminal_waterline=1,
+    )
+    build_classic_artifacts(
+        config,
+        dataset_uuid=_DATASET_UUID,
+        identifiers_uuid=_IDENTIFIERS_UUID,
+    )
+    intermediates_dir = stage01_dir / "classic-intermediates"
+    render_manifest_path = intermediates_dir / "render-manifest.json"
+    render_manifest = json.loads(render_manifest_path.read_text(encoding="utf-8"))
+    terminal_map_path = intermediates_dir / render_manifest["terminal_map_path"]
+    terminal_map = json.loads(terminal_map_path.read_text(encoding="utf-8"))
+    terminal_level_path = intermediates_dir / terminal_map["levels"][0]["path"]
+
+    if damage == "missing-reference":
+        del render_manifest["terminal_map_path"]
+        render_manifest_path.write_text(
+            json.dumps(render_manifest, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        terminal_level_path.unlink()
+
+    build_classic_artifacts(
+        config,
+        dataset_uuid=_DATASET_UUID,
+        identifiers_uuid=_IDENTIFIERS_UUID,
+    )
+
+    rebuilt_manifest = json.loads(render_manifest_path.read_text(encoding="utf-8"))
+    rebuilt_map_path = intermediates_dir / rebuilt_manifest["terminal_map_path"]
+    rebuilt_map = json.loads(rebuilt_map_path.read_text(encoding="utf-8"))
+    rebuilt_level_path = intermediates_dir / rebuilt_map["levels"][0]["path"]
+    assert rebuilt_level_path.is_file()
+    header = read_header(config.output_path)
+    with IndexNavigator(config.output_path, header) as navigator:
+        [root] = list(navigator.root_entries())
+    assert root.is_terminal is True
+    assert root.star_count == 1
+
+
 def test_classic_build_resumes_completed_spatial_partitions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
