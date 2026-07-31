@@ -79,6 +79,8 @@ def test_load_project_resolves_relative_paths_from_project_file_dir(
     assert project.stage02.classic_max_level == 14
     assert project.stage02.partition_from_level == 8
     assert project.stage02.partition_prefix_bits == 6
+    assert project.stage02.star_format_version == 2
+    assert project.stage02.terminal_waterline == 1_000
     assert project.stage03.sidecars[0].name == "meta"
     assert project.stage03.sidecars[0].fields == ("proper_name",)
 
@@ -178,6 +180,8 @@ def test_render_project_template_contains_complete_v1_config() -> None:
     assert "classic_max_level = 14" in rendered
     assert "partition_from_level = 8" in rendered
     assert "partition_prefix_bits = 6" in rendered
+    assert "star_format_version = 2" in rendered
+    assert "terminal_waterline = 1000" in rendered
     assert 'identifiers_order_output_path = "artifacts/identifiers.order"' in rendered
     assert 'stage03_output_dir = "artifacts/stage03"' in rendered
     assert 'name = "meta"' in rendered

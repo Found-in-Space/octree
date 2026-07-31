@@ -297,10 +297,24 @@ def stage_01(
     default=None,
     help="Classic output level cap. Defaults to stage02.classic_max_level.",
 )
+@click.option(
+    "--star-format-version",
+    type=click.Choice(("1", "2")),
+    default=None,
+    help="STAR output version. Defaults to stage02.star_format_version.",
+)
+@click.option(
+    "--terminal-waterline",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Maximum stars in a packed v2 terminal subtree.",
+)
 def stage_02(
     project_path: Path,
     retain_relocation_files: bool,
     max_level: int | None,
+    star_format_version: str | None,
+    terminal_waterline: int | None,
 ) -> None:
     """Build the classic stars.octree from sorted Stage 01 groups."""
     from foundinspace.octree.classic import (
@@ -311,6 +325,16 @@ def stage_02(
     project = _load_project_or_die(project_path)
     resolved_max_level = (
         max_level if max_level is not None else project.stage02.classic_max_level
+    )
+    resolved_format_version = (
+        int(star_format_version)
+        if star_format_version is not None
+        else project.stage02.star_format_version
+    )
+    resolved_terminal_waterline = (
+        terminal_waterline
+        if terminal_waterline is not None
+        else project.stage02.terminal_waterline
     )
     result = build_classic_artifacts(
         ClassicBuildConfig(
@@ -325,6 +349,8 @@ def stage_02(
             partition_from_level=project.stage02.partition_from_level,
             partition_prefix_bits=project.stage02.partition_prefix_bits,
             retain_relocation_files=retain_relocation_files,
+            star_format_version=resolved_format_version,
+            terminal_waterline=resolved_terminal_waterline,
         )
     )
     click.echo(
@@ -333,6 +359,9 @@ def stage_02(
         f"folded_rows={result.folded_row_count:,}, "
         f"cells={result.cell_count:,}, "
         f"max_level={resolved_max_level}, "
+        f"star_format_version={resolved_format_version}, "
+        "terminal_waterline="
+        f"{resolved_terminal_waterline if resolved_format_version == 2 else 'disabled'}, "
         f"dataset_uuid={result.dataset_uuid}"
     )
     click.echo(f"Wrote {result.output_path}")

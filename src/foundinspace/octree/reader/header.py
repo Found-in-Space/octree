@@ -8,8 +8,8 @@ from ..combine.records import (
     HEADER_FMT,
     HEADER_MAGIC,
     HEADER_SIZE,
-    HEADER_VERSION,
     SHARD_MAGIC,
+    SUPPORTED_STAR_FORMAT_VERSIONS,
     unpack_descriptor,
 )
 from .source import OctreeSource, SeekableBinaryReader, open_octree_source
@@ -57,9 +57,10 @@ def read_header_from_reader(fp: SeekableBinaryReader) -> OctreeHeader:
         raise ValueError(
             f"Invalid STAR magic: expected {HEADER_MAGIC!r}, got {magic!r}"
         )
-    if version != HEADER_VERSION:
+    if version not in SUPPORTED_STAR_FORMAT_VERSIONS:
         raise ValueError(
-            f"Unsupported STAR version: expected {HEADER_VERSION}, got {version}"
+            "Unsupported STAR version: expected one of "
+            f"{SUPPORTED_STAR_FORMAT_VERSIONS}, got {version}"
         )
     descriptor_bytes = fp.read(DESCRIPTOR_SIZE)
     if len(descriptor_bytes) != DESCRIPTOR_SIZE:

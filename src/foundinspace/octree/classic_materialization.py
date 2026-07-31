@@ -38,7 +38,11 @@ from .assembly.manifest import (
 )
 from .assembly.types import CellKey, ShardKey
 from .assembly.writer import IntermediateShardWriter, identifiers_shard_filenames
-from .config import MORTON_BITS
+from .config import (
+    DEFAULT_STAR_FORMAT_VERSION,
+    DEFAULT_TERMINAL_WATERLINE,
+    MORTON_BITS,
+)
 from .duckdb_util import (
     MEMORY_LIMIT,
     PRESERVE_INSERTION_ORDER,
@@ -47,12 +51,13 @@ from .duckdb_util import (
 )
 from .encoding.render import RENDER_RECORD_SIZE, encode_render_records
 from .sources.stage00 import _atomic_write_json
+from .terminal_packing import TerminalMap, build_terminal_map
 
 CLASSIC_BUILD_STATE_NAME = "classic-build-state.json"
 CLASSIC_BUILD_STATE_FORMAT = "foundinspace.octree.classic-build/v1"
 CLASSIC_WORK_STATE_NAME = "classic-work-state.json"
 CLASSIC_WORK_STATE_FORMAT = "foundinspace.octree.classic-work/v1"
-CLASSIC_ALGORITHM_VERSION = "sorted-cell-merge/v2"
+CLASSIC_ALGORITHM_VERSION = "sorted-cell-merge-terminal-packing/v3"
 CLASSIC_OVERLAP_IN_MEMORY_MAX_BYTES = 256 * 1024 * 1024
 CLASSIC_OVERLAP_EXTERNAL_SORT_MEMORY_LIMIT = "512MB"
 
@@ -118,6 +123,8 @@ class ClassicMaterializationPlan:
     max_open_files: int
     partition_from_level: int
     partition_prefix_bits: int
+    star_format_version: int = DEFAULT_STAR_FORMAT_VERSION
+    terminal_waterline: int = DEFAULT_TERMINAL_WATERLINE
 
     @property
     def merge_fan_in(self) -> int:
@@ -225,6 +232,10 @@ def classic_input_identity(
         "mag_limit": plan.mag_limit,
         "partition_from_level": plan.partition_from_level,
         "partition_prefix_bits": plan.partition_prefix_bits,
+        "star_format_version": plan.star_format_version,
+        "terminal_waterline": (
+            plan.terminal_waterline if plan.star_format_version == 2 else None
+        ),
         "row_schema": list(_RAW_COLUMNS),
         "render_record_size": RENDER_RECORD_SIZE,
         "sort_keys": [name for name, _order in _CANONICAL_SORT_KEYS],
@@ -291,6 +302,18 @@ def materialize_classic_groups(
     runs_dir.mkdir(parents=True, exist_ok=True)
     merge_dir.mkdir(parents=True, exist_ok=True)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
+    terminal_map: TerminalMap | None = None
+    terminal_map_manifest_path: Path | None = None
+    if plan.star_format_version == 2:
+        terminal_map_manifest_path = build_terminal_map(
+            groups=groups,
+            work_dir=work_dir,
+            artifacts_dir=artifacts_dir,
+            max_level=plan.max_level,
+            waterline=plan.terminal_waterline,
+            batch_size=plan.batch_size,
+        )
+        terminal_map = TerminalMap(terminal_map_manifest_path)
 
     completed_groups = state.setdefault("completed_groups", {})
     for group in groups:
@@ -301,6 +324,7 @@ def materialize_classic_groups(
             group,
             runs_dir=runs_dir,
             plan=plan,
+            terminal_map=terminal_map,
         )
         completed_groups[group.key] = group_result
         _atomic_write_json(work_dir / CLASSIC_WORK_STATE_NAME, state)
@@ -364,6 +388,7 @@ def materialize_classic_groups(
         index_magic=INDEX_MAGIC,
         mag_limit=plan.mag_limit,
         name=RENDER_MANIFEST_NAME,
+        terminal_map_path=terminal_map_manifest_path,
     )
     identifiers_manifest_path = write_manifest(
         artifacts_dir,
@@ -424,6 +449,7 @@ def _normalize_group(
     *,
     runs_dir: Path,
     plan: ClassicMaterializationPlan,
+    terminal_map: TerminalMap | None,
 ) -> dict[str, Any]:
     group_dir = runs_dir / _safe_group_dir_name(group.key)
     if group_dir.exists():
@@ -436,9 +462,22 @@ def _normalize_group(
             "runs": [],
         }
     requires_folding = _group_requires_folding(group, max_level=plan.max_level)
-    if not requires_folding:
-        return _stream_ordered_group(group, group_dir=group_dir, plan=plan)
-    return _externally_sort_folded_group(group, group_dir=group_dir, plan=plan)
+    requires_terminal_reordering = (
+        terminal_map is not None and terminal_map.terminal_count > 0
+    )
+    if not requires_folding and not requires_terminal_reordering:
+        return _stream_ordered_group(
+            group,
+            group_dir=group_dir,
+            plan=plan,
+            terminal_map=terminal_map,
+        )
+    return _externally_sort_folded_group(
+        group,
+        group_dir=group_dir,
+        plan=plan,
+        terminal_map=terminal_map,
+    )
 
 
 def _stream_ordered_group(
@@ -446,6 +485,7 @@ def _stream_ordered_group(
     *,
     group_dir: Path,
     plan: ClassicMaterializationPlan,
+    terminal_map: TerminalMap | None,
 ) -> dict[str, Any]:
     runs: list[dict[str, Any]] = []
     current_shard: ShardKey | None = None
@@ -472,7 +512,11 @@ def _stream_ordered_group(
 
     try:
         for raw_batch in _iter_raw_group_batches(group, batch_size=plan.batch_size):
-            compact, folded_rows = _normalize_batch(raw_batch, plan=plan)
+            compact, folded_rows = _normalize_batch(
+                raw_batch,
+                plan=plan,
+                terminal_map=terminal_map,
+            )
             if folded_rows:
                 raise ValueError(
                     f"Stage 01 group {group.key} exceeded its tracked natural max level"
@@ -518,6 +562,7 @@ def _externally_sort_folded_group(
     *,
     group_dir: Path,
     plan: ClassicMaterializationPlan,
+    terminal_map: TerminalMap | None,
 ) -> dict[str, Any]:
     batches_dir = group_dir / "batches"
     merge_dir = group_dir / "merge"
@@ -530,7 +575,11 @@ def _externally_sort_folded_group(
     for batch_index, raw_batch in enumerate(
         _iter_raw_group_batches(group, batch_size=plan.batch_size)
     ):
-        compact, batch_folded_rows = _normalize_batch(raw_batch, plan=plan)
+        compact, batch_folded_rows = _normalize_batch(
+            raw_batch,
+            plan=plan,
+            terminal_map=terminal_map,
+        )
         folded_row_count += batch_folded_rows
         compact = compact.take(
             pc.sort_indices(
@@ -554,7 +603,9 @@ def _externally_sort_folded_group(
             row_count += len(segment)
 
     _ensure_group_row_count(group, row_count)
-    if folded_row_count == 0:
+    if folded_row_count == 0 and (
+        terminal_map is None or terminal_map.terminal_count == 0
+    ):
         raise ValueError(
             f"Stage 01 group {group.key} did not reach its tracked natural max level"
         )
@@ -595,6 +646,7 @@ def _normalize_batch(
     table: pa.Table,
     *,
     plan: ClassicMaterializationPlan,
+    terminal_map: TerminalMap | None = None,
 ) -> tuple[pa.Table, int]:
     if len(table) == 0:
         return pa.Table.from_batches([], schema=_COMPACT_SCHEMA), 0
@@ -611,6 +663,11 @@ def _normalize_batch(
         indices = np.flatnonzero(final_levels == level)
         final_node_ids[indices] = morton_codes[indices] >> np.uint64(
             3 * (MORTON_BITS - level)
+        )
+    if terminal_map is not None:
+        final_levels, final_node_ids = terminal_map.remap(
+            final_levels,
+            final_node_ids,
         )
 
     positions = np.column_stack(

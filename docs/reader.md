@@ -157,6 +157,7 @@ class NodeEntry:
     child_mask: int            # bit o set => child exists in octant o
     payload_offset: int        # absolute file offset, 0 if no payload
     payload_length: int        # compressed bytes, 0 if no payload
+    star_count: int | None     # v2 payload records; unavailable for v1
 
     @property
     def is_leaf(self) -> bool:
@@ -165,6 +166,10 @@ class NodeEntry:
     @property
     def has_payload(self) -> bool:
         """True when HAS_PAYLOAD flag is set and payload_length > 0."""
+
+    @property
+    def is_terminal(self) -> bool:
+        """True when the STAR v2 terminal flag is set."""
 
     def aabb_distance(self, point: Point) -> float:
         """Minimum Euclidean distance from point to this node's AABB."""
@@ -241,8 +246,9 @@ The navigator must implement:
      - node_table_offset, frontier_table_offset, payload_base_offset
    - Reader uses at minimum: `node_count`, `parent_global_depth`, `parent_grid_*`, `entry_nodes`, `first_frontier_index`, `node_table_offset`, `frontier_table_offset`.
 
-2. **Node reading** — read one 20-byte `SHARD_NODE` record at `node_table_offset + (node_index − 1) × 20`.
-   - Format: `SHARD_NODE_FMT = "<HHBBBBQI"` (`SHARD_NODE_SIZE = 20`)
+2. **Node reading** — dispatch from the matching STAR/shard version.
+   - v1 format: `"<HHBBBBQI"` (20 bytes)
+   - v2 format: `"<HHBBBBQII"` (24 bytes)
    - Field order:
      - `first_child: u16`
      - `local_path: u16`
@@ -252,6 +258,10 @@ The navigator must implement:
      - `reserved: u8`
      - `payload_offset: u64`
      - `payload_length: u32`
+     - `star_count: u32` (v2 only)
+
+   The reader rejects a shard whose version does not match the STAR header.
+   See [`star-v2.md`](star-v2.md) for count and terminal semantics.
 
 3. **Intra-shard child resolution** — for a non-frontier node, the child at octant `o` is at node index `first_child + popcount(child_mask & ((1 << o) − 1))`.
 

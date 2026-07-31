@@ -14,9 +14,10 @@ from foundinspace.octree.combine import CombinePlan, combine_octree
 from foundinspace.octree.combine.records import (
     HEADER_FMT,
     HEADER_SIZE,
+    SHARD_HDR_FMT,
     PackedDescriptorFields,
 )
-from foundinspace.octree.reader import read_header
+from foundinspace.octree.reader import IndexNavigator, read_header
 
 
 def test_combine_octree_is_deterministic(tmp_path) -> None:
@@ -67,6 +68,52 @@ def test_combine_header_mag_limit_matches_manifest(tmp_path) -> None:
 
     hdr = HEADER_FMT.unpack(out.read_bytes()[:HEADER_SIZE])
     assert hdr[11] == pytest.approx(4.25)
+
+
+def test_combine_v2_writes_v2_shard_and_node_star_count(tmp_path) -> None:
+    manifest_path = build_intermediates(
+        tmp_path / "intermediates",
+        [PayloadNode(level=0, node_id=0, star_count=3, raw_payload=b"payload")],
+        max_level=0,
+    )
+    out = tmp_path / "out-v2.octree"
+    combine_octree(
+        manifest_path,
+        out,
+        plan=CombinePlan(max_open_files=2, star_format_version=2),
+        descriptor=PackedDescriptorFields(
+            artifact_kind="render",
+            dataset_uuid=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        ),
+    )
+
+    header = read_header(out)
+    assert header.version == 2
+    with open(out, "rb") as fp:
+        fp.seek(header.index_offset)
+        shard = SHARD_HDR_FMT.unpack(fp.read(SHARD_HDR_FMT.size))
+    assert shard[1] == 2
+    with IndexNavigator(out, header) as navigator:
+        [root] = list(navigator.root_entries())
+    assert root.star_count == 3
+    assert root.is_terminal is False
+
+
+def test_v1_reader_reports_unavailable_node_star_count(tmp_path) -> None:
+    manifest_path = build_intermediates(
+        tmp_path / "intermediates",
+        [PayloadNode(level=0, node_id=0, star_count=1, raw_payload=b"payload")],
+        max_level=0,
+    )
+    out = tmp_path / "out-v1.octree"
+    combine_octree(manifest_path, out, plan=CombinePlan(max_open_files=2))
+
+    header = read_header(out)
+    assert header.version == 1
+    with IndexNavigator(out, header) as navigator:
+        [root] = list(navigator.root_entries())
+    assert root.star_count is None
+    assert root.is_terminal is False
 
 
 def test_manifest_identifier_mismatch_fails_fast(tmp_path) -> None:

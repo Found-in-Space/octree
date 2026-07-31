@@ -33,6 +33,7 @@ class CombineManifest:
     mag_limit: float
     payload_codec: str
     shards: tuple[ShardEntry, ...]
+    terminal_map_path: Path | None
 
 
 def _parse_world_center(raw: object) -> tuple[float, float, float]:
@@ -79,6 +80,14 @@ def read_combine_manifest(manifest_path: Path) -> CombineManifest:
     if "mag_limit" not in raw:
         raise ValueError("Manifest is missing required field: mag_limit")
     mag_limit = float(raw["mag_limit"])
+    terminal_map_path_raw = raw.get("terminal_map_path")
+    terminal_map_path = (
+        root_dir / str(terminal_map_path_raw)
+        if terminal_map_path_raw is not None
+        else None
+    )
+    if terminal_map_path is not None and not terminal_map_path.is_file():
+        raise ValueError(f"Terminal map is missing: {terminal_map_path}")
 
     shards: list[ShardEntry] = []
     for level_entry in raw.get("levels", []):
@@ -119,4 +128,5 @@ def read_combine_manifest(manifest_path: Path) -> CombineManifest:
         mag_limit=mag_limit,
         payload_codec=payload_codec,
         shards=tuple(shards),
+        terminal_map_path=terminal_map_path,
     )

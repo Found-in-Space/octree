@@ -62,11 +62,12 @@ with the star count.
 
 Stage 00 calculates only the routing fields (`morton_code` and natural
 `level`) from raw Cartesian input. Stage 01 preserves the raw position,
-magnitude, and temperature fields. The classic Stage 02 output then clamps
-rows below `stage02.classic_max_level` (default 14) into their ancestor node
-and creates the node-relative 16-byte render record once, for that final node.
-A packed final-output variant can choose different nodes from the same raw
-Stage 01 rows without changing Stage 00 or Stage 01.
+magnitude, and temperature fields. The classic Stage 02 output clamps rows
+below `stage02.classic_max_level` (default 14) into their ancestor node. STAR
+v2 builds then collapse complete subtrees of at most
+`stage02.terminal_waterline` stars (default 1,000) before creating the
+node-relative 16-byte render record. Version 2 is the default;
+`stage02.star_format_version = 1` retains the unpacked v1 output.
 
 Classic materialization consumes Stage 01 as checksum-tracked sorted groups. It
 does not globally re-sort the catalogue: groups that do not need level folding
@@ -186,6 +187,7 @@ Current stage overview and supporting notes:
 - [`docs/sidecars.md`](docs/sidecars.md)
 - [`docs/identifiers-order.md`](docs/identifiers-order.md)
 - [`docs/reader.md`](docs/reader.md)
+- [`docs/star-v2.md`](docs/star-v2.md)
 - [`docs/terminal-memory-testbed.md`](docs/terminal-memory-testbed.md)
 - [`docs/glow.md`](docs/glow.md)
 - [`docs/roadmap.md`](docs/roadmap.md)

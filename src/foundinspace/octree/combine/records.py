@@ -9,7 +9,13 @@ from ..assembly.formats import INDEX_FILE_HDR, INDEX_HEADER_SIZE, INDEX_RECORD
 HEADER_FMT = struct.Struct("<4sHHQQ3ffHHf16s")
 HEADER_SIZE = 64
 HEADER_MAGIC = b"STAR"
-HEADER_VERSION = 1
+STAR_FORMAT_VERSION_V1 = 1
+STAR_FORMAT_VERSION_V2 = 2
+SUPPORTED_STAR_FORMAT_VERSIONS = (
+    STAR_FORMAT_VERSION_V1,
+    STAR_FORMAT_VERSION_V2,
+)
+HEADER_VERSION = STAR_FORMAT_VERSION_V1
 HEADER_FLAGS = 0
 PAYLOAD_RECORD_SIZE = 16
 HEADER_RESERVED = b"\x00" * 16
@@ -23,12 +29,14 @@ SIDECAR_DESCRIPTOR_KIND = 2
 SHARD_HDR_FMT = struct.Struct("<4sHBBIIHHHhIII8HHQQQ2x")
 SHARD_HDR_SIZE = 80
 SHARD_MAGIC = b"OSHR"
-SHARD_VERSION = 1
+SHARD_VERSION = STAR_FORMAT_VERSION_V1
 LEVELS_PER_SHARD = 5
 SHARD_FLAGS = 0
 
 SHARD_NODE_FMT = struct.Struct("<HHBBBBQI")
 SHARD_NODE_SIZE = 20
+SHARD_NODE_V2_FMT = struct.Struct("<HHBBBBQII")
+SHARD_NODE_V2_SIZE = 24
 
 FRONTIER_REF_FMT = struct.Struct("<Q")
 FRONTIER_REF_SIZE = 8
@@ -36,6 +44,7 @@ FRONTIER_REF_SIZE = 8
 HAS_PAYLOAD = 0x01
 HAS_CHILDREN = 0x02
 IS_FRONTIER = 0x04
+IS_TERMINAL = 0x08
 
 RELOC_MAGIC = b"ORLX"
 RELOC_VERSION = 1
@@ -48,6 +57,7 @@ assert HEADER_FMT.size == HEADER_SIZE
 assert DESCRIPTOR_FMT.size == DESCRIPTOR_SIZE
 assert SHARD_HDR_FMT.size == SHARD_HDR_SIZE
 assert SHARD_NODE_FMT.size == SHARD_NODE_SIZE
+assert SHARD_NODE_V2_FMT.size == SHARD_NODE_V2_SIZE
 assert FRONTIER_REF_FMT.size == FRONTIER_REF_SIZE
 
 
@@ -70,11 +80,30 @@ class PackedDescriptorFields:
     sidecar_kind: str | None = None
 
 
-def pack_top_level_header(fields: PackedHeaderFields) -> bytes:
+def validate_star_format_version(version: int) -> int:
+    resolved = int(version)
+    if resolved not in SUPPORTED_STAR_FORMAT_VERSIONS:
+        raise ValueError(
+            "star format version must be one of "
+            f"{SUPPORTED_STAR_FORMAT_VERSIONS}, got {version!r}"
+        )
+    return resolved
+
+
+def shard_node_format(version: int) -> struct.Struct:
+    resolved = validate_star_format_version(version)
+    return SHARD_NODE_FMT if resolved == STAR_FORMAT_VERSION_V1 else SHARD_NODE_V2_FMT
+
+
+def pack_top_level_header(
+    fields: PackedHeaderFields,
+    *,
+    version: int = HEADER_VERSION,
+) -> bytes:
     cx, cy, cz = fields.world_center
     return HEADER_FMT.pack(
         HEADER_MAGIC,
-        HEADER_VERSION,
+        validate_star_format_version(version),
         HEADER_FLAGS,
         int(fields.index_offset),
         int(fields.index_length),
@@ -176,12 +205,13 @@ def pack_shard_header(
     node_table_offset: int,
     frontier_table_offset: int,
     payload_base_offset: int,
+    version: int = SHARD_VERSION,
 ) -> bytes:
     if node_count > 0xFFFF:
         raise ValueError(f"node_count exceeds u16: {node_count}")
     return SHARD_HDR_FMT.pack(
         SHARD_MAGIC,
-        SHARD_VERSION,
+        validate_star_format_version(version),
         LEVELS_PER_SHARD,
         SHARD_FLAGS,
         int(shard_id),

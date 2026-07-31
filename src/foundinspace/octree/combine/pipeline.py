@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
 
+from ..terminal_packing import TerminalMap
 from .dfs import iter_cells_dfs
 from .lookup import FileHandleCache, IntermediateLookup, RelocationLookup
 from .manifest import read_combine_manifest
@@ -16,17 +17,22 @@ from .records import (
     HEADER_FMT,
     HEADER_SIZE,
     IS_FRONTIER,
+    IS_TERMINAL,
     RELOC_HEADER_FMT,
     RELOC_HEADER_SIZE,
     RELOC_MAGIC,
     RELOC_RECORD_FMT,
     RELOC_RECORD_SIZE,
     SHARD_NODE_FMT,
+    SHARD_NODE_V2_FMT,
+    STAR_FORMAT_VERSION_V1,
+    SUPPORTED_STAR_FORMAT_VERSIONS,
     PackedDescriptorFields,
     PackedHeaderFields,
     pack_descriptor,
     pack_shard_header,
     pack_top_level_header,
+    validate_star_format_version,
 )
 
 
@@ -35,12 +41,14 @@ class CombinePlan:
     max_open_files: int = 32
     lookup_cache_records: int = 65536
     retain_relocation_files: bool = False
+    star_format_version: int = STAR_FORMAT_VERSION_V1
 
     def validate(self) -> None:
         if self.max_open_files <= 0:
             raise ValueError("max_open_files must be > 0")
         if self.lookup_cache_records <= 0:
             raise ValueError("lookup_cache_records must be > 0")
+        validate_star_format_version(self.star_format_version)
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +72,7 @@ class _ShardNode:
     child_mask: int
     payload: tuple[int, int, int] | None
     children: tuple[_ShardNode, ...]
+    terminal: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,7 +193,8 @@ def combine_octree(
                     world_half_size_pc=manifest.world_half_size_pc,
                     max_level=manifest.max_level,
                     mag_limit=manifest.mag_limit,
-                )
+                ),
+                version=plan.star_format_version,
             )
         )
         out_fp.write(pack_descriptor(descriptor))
@@ -371,6 +381,7 @@ def _decode_grid(level: int, node_id: int) -> tuple[int, int, int]:
 def _build_node(
     existence: IntermediateLookup,
     relocation: RelocationLookup,
+    terminal_map: TerminalMap | None,
     *,
     max_level: int,
     global_level: int,
@@ -412,6 +423,7 @@ def _build_node(
             child = _build_node(
                 existence,
                 relocation,
+                terminal_map,
                 max_level=max_level,
                 global_level=next_level,
                 node_id=child_id,
@@ -421,6 +433,13 @@ def _build_node(
             if child is not None:
                 children.append(child)
 
+    terminal = terminal_map is not None and terminal_map.contains(global_level, node_id)
+    if terminal and payload_row is None:
+        raise ValueError(f"Terminal node has no payload: ({global_level}, {node_id})")
+    if terminal and child_mask != 0:
+        raise ValueError(
+            f"Terminal node retains descendants: ({global_level}, {node_id})"
+        )
     return _ShardNode(
         global_level=global_level,
         node_id=node_id,
@@ -428,6 +447,7 @@ def _build_node(
         local_path=local_path,
         child_mask=child_mask,
         payload=payload_row,
+        terminal=terminal,
         children=tuple(children),
     )
 
@@ -449,6 +469,7 @@ def _flatten_nodes(top_nodes: list[_ShardNode]) -> list[_ShardNode]:
 def _build_shard_nodes(
     existence: IntermediateLookup,
     relocation: RelocationLookup,
+    terminal_map: TerminalMap | None,
     *,
     max_level: int,
     parent_level: int,
@@ -464,6 +485,7 @@ def _build_shard_nodes(
         node = _build_node(
             existence,
             relocation,
+            terminal_map,
             max_level=max_level,
             global_level=child_level,
             node_id=node_id,
@@ -486,7 +508,16 @@ def write_final_shard_index(
     existence = IntermediateLookup(manifest, max_open_files=plan.max_open_files)
     relocation = RelocationLookup(relocation_files, max_open_files=plan.max_open_files)
     writer = _IndexWriter(
-        output_fp, existence, relocation, max_level=manifest.max_level
+        output_fp,
+        existence,
+        relocation,
+        max_level=manifest.max_level,
+        star_format_version=plan.star_format_version,
+        terminal_map=(
+            TerminalMap(manifest.terminal_map_path)
+            if manifest.terminal_map_path is not None
+            else None
+        ),
     )
     try:
         index_offset = output_fp.tell()
@@ -506,11 +537,15 @@ class _IndexWriter:
         relocation: RelocationLookup,
         *,
         max_level: int,
+        star_format_version: int,
+        terminal_map: TerminalMap | None,
     ):
         self._out = output_fp
         self._existence = existence
         self._relocation = relocation
         self._max_level = max_level
+        self._star_format_version = validate_star_format_version(star_format_version)
+        self._terminal_map = terminal_map
         self._next_shard_id = 1
 
     def write_root(self) -> None:
@@ -534,6 +569,7 @@ class _IndexWriter:
         nodes = _build_shard_nodes(
             self._existence,
             self._relocation,
+            self._terminal_map,
             max_level=self._max_level,
             parent_level=parent_level,
             parent_node_id=parent_node_id,
@@ -591,16 +627,19 @@ class _IndexWriter:
             flags = 0
             payload_offset = 0
             payload_length = 0
+            star_count = 0
             if node.payload is not None:
-                payload_offset, payload_length, _ = node.payload
+                payload_offset, payload_length, star_count = node.payload
                 flags |= HAS_PAYLOAD
             if node.child_mask != 0:
                 flags |= HAS_CHILDREN
             if is_frontier:
                 flags |= IS_FRONTIER
+            if self._star_format_version != STAR_FORMAT_VERSION_V1 and node.terminal:
+                flags |= IS_TERMINAL
 
-            self._out.write(
-                SHARD_NODE_FMT.pack(
+            if self._star_format_version == STAR_FORMAT_VERSION_V1:
+                packed_node = SHARD_NODE_FMT.pack(
                     first_child,
                     node.local_path,
                     node.child_mask,
@@ -610,7 +649,19 @@ class _IndexWriter:
                     payload_offset,
                     payload_length,
                 )
-            )
+            else:
+                packed_node = SHARD_NODE_V2_FMT.pack(
+                    first_child,
+                    node.local_path,
+                    node.child_mask,
+                    node.local_depth,
+                    flags,
+                    0,
+                    payload_offset,
+                    payload_length,
+                    star_count,
+                )
+            self._out.write(packed_node)
 
         frontier_table_offset = self._out.tell()
         for _ in frontier_nodes:
@@ -659,6 +710,7 @@ class _IndexWriter:
             node_table_offset=node_table_offset,
             frontier_table_offset=frontier_table_offset,
             payload_base_offset=HEADER_SIZE + DESCRIPTOR_SIZE,
+            version=self._star_format_version,
         )
 
         end = self._out.tell()
@@ -695,7 +747,7 @@ def finalize_octree_header(
             mag_limit,
             reserved,
         ) = HEADER_FMT.unpack(old)
-        if magic != b"STAR" or version != 1:
+        if magic != b"STAR" or version not in SUPPORTED_STAR_FORMAT_VERSIONS:
             raise ValueError("Output file has invalid header magic/version")
         cx, cy, cz = world_center
         patched = pack_top_level_header(
@@ -706,7 +758,8 @@ def finalize_octree_header(
                 mag_limit=mag_limit,
                 index_offset=index_offset,
                 index_length=index_length,
-            )
+            ),
+            version=int(version),
         )
         # Keep currently reserved area and payload-record size/max level contract.
         patched = bytearray(patched)

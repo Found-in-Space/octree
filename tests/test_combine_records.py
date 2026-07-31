@@ -9,8 +9,10 @@ from foundinspace.octree.combine.records import (
     HAS_PAYLOAD,
     HEADER_SIZE,
     IS_FRONTIER,
+    IS_TERMINAL,
     SHARD_HDR_SIZE,
     SHARD_NODE_SIZE,
+    SHARD_NODE_V2_SIZE,
     PackedDescriptorFields,
     PackedHeaderFields,
     pack_descriptor,
@@ -25,6 +27,7 @@ def test_record_sizes_are_pinned() -> None:
     assert DESCRIPTOR_SIZE == 128
     assert SHARD_HDR_SIZE == 80
     assert SHARD_NODE_SIZE == 20
+    assert SHARD_NODE_V2_SIZE == 24
     assert FRONTIER_REF_SIZE == 8
 
 
@@ -32,7 +35,8 @@ def test_node_flag_bits_are_distinct() -> None:
     assert HAS_PAYLOAD == 0x01
     assert HAS_CHILDREN == 0x02
     assert IS_FRONTIER == 0x04
-    assert len({HAS_PAYLOAD, HAS_CHILDREN, IS_FRONTIER}) == 3
+    assert IS_TERMINAL == 0x08
+    assert len({HAS_PAYLOAD, HAS_CHILDREN, IS_FRONTIER, IS_TERMINAL}) == 4
 
 
 def test_pack_unpack_top_level_header_round_trip() -> None:
@@ -54,6 +58,20 @@ def test_pack_unpack_top_level_header_round_trip() -> None:
     assert fields[4] == 5678
     assert fields[9] == 16
     assert fields[10] == 13
+
+
+def test_pack_v2_top_level_header() -> None:
+    packed = pack_top_level_header(
+        PackedHeaderFields(
+            world_center=(0.0, 0.0, 0.0),
+            world_half_size_pc=200_000.0,
+            max_level=14,
+            mag_limit=6.5,
+        ),
+        version=2,
+    )
+
+    assert unpack_top_level_header(packed)[1] == 2
 
 
 def test_pack_unpack_descriptor_round_trip() -> None:

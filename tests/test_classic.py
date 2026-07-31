@@ -33,7 +33,7 @@ from foundinspace.octree.identifiers_order import (
     read_header as read_identifiers_header,
 )
 from foundinspace.octree.mag_levels import MagLevelConfig
-from foundinspace.octree.reader import OctreeReader, Point, read_header
+from foundinspace.octree.reader import IndexNavigator, OctreeReader, Point, read_header
 from foundinspace.octree.sources.stage00 import (
     STAGE00_INPUT_FILTER_RAW_CARTESIAN,
     Stage00Config,
@@ -326,6 +326,7 @@ def test_classic_build_matches_legacy_builder_when_rows_are_within_cap(
             max_level=8,
             batch_size=10,
             max_open_files=4,
+            star_format_version=1,
         ),
         dataset_uuid=_DATASET_UUID,
         identifiers_uuid=_IDENTIFIERS_UUID,
@@ -407,6 +408,7 @@ def test_classic_build_folds_deep_rows_into_capped_node(tmp_path: Path) -> None:
             max_level=14,
             batch_size=10,
             max_open_files=4,
+            star_format_version=1,
         ),
         dataset_uuid=_DATASET_UUID,
         identifiers_uuid=_IDENTIFIERS_UUID,
@@ -438,6 +440,137 @@ def test_classic_build_folds_deep_rows_into_capped_node(tmp_path: Path) -> None:
             star.position.y,
             star.position.z,
         ) == pytest.approx(expected, abs=1e-5)
+
+
+def test_classic_v2_packs_terminal_and_preserves_order_and_positions(
+    tmp_path: Path,
+) -> None:
+    child_center = _node_center(2, 0)
+    rows = [
+        {
+            "source_id": "later",
+            "morton_code": _morton_for_node(0, 0),
+            "level": 0,
+            "mag_abs": 2.0,
+            "x_icrs_pc": 20_000.0,
+            "y_icrs_pc": 40_000.0,
+            "z_icrs_pc": 60_000.0,
+        },
+        {
+            "source_id": "first",
+            "morton_code": _morton_for_node(2, 0),
+            "level": 2,
+            "mag_abs": 1.0,
+            "x_icrs_pc": child_center[0],
+            "y_icrs_pc": child_center[1],
+            "z_icrs_pc": child_center[2],
+        },
+    ]
+    _input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
+    output_path = tmp_path / "stars.octree"
+    identifiers_path = tmp_path / "identifiers.order"
+
+    result = build_classic_artifacts(
+        ClassicBuildConfig(
+            stage00_output_dir=stage00_dir,
+            stage01_output_dir=stage01_dir,
+            output_path=output_path,
+            identifiers_order_path=identifiers_path,
+            mag_limit=6.5,
+            max_level=2,
+            batch_size=1,
+            max_open_files=2,
+            star_format_version=2,
+            terminal_waterline=2,
+        ),
+        dataset_uuid=_DATASET_UUID,
+        identifiers_uuid=_IDENTIFIERS_UUID,
+    )
+
+    assert result.row_count == 2
+    assert result.cell_count == 1
+    header = read_header(output_path)
+    assert header.version == 2
+    assert header.max_level == 2
+    with IndexNavigator(output_path, header) as navigator:
+        [root] = list(navigator.root_entries())
+    assert root.level == 0
+    assert root.star_count == 2
+    assert root.is_terminal is True
+    assert root.is_leaf is True
+
+    with IdentifiersOrderReader(identifiers_path) as reader:
+        [(record, identities)] = list(reader.iter_cells())
+    assert (record.level, record.node_id, record.star_count) == (0, 0, 2)
+    assert identities == [("gaia", "first"), ("gaia", "later")]
+
+    with OctreeReader(output_path) as reader:
+        stars = sorted(
+            reader.stars_within_distance(Point(0.0, 0.0, 0.0), 1_000_000.0),
+            key=lambda star: star.magnitude,
+        )
+    assert len(stars) == 2
+    assert (
+        stars[0].position.x,
+        stars[0].position.y,
+        stars[0].position.z,
+    ) == pytest.approx(child_center, abs=1e-5)
+    assert (
+        stars[1].position.x,
+        stars[1].position.y,
+        stars[1].position.z,
+    ) == pytest.approx((20_000.0, 40_000.0, 60_000.0), abs=0.01)
+
+
+def test_classic_v2_counts_index_only_and_nested_terminal_nodes(
+    tmp_path: Path,
+) -> None:
+    rows = []
+    for source_id, node_id in (("left", 0), ("right", 63)):
+        center = _node_center(2, node_id)
+        rows.append(
+            {
+                "source_id": source_id,
+                "morton_code": _morton_for_node(2, node_id),
+                "level": 2,
+                "mag_abs": 7.0,
+                "x_icrs_pc": center[0],
+                "y_icrs_pc": center[1],
+                "z_icrs_pc": center[2],
+            }
+        )
+    _input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
+    output_path = tmp_path / "stars.octree"
+
+    build_classic_artifacts(
+        ClassicBuildConfig(
+            stage00_output_dir=stage00_dir,
+            stage01_output_dir=stage01_dir,
+            output_path=output_path,
+            identifiers_order_path=tmp_path / "identifiers.order",
+            mag_limit=6.5,
+            max_level=2,
+            batch_size=1,
+            max_open_files=2,
+            star_format_version=2,
+            terminal_waterline=1,
+        )
+    )
+
+    header = read_header(output_path)
+    with IndexNavigator(output_path, header) as navigator:
+        [root] = list(navigator.root_entries())
+        children = [
+            navigator.get_child(root, octant)
+            for octant in range(8)
+            if root.child_mask & (1 << octant)
+        ]
+    assert root.star_count == 0
+    assert root.is_terminal is False
+    assert len(children) == 2
+    assert all(child is not None for child in children)
+    assert all(child.star_count == 1 for child in children if child is not None)
+    assert all(child.is_terminal for child in children if child is not None)
 
 
 def test_classic_build_merges_sorted_stage01_groups_in_canonical_order(
@@ -536,6 +669,7 @@ def test_classic_build_merges_sorted_stage01_groups_in_canonical_order(
             max_level=14,
             batch_size=2,
             max_open_files=2,
+            star_format_version=1,
         ),
         dataset_uuid=_DATASET_UUID,
         identifiers_uuid=_IDENTIFIERS_UUID,
@@ -672,6 +806,7 @@ def test_classic_build_externally_merges_folded_group_batches(
             max_level=14,
             batch_size=2,
             max_open_files=2,
+            star_format_version=1,
         ),
         dataset_uuid=_DATASET_UUID,
         identifiers_uuid=_IDENTIFIERS_UUID,
@@ -711,6 +846,7 @@ def test_classic_build_reuses_completed_sorted_materialization(tmp_path: Path) -
         max_level=1,
         batch_size=10,
         max_open_files=2,
+        star_format_version=1,
     )
     build_classic_artifacts(
         config,
@@ -775,6 +911,7 @@ def test_classic_build_resumes_completed_spatial_partitions(
         max_open_files=2,
         partition_from_level=1,
         partition_prefix_bits=1,
+        star_format_version=1,
     )
     original = classic_materialization._materialize_partition
     calls = 0
@@ -889,5 +1026,6 @@ def test_classic_build_rejects_stage01_without_raw_fields(tmp_path: Path) -> Non
                 max_level=14,
                 batch_size=10,
                 max_open_files=4,
+                star_format_version=1,
             )
         )

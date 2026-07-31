@@ -61,6 +61,8 @@ def test_stage02_help() -> None:
     assert "--project" in result.output
     assert "--retain-relocation-files" in result.output
     assert "--max-level" in result.output
+    assert "--star-format-version" in result.output
+    assert "--terminal-waterline" in result.output
 
 
 def test_stage02_requires_project() -> None:
@@ -113,6 +115,10 @@ def test_stage02_builds_classic_output_from_project(
             "--retain-relocation-files",
             "--max-level",
             "13",
+            "--star-format-version",
+            "1",
+            "--terminal-waterline",
+            "250",
         ],
     )
 
@@ -123,5 +129,9 @@ def test_stage02_builds_classic_output_from_project(
     assert calls[0].max_open_files == 7
     assert calls[0].retain_relocation_files is True
     assert calls[0].max_level == 13
+    assert calls[0].star_format_version == 1
+    assert calls[0].terminal_waterline == 250
     assert "rows=12" in result.output
     assert "folded_rows=3" in result.output
+    assert "star_format_version=1" in result.output
+    assert "terminal_waterline=disabled" in result.output

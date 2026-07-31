@@ -22,6 +22,8 @@ from .config import (
     DEFAULT_CLASSIC_MAX_LEVEL,
     DEFAULT_CLASSIC_PARTITION_FROM_LEVEL,
     DEFAULT_CLASSIC_PARTITION_PREFIX_BITS,
+    DEFAULT_STAR_FORMAT_VERSION,
+    DEFAULT_TERMINAL_WATERLINE,
     MORTON_BITS,
 )
 from .identifiers_order import combine_identifiers_order
@@ -49,6 +51,8 @@ class ClassicBuildConfig:
     partition_from_level: int = DEFAULT_CLASSIC_PARTITION_FROM_LEVEL
     partition_prefix_bits: int = DEFAULT_CLASSIC_PARTITION_PREFIX_BITS
     retain_relocation_files: bool = False
+    star_format_version: int = DEFAULT_STAR_FORMAT_VERSION
+    terminal_waterline: int = DEFAULT_TERMINAL_WATERLINE
 
     def validate(self) -> None:
         if not self.stage00_output_dir.is_dir():
@@ -67,6 +71,10 @@ class ClassicBuildConfig:
             raise ValueError("partition_prefix_bits must be >= 0")
         if not math.isfinite(self.mag_limit):
             raise ValueError("mag_limit must be finite")
+        if self.star_format_version not in (1, 2):
+            raise ValueError("star_format_version must be 1 or 2")
+        if self.terminal_waterline <= 0:
+            raise ValueError("terminal_waterline must be > 0")
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +198,8 @@ def build_classic_artifacts(
         max_open_files=config.max_open_files,
         partition_from_level=config.partition_from_level,
         partition_prefix_bits=config.partition_prefix_bits,
+        star_format_version=config.star_format_version,
+        terminal_waterline=config.terminal_waterline,
     )
     input_identity = classic_input_identity(stage01_groups, materialization_plan)
 
@@ -233,6 +243,7 @@ def build_classic_artifacts(
             plan=CombinePlan(
                 max_open_files=config.max_open_files,
                 retain_relocation_files=config.retain_relocation_files,
+                star_format_version=config.star_format_version,
             ),
             descriptor=PackedDescriptorFields(
                 artifact_kind="render",

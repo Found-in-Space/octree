@@ -12,6 +12,8 @@ from .config import (
     DEFAULT_CLASSIC_PARTITION_PREFIX_BITS,
     DEFAULT_DEEP_SHARD_FROM_LEVEL,
     DEFAULT_MAG_VIS,
+    DEFAULT_STAR_FORMAT_VERSION,
+    DEFAULT_TERMINAL_WATERLINE,
     MORTON_BITS,
 )
 
@@ -62,6 +64,8 @@ _STAGE02_KEYS = {
     "classic_max_level",
     "partition_from_level",
     "partition_prefix_bits",
+    "star_format_version",
+    "terminal_waterline",
 }
 _STAGE03_KEYS = {"sidecars"}
 _STAGE03_SIDECAR_KEYS = {"name", "fields"}
@@ -103,6 +107,8 @@ class Stage02ProjectConfig:
     classic_max_level: int = DEFAULT_CLASSIC_MAX_LEVEL
     partition_from_level: int = DEFAULT_CLASSIC_PARTITION_FROM_LEVEL
     partition_prefix_bits: int = DEFAULT_CLASSIC_PARTITION_PREFIX_BITS
+    star_format_version: int = DEFAULT_STAR_FORMAT_VERSION
+    terminal_waterline: int = DEFAULT_TERMINAL_WATERLINE
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,6 +346,16 @@ def load_project(project_path: Path) -> OctreeProject:
             "partition_prefix_bits",
             DEFAULT_CLASSIC_PARTITION_PREFIX_BITS,
         ),
+        star_format_version=_optional_int(
+            stage02_raw,
+            "star_format_version",
+            DEFAULT_STAR_FORMAT_VERSION,
+        ),
+        terminal_waterline=_optional_int(
+            stage02_raw,
+            "terminal_waterline",
+            DEFAULT_TERMINAL_WATERLINE,
+        ),
     )
     if stage02.max_open_files <= 0:
         raise ValueError("stage02.max_open_files must be > 0")
@@ -349,6 +365,10 @@ def load_project(project_path: Path) -> OctreeProject:
         raise ValueError("stage02.partition_from_level must be >= 0")
     if stage02.partition_prefix_bits < 0:
         raise ValueError("stage02.partition_prefix_bits must be >= 0")
+    if stage02.star_format_version not in (1, 2):
+        raise ValueError("stage02.star_format_version must be 1 or 2")
+    if stage02.terminal_waterline <= 0:
+        raise ValueError("stage02.terminal_waterline must be > 0")
 
     sidecars_raw = stage03_raw.get("sidecars", [])
     if not isinstance(sidecars_raw, list):
@@ -426,7 +446,9 @@ def render_project_template() -> str:
         "max_open_files = 32\n"
         f"classic_max_level = {DEFAULT_CLASSIC_MAX_LEVEL}\n"
         f"partition_from_level = {DEFAULT_CLASSIC_PARTITION_FROM_LEVEL}\n"
-        f"partition_prefix_bits = {DEFAULT_CLASSIC_PARTITION_PREFIX_BITS}\n\n"
+        f"partition_prefix_bits = {DEFAULT_CLASSIC_PARTITION_PREFIX_BITS}\n"
+        f"star_format_version = {DEFAULT_STAR_FORMAT_VERSION}\n"
+        f"terminal_waterline = {DEFAULT_TERMINAL_WATERLINE}\n\n"
         "[stage03]\n\n"
         "[[stage03.sidecars]]\n"
         'name = "meta"\n'

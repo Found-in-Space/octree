@@ -137,6 +137,7 @@ def write_manifest(
     index_magic: bytes,
     mag_limit: float,
     name: str = "manifest.json",
+    terminal_map_path: Path | None = None,
 ) -> Path:
     for entry in shard_entries:
         validate_shard(out_dir, entry, expected_magic=index_magic)
@@ -179,6 +180,10 @@ def write_manifest(
         "index_record_struct": INDEX_RECORD.format,
         "levels": levels,
     }
+    if terminal_map_path is not None:
+        manifest["terminal_map_path"] = terminal_map_path.relative_to(
+            out_dir
+        ).as_posix()
 
     out_manifest = manifest_path(out_dir, name=name)
     tmp_path = out_dir / f".{name}.tmp"

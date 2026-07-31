@@ -8,13 +8,13 @@ from ..combine.records import (
     FRONTIER_REF_SIZE,
     HAS_PAYLOAD,
     IS_FRONTIER,
+    IS_TERMINAL,
     LEVELS_PER_SHARD,
     SHARD_HDR_FMT,
     SHARD_HDR_SIZE,
     SHARD_MAGIC,
-    SHARD_NODE_FMT,
-    SHARD_NODE_SIZE,
-    SHARD_VERSION,
+    SUPPORTED_STAR_FORMAT_VERSIONS,
+    shard_node_format,
 )
 from .header import OctreeHeader
 from .source import OctreeSource, SeekableBinaryReader, open_octree_source
@@ -55,6 +55,7 @@ class NodeEntry:
     _first_child: int
     _local_depth: int
     _local_path: int
+    star_count: int | None = None
 
     @property
     def is_leaf(self) -> bool:
@@ -63,6 +64,10 @@ class NodeEntry:
     @property
     def has_payload(self) -> bool:
         return bool(self.flags & HAS_PAYLOAD) and self.payload_length > 0
+
+    @property
+    def is_terminal(self) -> bool:
+        return bool(self.flags & IS_TERMINAL)
 
     def aabb_distance(self, point: Point) -> float:
         dx = max(abs(point.x - self.center.x) - self.half_size, 0.0)
@@ -81,6 +86,7 @@ class _ShardHeader:
     first_frontier_index: int
     node_table_offset: int
     frontier_table_offset: int
+    version: int
 
 
 class IndexNavigator:
@@ -187,9 +193,16 @@ class IndexNavigator:
             raise ValueError(
                 f"Invalid shard magic at offset {offset}: expected {SHARD_MAGIC!r}, got {magic!r}"
             )
-        if version != SHARD_VERSION:
+        if version not in SUPPORTED_STAR_FORMAT_VERSIONS:
             raise ValueError(
-                f"Unsupported shard version at offset {offset}: expected {SHARD_VERSION}, got {version}"
+                "Unsupported shard version at offset "
+                f"{offset}: expected one of {SUPPORTED_STAR_FORMAT_VERSIONS}, "
+                f"got {version}"
+            )
+        if int(version) != self._header.version:
+            raise ValueError(
+                "STAR/shard version mismatch at offset "
+                f"{offset}: STAR={self._header.version}, shard={version}"
             )
         entry_nodes = tuple(int(v) for v in fields[13:21])
         return _ShardHeader(
@@ -210,6 +223,7 @@ class IndexNavigator:
             first_frontier_index=int(fields[21]),
             node_table_offset=int(fields[22]),
             frontier_table_offset=int(fields[23]),
+            version=int(version),
         )
 
     def _read_node(self, shard: _ShardHeader, node_index: int) -> NodeEntry:
@@ -217,13 +231,15 @@ class IndexNavigator:
             raise ValueError(
                 f"Node index out of range for shard at {shard.offset}: {node_index}"
             )
-        node_offset = shard.node_table_offset + (node_index - 1) * SHARD_NODE_SIZE
+        node_format = shard_node_format(shard.version)
+        node_offset = shard.node_table_offset + (node_index - 1) * node_format.size
         self._fp.seek(node_offset)
-        raw = self._fp.read(SHARD_NODE_SIZE)
-        if len(raw) != SHARD_NODE_SIZE:
+        raw = self._fp.read(node_format.size)
+        if len(raw) != node_format.size:
             raise ValueError(
                 f"Truncated node record at shard {shard.offset}, node {node_index}"
             )
+        fields = node_format.unpack(raw)
         (
             first_child,
             local_path,
@@ -233,7 +249,8 @@ class IndexNavigator:
             _reserved,
             payload_offset,
             payload_length,
-        ) = SHARD_NODE_FMT.unpack(raw)
+        ) = fields[:8]
+        star_count = int(fields[8]) if len(fields) == 9 else None
 
         global_level = shard.parent_global_depth + int(local_depth)
         grid = self._decode_local_grid(
@@ -256,6 +273,7 @@ class IndexNavigator:
             _first_child=int(first_child),
             _local_depth=int(local_depth),
             _local_path=int(local_path),
+            star_count=star_count,
         )
 
     def _node_geometry(self, grid: GridCoord, level: int) -> tuple[Point, float]:
