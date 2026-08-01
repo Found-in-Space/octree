@@ -60,6 +60,10 @@ CLASSIC_WORK_STATE_FORMAT = "foundinspace.octree.classic-work/v1"
 CLASSIC_ALGORITHM_VERSION = "sorted-cell-merge-terminal-packing/v3"
 CLASSIC_OVERLAP_IN_MEMORY_MAX_BYTES = 256 * 1024 * 1024
 CLASSIC_OVERLAP_EXTERNAL_SORT_MEMORY_LIMIT = "512MB"
+# Merge runs are sequential-scan intermediates.  Keep their physical writes
+# bounded independently of the number (and size distribution) of cells.
+CLASSIC_MERGE_WRITE_MAX_BYTES = 256 * 1024 * 1024
+CLASSIC_MERGE_WRITE_MAX_PIECES = 1024
 
 _RAW_COLUMNS = (
     "x_icrs_pc",
@@ -1005,15 +1009,78 @@ def _write_merged_run(
     *,
     batch_size: int,
 ) -> None:
+    if batch_size <= 0:
+        raise ValueError("Classic merge batch_size must be > 0")
     tmp_path = output.with_name(f".{output.name}.tmp")
-    writer = pq.ParquetWriter(tmp_path, _COMPACT_SCHEMA, compression="zstd")
+    writer = pq.ParquetWriter(
+        tmp_path,
+        _COMPACT_SCHEMA,
+        compression="zstd",
+        # These files are consumed in canonical order, never predicate-scanned.
+        # Per-column statistics only enlarge their footer.
+        write_statistics=False,
+    )
+    buffered: list[pa.Table] = []
+    buffered_rows = 0
+    buffered_bytes = 0
+
+    def flush() -> None:
+        nonlocal buffered, buffered_rows, buffered_bytes
+        if not buffered:
+            return
+        table = pa.concat_tables(buffered, promote_options="none")
+        writer.write_table(table, row_group_size=batch_size)
+        buffered = []
+        buffered_rows = 0
+        buffered_bytes = 0
+
+    def compact_pieces() -> None:
+        nonlocal buffered, buffered_bytes
+        # Arrow table slices retain their parent buffers.  Combining chunks here
+        # caps both metadata and retained-buffer counts for many tiny cells.
+        table = pa.concat_tables(buffered, promote_options="none").combine_chunks()
+        buffered = [table]
+        buffered_bytes = table.nbytes
+
     try:
         for _key, batch in _iter_merged_batches(
             paths,
             batch_size=batch_size,
             spill_dir=output.parent,
         ):
-            writer.write_table(batch, row_group_size=batch_size)
+            offset = 0
+            while offset < len(batch):
+                if buffered_rows >= batch_size:
+                    flush()
+                row_room = batch_size - buffered_rows
+                piece_rows = min(row_room, len(batch) - offset)
+                piece = batch.slice(offset, piece_rows)
+
+                # A row bound alone is insufficient for variable-width identity
+                # fields.  Shrink a piece until its logical size fits the byte
+                # budget (a single unusually large row is the unavoidable floor).
+                while len(piece) > 1 and piece.nbytes > CLASSIC_MERGE_WRITE_MAX_BYTES:
+                    piece_rows = max(1, piece_rows // 2)
+                    piece = batch.slice(offset, piece_rows)
+
+                if buffered and (
+                    buffered_bytes + piece.nbytes > CLASSIC_MERGE_WRITE_MAX_BYTES
+                ):
+                    flush()
+                    continue
+
+                buffered.append(piece)
+                buffered_rows += len(piece)
+                buffered_bytes += piece.nbytes
+                offset += len(piece)
+                if len(buffered) >= CLASSIC_MERGE_WRITE_MAX_PIECES:
+                    compact_pieces()
+                if (
+                    buffered_rows >= batch_size
+                    or buffered_bytes >= CLASSIC_MERGE_WRITE_MAX_BYTES
+                ):
+                    flush()
+        flush()
     except Exception:
         writer.close()
         tmp_path.unlink(missing_ok=True)

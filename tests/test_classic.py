@@ -84,6 +84,30 @@ def _write_compact_run(path: Path, rows: list[tuple[float | None, str, int]]) ->
     )
 
 
+def _write_compact_cells(
+    path: Path,
+    rows: list[tuple[int, int, float, str]],
+) -> None:
+    pq.write_table(
+        pa.table(
+            {
+                "final_level": pa.array([row[0] for row in rows], pa.int16()),
+                "final_node_id": pa.array([row[1] for row in rows], pa.uint64()),
+                "mag_abs": pa.array([row[2] for row in rows], pa.float64()),
+                "source": pa.array(["gaia"] * len(rows), pa.string()),
+                "source_id": pa.array([row[3] for row in rows], pa.string()),
+                "render": pa.array(
+                    [bytes([index % 256]) * 16 for index in range(len(rows))],
+                    pa.binary(16),
+                ),
+            },
+            schema=classic_materialization._COMPACT_SCHEMA,
+        ),
+        path,
+        compression="zstd",
+    )
+
+
 def _merged_compact_runs(
     paths: list[Path],
     *,
@@ -686,6 +710,100 @@ def test_classic_build_merges_sorted_stage01_groups_in_canonical_order(
         ("gaia", "m"),
         ("gaia", "z"),
     ]
+
+
+def test_merged_run_coalesces_many_tiny_cells_into_bounded_row_groups(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = tmp_path / "first.parquet"
+    second = tmp_path / "second.parquet"
+    output = tmp_path / "merged.parquet"
+    rows = [(14, node, float(node), f"id-{node:03d}") for node in range(37)]
+    _write_compact_cells(first, rows[::2])
+    _write_compact_cells(second, rows[1::2])
+    # Exercise piece compaction without allowing the piece count to dictate
+    # physical row groups.
+    monkeypatch.setattr(
+        classic_materialization,
+        "CLASSIC_MERGE_WRITE_MAX_PIECES",
+        3,
+    )
+
+    classic_materialization._write_merged_run([first, second], output, batch_size=10)
+
+    parquet = pq.ParquetFile(output)
+    assert parquet.metadata.num_row_groups == 4
+    assert [
+        parquet.metadata.row_group(index).num_rows
+        for index in range(parquet.metadata.num_row_groups)
+    ] == [10, 10, 10, 7]
+    assert parquet.metadata.row_group(0).column(0).statistics is None
+    assert parquet.read().column("source_id").to_pylist() == [row[3] for row in rows]
+
+
+def test_merged_run_preserves_cell_across_physical_row_group_boundaries(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.parquet"
+    output = tmp_path / "merged.parquet"
+    rows = [(14, 0, float(index), f"zero-{index:02d}") for index in range(13)] + [
+        (14, 1, float(index), f"one-{index:02d}") for index in range(4)
+    ]
+    _write_compact_cells(source, rows)
+
+    classic_materialization._write_merged_run([source], output, batch_size=5)
+
+    parquet = pq.ParquetFile(output)
+    assert [
+        parquet.metadata.row_group(index).num_rows
+        for index in range(parquet.metadata.num_row_groups)
+    ] == [5, 5, 5, 2]
+    keyed = list(
+        classic_materialization._iter_merged_batches(
+            [output], batch_size=4, spill_dir=tmp_path
+        )
+    )
+    assert [key for key, _table in keyed] == [
+        (14, 0),
+        (14, 0),
+        (14, 0),
+        (14, 0),
+        (14, 1),
+        (14, 1),
+    ]
+    assert [
+        sum(len(table) for key, table in keyed if key == wanted)
+        for wanted in [(14, 0), (14, 1)]
+    ] == [13, 4]
+
+
+def test_merged_run_byte_cap_splits_oversized_variable_width_cell(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.parquet"
+    output = tmp_path / "merged.parquet"
+    rows = [(14, 0, float(index), f"id-{index}-" + "x" * 180) for index in range(12)]
+    _write_compact_cells(source, rows)
+    monkeypatch.setattr(
+        classic_materialization,
+        "CLASSIC_MERGE_WRITE_MAX_BYTES",
+        700,
+    )
+
+    classic_materialization._write_merged_run([source], output, batch_size=12)
+
+    parquet = pq.ParquetFile(output)
+    assert parquet.metadata.num_row_groups > 1
+    assert (
+        max(
+            parquet.metadata.row_group(index).num_rows
+            for index in range(parquet.metadata.num_row_groups)
+        )
+        < 12
+    )
+    assert parquet.read().column("source_id").to_pylist() == [row[3] for row in rows]
 
 
 def test_classic_overlap_spill_matches_in_memory_sort(
