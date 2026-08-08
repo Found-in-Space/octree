@@ -274,6 +274,82 @@ def test_stage01_dirty_only_changed_group_marks_stage03_all(
     assert unchanged_file.stat().st_mtime_ns == unchanged_mtime
 
 
+def test_one_star_replacement_preserves_unrelated_sorted_group_from_same_shard(
+    tmp_path: Path,
+) -> None:
+    input_root = tmp_path / "input"
+    rows = [
+        {
+            "source": "gaia",
+            "source_id": "changed-before",
+            "morton_code": _morton_for_node(1, 0),
+            "level": 1,
+            "mag_abs": 7.0,
+        },
+        {
+            "source": "gaia",
+            "source_id": "unchanged",
+            "morton_code": _morton_for_node(1, 1),
+            "level": 1,
+            "mag_abs": 7.1,
+        },
+    ]
+    _write_stage00_pixel(input_root, "100", rows)
+    stage00_dir = tmp_path / "stage00"
+    stage01_dir = tmp_path / "stage01"
+    stage00_config = _stage00_config(input_root, stage00_dir, bucket_size=2)
+    stage01_config = _stage01_config(stage00_dir, stage01_dir, bucket_size=2)
+    run_stage00(stage00_config)
+    run_stage01(stage01_config)
+    _clear_stage03_dirty(stage00_dir)
+
+    before_state = json.loads(
+        (stage00_dir / "stage-state.json").read_text(encoding="utf-8")
+    )
+    before_groups = {group["key"]: group for group in before_state["stage01_groups"]}
+    unchanged_key = "o=1|100|pack"
+    changed_key = "o=0|100|pack"
+    unchanged_files = [
+        stage01_dir / value for value in before_groups[unchanged_key]["files"]
+    ]
+    unchanged_stats = [
+        (path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes())
+        for path in unchanged_files
+    ]
+
+    replacement = [dict(row) for row in rows]
+    replacement[0]["source_id"] = "changed-after"
+    _write_stage00_pixel(input_root, "100", replacement)
+    run_stage00(
+        _stage00_config(
+            input_root,
+            stage00_dir,
+            bucket_size=2,
+            shard_ids=("100",),
+            replace_shards=True,
+        )
+    )
+
+    report_path = run_stage01(stage01_config)
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    after_state = json.loads(
+        (stage00_dir / "stage-state.json").read_text(encoding="utf-8")
+    )
+    after_groups = {group["key"]: group for group in after_state["stage01_groups"]}
+    assert report["processed_group_count"] == 1
+    assert report["changed_group_count"] == 1
+    assert report["unchanged_group_count"] == 0
+    assert after_groups[unchanged_key] == before_groups[unchanged_key]
+    assert (
+        after_groups[changed_key]["checksum"] != before_groups[changed_key]["checksum"]
+    )
+    assert [
+        (path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes())
+        for path in unchanged_files
+    ] == unchanged_stats
+
+
 def test_stage01_processes_dirty_groups_accumulated_across_replacements(
     tmp_path: Path,
 ) -> None:
@@ -627,6 +703,140 @@ def test_stage01_uses_external_sort_for_oversized_group(
     assert [pq.read_metadata(path).num_rows for path in files] == [2, 2, 1]
     assert sorted_table.column("source_id").to_pylist() == ["a", "b", "y", "x", "z"]
     assert state["stage01_groups"][0]["checksum"] == expected_checksum
+
+
+def test_stage01_external_sort_matches_in_memory_for_primary_key_ties(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_root = tmp_path / "input"
+    base_morton = _morton_for_node(2, 1)
+    _write_stage00_pixel(
+        input_root,
+        "100",
+        [
+            {
+                "source": "gaia",
+                "source_id": "same",
+                "morton_code": base_morton + suffix,
+                "level": 2,
+                "mag_abs": 7.0,
+            }
+            for suffix in (9, 1, 7, 3, 5)
+        ],
+    )
+    stage00_dir = tmp_path / "stage00"
+    stage01_dir = tmp_path / "stage01"
+    run_stage00(_stage00_config(input_root, stage00_dir))
+    state = json.loads((stage00_dir / "stage-state.json").read_text(encoding="utf-8"))
+    expected = stage01_module._sorted_stage00_group(
+        stage00_dir,
+        state["stage00_groups"][0],
+    )
+    expected_checksum = stage01_module._stage01_group_checksum(expected)
+    monkeypatch.setattr(
+        stage01_module,
+        "STAGE01_IN_MEMORY_MAX_UNCOMPRESSED_BYTES",
+        1,
+    )
+
+    run_stage01(_stage01_config(stage00_dir, stage01_dir, fragment_target_rows=2))
+
+    state = json.loads((stage00_dir / "stage-state.json").read_text(encoding="utf-8"))
+    files = [stage01_dir / path for path in state["stage01_groups"][0]["files"]]
+    actual = pa.concat_tables([pq.read_table(path) for path in files])
+    assert state["stage01_groups"][0]["checksum"] == expected_checksum
+    assert actual.column("morton_code").to_pylist() == [
+        base_morton + suffix for suffix in (1, 3, 5, 7, 9)
+    ]
+
+
+def test_stage01_external_sort_matches_arrow_null_and_nan_ordering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_root = tmp_path / "input"
+    rows = [
+        {
+            "source": "gaia",
+            "source_id": source_id,
+            "morton_code": _morton_for_node(1, 0),
+            "level": 1,
+            "mag_abs": magnitude,
+        }
+        for source_id, magnitude in (
+            (None, 1.0),
+            ("null-mag", None),
+            ("nan", float("nan")),
+            ("z", 1.0),
+        )
+    ]
+    _write_stage00_pixel(input_root, "100", rows)
+    stage00_dir = tmp_path / "stage00"
+    stage01_dir = tmp_path / "stage01"
+    run_stage00(_stage00_config(input_root, stage00_dir))
+    state = json.loads((stage00_dir / "stage-state.json").read_text(encoding="utf-8"))
+    expected = stage01_module._sorted_stage00_group(
+        stage00_dir,
+        state["stage00_groups"][0],
+    )
+    expected_checksum = stage01_module._stage01_group_checksum(expected)
+    monkeypatch.setattr(
+        stage01_module,
+        "STAGE01_IN_MEMORY_MAX_UNCOMPRESSED_BYTES",
+        1,
+    )
+
+    run_stage01(_stage01_config(stage00_dir, stage01_dir))
+
+    state = json.loads((stage00_dir / "stage-state.json").read_text(encoding="utf-8"))
+    files = [stage01_dir / path for path in state["stage01_groups"][0]["files"]]
+    actual = pa.concat_tables([pq.read_table(path) for path in files])
+    assert state["stage01_groups"][0]["checksum"] == expected_checksum
+    assert actual.column("source_id").to_pylist() == [
+        "z",
+        None,
+        "nan",
+        "null-mag",
+    ]
+
+
+def test_stage01_reprocessing_keeps_published_group_files_immutable(
+    tmp_path: Path,
+) -> None:
+    input_root = tmp_path / "input"
+    _write_stage00_pixel(
+        input_root,
+        "100",
+        [
+            {
+                "source": "gaia",
+                "source_id": "a",
+                "morton_code": _morton_for_node(1, 0),
+                "level": 1,
+                "mag_abs": 7.0,
+            }
+        ],
+    )
+    stage00_dir = tmp_path / "stage00"
+    stage01_dir = tmp_path / "stage01"
+    run_stage00(_stage00_config(input_root, stage00_dir))
+    run_stage01(_stage01_config(stage00_dir, stage01_dir))
+    state_path = stage00_dir / "stage-state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    group = state["stage01_groups"][0]
+    output_path = stage01_dir / group["files"][0]
+    inode = output_path.stat().st_ino
+    state["dirty"]["stage01_groups"] = [group["key"]]
+    state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+    report_path = run_stage01(_stage01_config(stage00_dir, stage01_dir))
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert report["unchanged_group_count"] == 1
+    assert state["stage01_groups"][0]["files"] == group["files"]
+    assert output_path.stat().st_ino == inode
 
 
 def test_stage01_external_sort_ignores_hive_node_directories(

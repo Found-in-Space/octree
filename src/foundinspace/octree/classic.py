@@ -53,6 +53,8 @@ class ClassicBuildConfig:
     retain_relocation_files: bool = False
     star_format_version: int = DEFAULT_STAR_FORMAT_VERSION
     terminal_waterline: int = DEFAULT_TERMINAL_WATERLINE
+    intermediates_dir: Path | None = None
+    work_dir: Path | None = None
 
     def validate(self) -> None:
         if not self.stage00_output_dir.is_dir():
@@ -164,19 +166,41 @@ def _publish_intermediates(
     temporary_dir: Path,
     final_dir: Path,
 ) -> None:
+    final_dir.parent.mkdir(parents=True, exist_ok=True)
+    incoming_dir = final_dir.with_name(f".{final_dir.name}.{uuid4().hex}.incoming")
+    publication_dir = temporary_dir
+    copied_to_final_device = False
+    if temporary_dir.stat().st_dev != final_dir.parent.stat().st_dev:
+        # os.replace is atomic only within one filesystem. Build a complete
+        # staging tree beside the destination before disturbing the published
+        # tree when callers configure work and intermediates on different
+        # filesystems.
+        try:
+            shutil.copytree(temporary_dir, incoming_dir, copy_function=shutil.copy2)
+        except Exception:
+            shutil.rmtree(incoming_dir, ignore_errors=True)
+            raise
+        publication_dir = incoming_dir
+        copied_to_final_device = True
+
     backup_dir = final_dir.with_name(f".{final_dir.name}.{uuid4().hex}.backup")
     moved_existing = False
     if final_dir.exists():
         os.replace(final_dir, backup_dir)
         moved_existing = True
     try:
-        os.replace(temporary_dir, final_dir)
+        os.replace(publication_dir, final_dir)
     except Exception:
         if moved_existing and not final_dir.exists():
             os.replace(backup_dir, final_dir)
         raise
+    finally:
+        if incoming_dir.exists():
+            shutil.rmtree(incoming_dir)
     if moved_existing:
         shutil.rmtree(backup_dir)
+    if copied_to_final_device:
+        shutil.rmtree(temporary_dir, ignore_errors=True)
 
 
 def build_classic_artifacts(
@@ -203,14 +227,18 @@ def build_classic_artifacts(
     )
     input_identity = classic_input_identity(stage01_groups, materialization_plan)
 
-    intermediates_dir = config.stage01_output_dir / CLASSIC_INTERMEDIATES_DIR_NAME
+    intermediates_dir = config.intermediates_dir or (
+        config.stage01_output_dir / CLASSIC_INTERMEDIATES_DIR_NAME
+    )
     materialized = load_published_materialization(
         intermediates_dir,
         input_identity=input_identity,
         plan=materialization_plan,
     )
     if materialized is None:
-        work_dir = config.stage01_output_dir / CLASSIC_WORK_DIR_NAME
+        work_dir = config.work_dir or (
+            config.stage01_output_dir / CLASSIC_WORK_DIR_NAME
+        )
         materialized = materialize_classic_groups(
             groups=stage01_groups,
             work_dir=work_dir,
@@ -221,7 +249,10 @@ def build_classic_artifacts(
             temporary_dir=work_artifacts_dir,
             final_dir=intermediates_dir,
         )
-        shutil.rmtree(work_dir, ignore_errors=True)
+        # The work directory owns content-addressed normalized runs, topology
+        # inputs and completed partitions. materialize_classic_groups prunes
+        # superseded products after successful publication assembly; retaining
+        # this bounded checkpoint is what makes later shard rebuilds incremental.
     render_manifest_path = intermediates_dir / materialized.render_manifest_path.name
     identifiers_manifest_path = (
         intermediates_dir / materialized.identifiers_manifest_path.name

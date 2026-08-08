@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import io
 import struct
 from collections.abc import Iterable, Iterator
 from typing import BinaryIO
@@ -113,37 +114,59 @@ def _identity_chunks(
         yield source_id_bytes
 
 
-def decode_identity_rows(raw: bytes, *, star_count: int) -> list[tuple[str, str]]:
-    out: list[tuple[str, str]] = []
-    offset = 0
+def iter_identity_rows(
+    source: BinaryIO,
+    *,
+    star_count: int,
+) -> Iterator[tuple[str, str]]:
+    """Decode identities sequentially from an uncompressed cell stream."""
     for _ in range(star_count):
-        if offset + _LEN_FMT.size > len(raw):
-            raise ValueError("Identity payload truncated reading source length")
-        (source_len,) = _LEN_FMT.unpack_from(raw, offset)
-        offset += _LEN_FMT.size
-        end = offset + source_len
-        if end > len(raw):
-            raise ValueError("Identity payload truncated reading source bytes")
-        source = raw[offset:end].decode("utf-8")
-        offset = end
-
-        if offset + _LEN_FMT.size > len(raw):
-            raise ValueError("Identity payload truncated reading source_id length")
-        (source_id_len,) = _LEN_FMT.unpack_from(raw, offset)
-        offset += _LEN_FMT.size
-        end = offset + source_id_len
-        if end > len(raw):
-            raise ValueError("Identity payload truncated reading source_id bytes")
-        source_id = raw[offset:end].decode("utf-8")
-        offset = end
-        out.append((source, source_id))
-    if offset != len(raw):
+        (source_len,) = _LEN_FMT.unpack(
+            _read_exact(
+                source,
+                _LEN_FMT.size,
+                message="Identity payload truncated reading source length",
+            )
+        )
+        source_value = _read_exact(
+            source,
+            source_len,
+            message="Identity payload truncated reading source bytes",
+        ).decode("utf-8")
+        (source_id_len,) = _LEN_FMT.unpack(
+            _read_exact(
+                source,
+                _LEN_FMT.size,
+                message="Identity payload truncated reading source_id length",
+            )
+        )
+        source_id = _read_exact(
+            source,
+            source_id_len,
+            message="Identity payload truncated reading source_id bytes",
+        ).decode("utf-8")
+        yield source_value, source_id
+    if source.read(1):
         raise ValueError("Identity payload has trailing bytes")
-    return out
+
+
+def _read_exact(source: BinaryIO, size: int, *, message: str) -> bytes:
+    out = bytearray()
+    while len(out) < size:
+        chunk = source.read(size - len(out))
+        if not chunk:
+            raise ValueError(message)
+        out.extend(chunk)
+    return bytes(out)
+
+
+def decode_identity_rows(raw: bytes, *, star_count: int) -> list[tuple[str, str]]:
+    return list(iter_identity_rows(io.BytesIO(raw), star_count=star_count))
 
 
 def decode_identity_blob(blob: bytes, *, star_count: int) -> list[tuple[str, str]]:
-    return decode_identity_rows(gzip.decompress(blob), star_count=star_count)
+    with gzip.GzipFile(fileobj=io.BytesIO(blob), mode="rb") as decompressed:
+        return list(iter_identity_rows(decompressed, star_count=star_count))
 
 
 def iter_encoded_cells_with_identities(

@@ -97,6 +97,32 @@ file.
 
 For `meta`, `fields = [...]` limits which enrichment columns are emitted. `source` and `source_id` are always included.
 
+### Enrichment Lookup
+
+The enrichment map and the identity request stream have very different sizes
+and access patterns. `identifiers_map.parquet` is normally a small curated map,
+while `identifiers.order` can contain every rendered star and presents requests
+in spatial/cell order rather than identity order.
+
+The metadata encoder therefore consumes the Parquet map in bounded batches and
+uses an adaptive lookup backend:
+
+- maps whose conservative logical estimate stays within 64 MiB use an in-memory
+  hash map, then stream identity requests through direct lookups;
+- larger maps are promoted to a private disk-backed SQLite primary-key index;
+  the in-memory entries are released and subsequent ingestion remains batched.
+
+SQLite is used only for the overflow random-lookup case. DuckDB is effective for
+bulk scans and external ordering, but a cell-at-a-time join would repeatedly
+scan or rebuild a hash table over the enrichment map. A pure sort/merge join
+would require writing all identity requests, sorting them by identity, joining,
+then externally sorting the results back into cell order. That multi-pass design
+becomes attractive only if enrichment maps grow beyond the bounded hash-map fast
+path and measurements show that building the disk primary-key index dominates.
+
+Both backends preserve input request order, duplicate-map last-row-wins behavior,
+field normalization, and byte-identical gzip JSON payloads.
+
 ## Intermediate Files
 
 The current implementation builds per-sidecar intermediate shard files under:

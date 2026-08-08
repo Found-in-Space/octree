@@ -1,613 +1,552 @@
-# Staged Pipeline Plan
+# Incremental Streaming Pipeline Plan
 
-This is the coordination document for the new staged octree pipeline. It tracks
-the target design, implementation order, invariants, and open decisions while we
-move from the current compatibility pipeline to an incremental build pipeline.
+This document tracks migration from the current numbered compatibility commands
+to the product flow defined in
+[`streaming-pipeline.md`](streaming-pipeline.md). The goal is simple: when a
+small part of an upstream catalogue changes, reuse every routed, sorted,
+topology, materialized, and packed result whose relevant semantic content did
+not change.
 
-The core goal is simple: if a small part of the upstream catalogue changes, the
-octree build should reuse every staged, materialized, and packaged result whose
-semantic content did not change.
+Numeric stage labels describe current entry points only. New contracts and
+implementation work use the product names `routed contributions`, `sorted
+contributions`, `profile topology`, `materialized buckets`, `packing`, and
+`sidecars`.
 
-## Current Status
+## Current status
 
-Implemented on the current work branch:
+Implemented or available on the current work branch:
 
-- Stage 00 can build an adaptive octree-shaped staging tree.
-- Stage 00 accepts both directory-based input shards and root-level parquet
-  shard files. A shard may be a HEALPix pixel, a batch shard, or any other
-  stable upstream rebuild unit.
-- Stage 00 preserves the input shard id in output fragment names.
-- Stage 00 reports group-level content checksums for current staged fragments.
-  Checksums stream fixed logical Arrow batches, so memory use and digest identity
-  do not depend on physical parquet fragment boundaries.
-- Stage 00 has been smoke-tested against a 31M-row real parquet shard.
-- Stage 00 writes tree identity and mutable stage-state manifests.
-- Stage 00 supports explicit shard replacement and dirty Stage 01 group
-  tracking.
-- Initial Stage 00 builds checkpoint after each input shard. Fragment changes
-  use a write-ahead journal, and the final semantic checksum pass uses
-  independent per-group checkpoints.
-- Stage 01 sorts and compacts Stage 00 groups into replaceable sorted parquet
-  groups while preserving `(staging_node, input_shard_id, kind)` granularity.
-  Ordinary groups retain the in-memory Arrow fast path; outlier groups switch to
-  a disk-backed DuckDB external sort with a bounded default memory limit.
-- Stage 01 checkpoints each completed group independently and consolidates the
-  shared state once at completion.
-- Stage 01 stores a scalar natural maximum level per group rather than occupied
-  final-node lists. Downstream dirtiness is a bounded `clean`/`all` state.
-- The compatibility `stage-02` path materializes the traditional/classic
-  level-capped output from tracked Stage 01 groups and writes `stars.octree`
-  plus `identifiers.order` through the existing binary combine pipeline.
+- The compatibility `stage-00` command routes directory-based or root-level
+  Parquet shards into an adaptive octree-shaped staging tree.
+- A shard may be a HEALPix pixel, a batch shard, or another stable upstream
+  replacement unit.
+- Routing preserves `input_shard_id` and the
+  `(staging bucket, input shard id, kind)` contribution boundary.
+- Group semantic checksums stream fixed logical Arrow batches and do not depend
+  on Parquet row-group or fragment boundaries.
+- Initial routing checkpoints after every shard. A write-ahead fragment journal
+  handles rollback or cleanup, and the final checksum pass has independent
+  group checkpoints.
+- Shard replacement compares old and new contribution checksums and records
+  only changed, created, or removed groups for preparation.
+- The compatibility `stage-01` command sorts changed contributions into
+  replaceable canonical Parquet groups.
+- Ordinary groups use the bounded Arrow fast path. Oversized groups use
+  DuckDB's disk-backed external sort with a bounded default memory limit.
+- Sorted fragment names include their input/policy identity, publication is
+  atomic, and superseded files remain live until a durable group checkpoint
+  exists.
+- Each completed preparation group is checkpointed independently before the
+  shared state is consolidated.
 - The raw Cartesian input filter computes only `morton_code` and natural
-  `level`; raw position, magnitude, and temperature fields remain available in
-  Stage 00 and Stage 01.
-- Classic materialization selects the capped final node and encodes its
-  node-relative render record once. Precomputed Stage 01 `render` records are
-  not part of the staged-row contract.
-- Classic materialization preserves the sorted Stage 01 order for rows within
-  the level cap, locally reorders only groups affected by level folding, and
-  combines compact group runs with a bounded fan-in cell merge. Disjoint cells
-  remain chunk-streamed; overlapping cells use native Arrow sorting with a
-  DuckDB spill fallback above the in-memory bound.
-- Deep classic output is spatially partitioned and checkpointed. Failed builds
-  reuse completed group runs and completed output partitions.
+  `level`; raw position, magnitude, temperature, and identity fields remain
+  available for profile materialization.
+- Shared materialization run/merge helpers support bounded run generation,
+  bounded fan-in merging, checkpointed group runs, and checkpointed spatial
+  output partitions.
+- The compatibility `stage-02` path can materialize and pack the traditional
+  level-capped output as `stars.octree` plus `identifiers.order`.
+- Materialization selects the final profile cell before encoding the
+  node-relative render record. It preserves prepared order where possible and
+  locally reorders only affected or overlapping cells.
+- Disjoint cells remain Arrow-streamed; oversized local sorting may use DuckDB
+  when its native external sorter is the better execution engine.
+- Render artifacts, identity order, and sidecars carry UUID-backed parent
+  identities.
 
-Not implemented yet:
+Compatibility limitations still to remove:
 
-- the alternative packed final-output variant
-- profile-oriented Stage 03 assembly and manifests
-- named Stage 03 output profiles
-- dedicated sidecar builds per Stage 03 output profile
-- removal of the obsolete Stage 02 command and old intermediate-shard pipeline
+- downstream preparation changes currently fall back to a shared
+  `clean`/`all` invalidation marker;
+- per-cell count and content summaries are not yet a complete reusable product;
+- terminal-packed topology still needs the streamed count/topology design;
+- profile topology and materialized dependency manifests are not yet fully
+  partitioned;
+- the current monolithic packer rewrites complete artifacts; and
+- current numeric commands collapse several target products together.
 
-## Target Pipeline
+The `clean`/`all` marker is bounded and safe, but it is not the target
+architecture. The target is partitioned dependency metadata with checksum
+stopping at every product boundary.
 
-| Stage | Role | Rebuild boundary | Output |
-|---|---|---|---|
-| Stage 00 | Partition input shards into staging buckets. | Input shard and staging node. | Raw staged parquet groups. |
-| Stage 01 | Sort and compact staged groups. | Staging node, shard id, and fragment kind. | Canonical sorted staged groups. |
-| Stage 03 | Assemble final output profiles. | Output profile and final octree node. | `stars.octree`, `identifiers.order`, and dedicated sidecars per profile. |
+## Target products
 
-The stage split is intentional:
+| Product | Rebuild boundary | Output |
+|---|---|---|
+| Routed contributions | Input shard and staging group | Immutable raw contribution fragments |
+| Sorted contributions | Changed routed contribution | Canonical rows and sorted cell summaries |
+| Profile topology | Profile and changed spatial branch | Natural-cell to final-cell mapping |
+| Materialized buckets | Profile and affected output partition | Aligned render and identity byte ranges |
+| Packed artifacts | Output profile | `stars.octree` and `identifiers.order` |
+| Sidecars | Profile, family, and affected identity partition | Schema-bearing sidecar artifacts |
 
-- Stage 00 does spatial placement once.
-- Stage 01 makes staged input deterministic and compact.
-- Stage 03 is where final renderer order becomes canonical and packaged.
-- Stage 03 builds sidecars against the exact identity order of each output
-  profile.
-
-There is no Stage 02 in the target pipeline. The old Stage 02 command combined
-intermediate shards into `stars.octree`; that responsibility moves into Stage
-03. The old Stage 03 command built sidecars from global Stage 02 artifacts; that
-becomes a per-output-profile Stage 03 subtask.
-
-### Output Profiles
-
-Stage 03 builds one or more named output profiles from the same Stage 01 sorted
-groups. Each profile owns its render octree, identity-order artifact, manifest,
-dataset UUID, and sidecars.
-
-Required profiles:
-
-- `classic`: cap final output at level 14 and preserve today's octree semantics
-  and binary compatibility where practical.
-- `unbounded`: allow final output through `MORTON_BITS` / level 21, relying on
-  magnitude placement and Stage 00 packing so very deep nodes are rare.
-
-Recommended output layout:
+The intended orchestration vocabulary is:
 
 ```text
-stage03/classic/stars.octree
-stage03/classic/identifiers.order
-stage03/classic/sidecars/meta.octree
-
-stage03/unbounded/stars.octree
-stage03/unbounded/identifiers.order
-stage03/unbounded/sidecars/meta.octree
+route
+prepare
+materialize --profile NAME
+pack --profile NAME
+sidecars
+build --profile NAME
 ```
 
-Sidecar artifacts are never shared between profiles. A profile's node set and
-identity order define the sidecar order, and each sidecar artifact must carry
-that profile's parent dataset UUID. Sidecars are schema-bearing artifacts: a
-reader should be able to open a sidecar, validate its parent dataset UUID when
-joining with a render octree, inspect the embedded schema, and decode typed
-records without knowing a separate sidecar "family" registry.
+Renaming the current CLI is deliberately separate from building these product
+contracts.
 
-## Invariants
+## Core invariants
 
-These invariants should be enforced by manifests and tests.
+### Replaceable contribution boundary
 
-### Stage 00 Placement
-
-For a fixed input shard and fixed build identity, Stage 00 must produce the same
-semantic staged row groups every time.
-
-The physical parquet files are allowed to differ in metadata or row group
-layout. The semantic content is what matters:
+For a fixed shard and tree identity, routing produces:
 
 ```text
-(staging_node, input_shard_id, kind) -> rows
+(staging bucket, input shard id, kind) -> semantic rows
 ```
 
-`kind` is currently:
+`kind` currently distinguishes:
 
-- `pack`: rows held in a packed staging node that may include deeper final
-  levels
-- `lim`: rows resident at a lower-mag-limited staging node
+- `pack`: rows held in a staging bucket that may contain deeper natural cells;
+- `lim`: rows resident in a lower-magnitude-limited staging bucket.
 
-### Shard Replaceability
+Physical filenames, compression metadata, and row-group boundaries may differ.
+Semantic row content determines identity.
 
-An input shard must be replaceable without deleting unrelated shard data:
+A shard replacement uses the union of old and new contribution keys. It must
+detect rows that moved to another group, disappeared, or appeared. Equal
+contributions retain their existing immutable files; they are not republished
+just because the shard was reread.
 
-1. Find all Stage 00 groups with `input_shard_id`.
-2. Delete those fragments.
-3. Run Stage 00 for the new shard file.
-4. Compare old and new group checksums.
-5. Mark only changed groups dirty.
+### Canonical local ordering
 
-This is true for HEALPix pixel files and also for older batch-sharded parquet
-files. The upstream catalogue pipeline owns this granularity: if it wants
-HEALPix-level rebuilds it should emit stable HEALPix shards; if it emits batch
-files, the octree pipeline will rebuild and checksum at batch-shard granularity.
-
-Stage 00 derives `input_shard_id` from the input directory name or root-level
-parquet filename stem. It does not derive the rebuild boundary from row-level
-HEALPix columns. It preserves row columns as supplied; enrichment or
-normalization is allowed only through an explicitly configured pre-filter, and
-that filter must preserve row count. The raw Cartesian filter adds routing
-columns only. It does not replace raw coordinates with node-relative payload
-coordinates.
-
-### Canonical Ordering
-
-Stage 01 is responsible for deterministic local ordering. Stage 03 is
-responsible for deterministic final node ordering.
-
-The Stage 01 sort key is:
+Preparation sorts each contribution independently, never the whole catalogue.
+The primary key is:
 
 ```text
 level, final_node_id, mag_abs, source, source_id
 ```
 
-where:
+with:
 
 ```text
 final_node_id = morton_code >> (3 * (MORTON_BITS - level))
 ```
 
-If the renderer or sidecar builders need a different tie-breaker, the Stage 01
-manifest/state version must change.
+Remaining columns provide a deterministic schema-order tie-break. Nulls sort
+last. Arrow and the chosen external-sort engine must publish the same semantic
+checksum for the same rows.
 
-### Checksums
+### Bounded execution
 
-Checksums should be semantic, not raw parquet file checksums.
+Every catalogue-scale read, transform, checksum, sort, merge, and write has an
+explicit memory bound. Small contributions may use an in-memory fast path.
+Large ordering uses either:
 
-Recommended checksum layers:
+- immutable sorted runs and bounded fan-in merging; or
+- an optimized analytical engine with controlled memory and spill.
 
-- Stage 00 group checksum: canonical row content for one
-  `(staging_node, input_shard_id, kind)` group.
-- Stage 01 group checksum: canonical sorted content for that group.
-- Stage 03 node checksum: final render payload bytes plus identity-order bytes
-  for one profile node.
-- Stage 03 artifact checksum: packaged output for one profile artifact.
-- Stage 03 sidecar checksum: one schema-bearing sidecar artifact for one
-  profile's identity order.
+DuckDB is allowed—and often preferable—for vectorized external sorting or
+aggregation when representative measurements show better throughput and I/O.
+It is an execution engine, not the mutable source of truth. SQLite remains
+reasonable for genuinely small control metadata, but catalogue-scale indexed
+UPSERT designs require evidence that they avoid random-write amplification.
 
-If a stage recomputes the same semantic checksum, dirty propagation stops there.
+### Shared materialization
 
-## Manifests
+STAR profiles share contribution streaming, run generation, merging,
+checkpointing, encoding orchestration, and packing mechanics. Profile-specific
+code owns only:
 
-Use two classes of manifests.
+- topology policy;
+- mapping from natural to final cells; and
+- binary-format differences that cannot be shared.
 
-### Tree Identity Manifest
+Classic level capping and terminal-subtree packing must not grow separate
+catalogue sort/merge implementations.
 
-The tree identity manifest is immutable for an existing tree. Any setting that
-can move a star to another staging node or final node belongs here.
+### Precise invalidation
 
-Proposed path:
+Use distinct semantic identities:
+
+- routing identity for staging membership;
+- ordering identity for natural cell and canonical order;
+- topology identity for cell counts and profile policy;
+- render identity for encoded render inputs;
+- star identity for `source` and `source_id`;
+- sidecar identity for a sidecar's fields and schema.
+
+Dirty propagation is the dependency closure of changed identities. It stops at
+an equal checksum. A single global checksum or dirty flag cannot express, for
+example, a sidecar-only update that leaves the render payload unchanged.
+
+## Product contracts
+
+### Routed contributions
+
+Inputs:
+
+- project and tree identity;
+- one or more upstream Parquet shards;
+- optional existing routed-contribution manifest.
+
+Outputs:
+
+- immutable `pack` and `lim` fragments containing raw and routing fields;
+- per-contribution row count and semantic checksum;
+- per-shard manifest of contributed group keys;
+- write-ahead publication journal and recovery checkpoints.
+
+Replacement protocol:
+
+1. Read the replacement shard and route rows to temporary fragments.
+2. Finalize every new contribution checksum.
+3. Compare the union of old and new group keys.
+4. Retain equal published contributions.
+5. Atomically publish changed and new contributions.
+6. Record removed contributions in downstream invalidation.
+7. Publish the shard manifest last.
+8. Garbage-collect unreachable old files after durable publication.
+
+### Sorted contributions and cell summaries
+
+Inputs:
+
+- changed routed contributions;
+- canonical ordering policy;
+- bounded sort configuration.
+
+Outputs:
+
+- immutable, content/policy-addressed sorted fragments;
+- sorted contribution checksum and row count;
+- sorted per-natural-cell count records;
+- sorted per-natural-cell content checksums; and
+- independent completion checkpoint.
+
+Preparation inspects Parquet metadata to choose a bounded Arrow path or external
+sort. DuckDB currently provides the optimized large-group path. An explicit run
+sorter should replace it only with benchmark evidence or a required recovery
+property that DuckDB cannot provide.
+
+Cell summaries are catalogue-scale data and therefore partitioned binary or
+Parquet products, not arrays embedded in a shared JSON manifest.
+
+### Profile topology
+
+Inputs:
+
+- merged cell-count summaries;
+- profile policy and identity;
+- previous topology partitions where available.
+
+Outputs:
+
+- natural-cell to final-cell mappings;
+- partition root summaries and topology checksums;
+- changed mapping ranges for materialization invalidation.
+
+Classic topology applies a configured level cap.
+
+Terminal-packed topology:
+
+1. merges sorted natural-cell count records;
+2. emits deepest-level counts ordered by node id;
+3. sequentially aggregates children into each parent level;
+4. selects shallowest eligible terminal roots; and
+5. publishes partitioned terminal mappings and ancestor summaries.
+
+One changed cell recomputes its containing topology partition and ancestor
+spine. If a terminal boundary moves, its covered subtree is invalidated. Other
+branches remain reusable.
+
+### Materialized buckets
+
+Inputs:
+
+- sorted contributions;
+- profile topology mapping;
+- affected dependency partitions;
+- render, identity, and ordering policies.
+
+Outputs:
+
+- render payload byte ranges;
+- identity-order byte ranges from the same row stream;
+- per-cell offsets, row counts, and content checksums;
+- immutable group runs and spatial partition checkpoints.
+
+Shared behavior:
+
+1. stream contribution rows;
+2. map each natural cell to its final profile cell;
+3. encode coordinates relative to that final cell;
+4. preserve prepared order where mapping does not disturb it;
+5. write bounded local runs where cells overlap or ordering changes;
+6. merge runs with bounded fan-in; and
+7. publish render and identity ranges together.
+
+The classic and terminal-packed profiles own separate materialized products
+because they may assign the same star to different cells.
+
+### Packing
+
+Inputs:
+
+- materialized render and identity ranges;
+- topology/index information;
+- output-format metadata.
+
+Outputs:
+
+- `stars.octree`;
+- `identifiers.order`;
+- profile manifest and UUID identities.
+
+Packing performs no source routing, Parquet sorting, topology aggregation, or
+row encoding. The current monolithic format may be rewritten sequentially from
+changed and reused materialized partitions. Partial publication is deferred to
+a separate sharded-container format decision.
+
+### Sidecars
+
+Each sidecar belongs to one packed profile and carries its parent dataset UUID.
+Its records follow the profile's exact materialized identity order. Sidecar
+schema and field identity are independent from the base render identity, so a
+sidecar-only change need not invalidate topology or render materialization.
+
+## Manifests and state
+
+Use three layers rather than one growing mutable document.
+
+### Tree identity
+
+The immutable tree identity contains any setting that can change routing or
+canonical natural-cell semantics:
+
+- source dataset and schema identity;
+- coordinate frame, origin, bounds, and Morton depth;
+- magnitude-to-level policy;
+- staging split policy; and
+- canonical contribution ordering version.
+
+Routing refuses to append or replace data when this identity differs.
+
+### Small control manifests
+
+Small JSON manifests contain:
+
+- product format and policy identities;
+- input and output checksum references;
+- paths to partitioned dependency products;
+- checkpoint status; and
+- publication generation.
+
+They are written atomically and published after referenced files.
+
+### Partitioned dependency products
+
+Sorted binary or Parquet records contain catalogue-scale state such as:
 
 ```text
-stage00/tree-manifest.json
+cell key
+input shard id
+contribution identity
+row count
+ordering checksum
+render checksum
+identity checksum
 ```
 
-Proposed fields:
-
-```json
-{
-  "format": "foundinspace.octree.stage-tree/v0",
-  "source_dataset": {
-    "name": "...",
-    "version": "...",
-    "input_kind": "healpix|flat-shard"
-  },
-  "coordinate_frame": "icrs",
-  "world_center": [0.0, 0.0, 0.0],
-  "world_half_size_pc": 32768.0,
-  "morton_bits": 21,
-  "mag_level": {
-    "v_mag": 6.5
-  },
-  "stage00": {
-    "bucket_size": 1000000,
-    "split_policy": "lower-mag-limited-at-row-cap",
-    "row_schema_version": 0
-  },
-  "ordering": {
-    "stage01_sort_key": "level,final_node_id,mag_abs,source,source_id"
-  }
-}
-```
-
-Stage 00 must refuse to append or replace in a tree if the requested project
-does not match this identity.
-
-### Mutable Stage State
-
-Mutable state tracks what has been written, what is dirty, and what can be
-reused.
-
-Proposed path:
-
-```text
-stage00/stage-state.json
-```
-
-The exact shape can evolve, but it should track:
-
-- input shards seen by Stage 00
-- Stage 00 groups and checksums
-- Stage 01 sorted groups and checksums
-- dirty Stage 00 groups
-- dirty Stage 01 groups
-- dirty Stage 03 final nodes
-- stage versions that produced each entry
-
-Sketch:
-
-```json
-{
-  "format": "foundinspace.octree.stage-state/v0",
-  "input_shards": {
-    "hp-449": {
-      "source_path": "...",
-      "source_size": 123,
-      "source_mtime_ns": 123,
-      "stage00_groups": [
-        "o=1/o=6|hp-449|pack"
-      ]
-    }
-  },
-  "stage00_groups": {
-    "o=1/o=6|hp-449|pack": {
-      "node_path": "o=1/o=6",
-      "input_shard_id": "hp-449",
-      "kind": "pack",
-      "files": [
-        "tree/o=1/o=6/shard-hp-449-pack-000001.parquet"
-      ],
-      "row_count": 100000,
-      "content_checksum": "sha256:...",
-      "dirty": false
-    }
-  },
-  "stage01_groups": {
-    "o=1/o=6|hp-449|pack": {
-      "files": [
-        "tree/o=1/o=6/shard-hp-449-sorted-000001.parquet"
-      ],
-      "row_count": 100000,
-      "sorted_checksum": "sha256:...",
-      "dirty": false
-    }
-  },
-  "dirty": {
-    "stage00_groups": [],
-    "stage01_groups": [],
-    "stage03_profiles": {
-      "classic": {
-        "nodes": []
-      },
-      "unbounded": {
-        "nodes": []
-      }
-    }
-  }
-}
-```
+These records can be compared and merged sequentially. They replace global
+dirty-node arrays and avoid a catalogue-scale mutable row database.
 
-The manifest should be updated with atomic temp-file writes.
+## Change propagation examples
 
-## Stage Contracts
+### One changed star in one HEALPix shard
 
-### Stage 00
+1. Reread and route the HEALPix shard.
+2. Compare every old/new contribution pair.
+3. Reuse all equal contributions; include removed old groups in the changed set.
+4. Prepare only changed contributions.
+5. Compare old/new per-cell identities.
+6. Recompute affected topology branches per profile.
+7. Rematerialize dependent output partitions only.
+8. Repack from changed and reused materialized ranges.
+9. Rebuild sidecars only where their own identity changed.
 
-Inputs:
+If the star remains in one group, other groups from the same HEALPix shard stop
+at contribution comparison. If the replacement is semantically identical, no
+preparation runs.
 
-- project config
-- one or more input shard parquet files
-- optional existing stage tree
+### Render-encoding change without placement change
 
-Outputs:
+Routing and ordering identities remain unchanged. Topology remains reusable.
+Affected profile buckets are re-encoded and packed. Sidecars rebuild only if
+they consume changed fields or identity order.
 
-- adaptive staging tree under `stage00/tree`
-- raw `pack` and `lim` parquet fragments containing source position,
-  photometry, identity, and routing fields
-- Stage 00 report
-- tree identity manifest
-- mutable stage state entries for affected groups
+### Sidecar-only field change
 
-Modes:
+Routing, ordering, topology, and base render products remain reusable. Only the
+affected sidecar partitions and final sidecar artifact change.
 
-- full rebuild: empty output tree or `--force`
-- shard replace: delete and rebuild one or more input shards
+### Topology-policy change
 
-### Stage 01
+Routed and sorted contributions remain reusable. The affected profile topology
+and dependent materialized buckets rebuild. Other profiles remain untouched.
 
-Inputs:
+## Work streams
 
-- Stage 00 tree
-- tree identity manifest
-- stage-state manifest
-- dirty Stage 00 groups, or all groups for first run
+### A. Contribution immutability and replacement
 
-Outputs:
+Status: substantially implemented.
 
-- sorted compacted staged groups
-- updated Stage 01 group checksums
-- bounded Stage 03 invalidation mode (`clean` or `all`)
+Remaining work:
 
-Stage 01 should not do a global catalogue sort. It should operate on local
-groups. DuckDB may still be used as a local sorting engine, but the query scope
-should be one group or one staging node, not the full tree.
+- finish partitioning routed manifests before shared JSON state becomes large;
+- expose reuse/change counts by semantic identity;
+- verify replacement deletion and crash recovery on real HEALPix shards.
 
-Stage 01 behavior:
+### B. Preparation and cell summaries
 
-1. Walk Stage 00 groups.
-2. For each dirty or unsorted group, inspect parquet metadata to choose the
-   ordinary in-memory path or the outlier external-sort path.
-3. Sort by the Stage 01 canonical key. The external path streams sorted Arrow
-   batches and can spill to the configured DuckDB temporary directory.
-4. Write replacement sorted files to temp paths.
-5. Compute sorted checksum.
-6. Atomically swap files.
-7. Write a per-group recovery checkpoint.
-8. If any checksum changed, set bounded downstream invalidation to `all`.
-9. Consolidate the shared stage state once all target groups are complete.
+Status: deterministic local sorting, bounded external sorting, immutable
+publication, and checkpoints are implemented.
 
-Stage 01 must preserve the raw fields needed to encode the final render record.
-It sorts rows but does not create node-relative coordinates.
+Remaining work:
 
-### Stage 03
+- emit reusable per-cell count and field-specific checksum runs;
+- consume those runs through sequential partition merges;
+- remove the conservative `all` propagation once dependency products exist.
 
-Inputs:
+### C. Profile topology
 
-- sorted Stage 01 groups
-- stage-state manifest
-- output profile config
-- sidecar artifact definitions
-- enrichment inputs for sidecars
+Status: classic level-cap policy exists in compatibility materialization.
 
-Outputs:
+Remaining work:
 
-- one output directory per profile
-- `stars.octree` per profile
-- `identifiers.order` per profile
-- sidecar octrees per profile, such as `sidecars/meta.octree`
-- profile manifest with node checksums, artifact checksums, dataset UUID,
-  sidecar UUIDs, and sidecar schema descriptors
+- make classic mapping an explicit topology product;
+- replace catalogue-scale terminal count storage with sequential level files;
+- partition terminal topology and ancestor summaries;
+- validate subtree invalidation when terminal boundaries move.
 
-Stage 03 is where packed staging nodes are expanded into final render nodes.
-Rows in a packed staging node may have deeper final `level` values. Stage 03
-must route those rows to final node payloads for each output profile.
+### D. Shared materialization
 
-Profile behavior:
+Status: bounded run-generation and fan-in merge helpers exist and classic
+materialization is moving onto them.
 
-- `classic` clamps output to level 14. Rows with deeper final levels are
-  materialized into the corresponding level-14 node and encoded relative to
-  that selected node using the Stage 03 canonical order for that profile.
-- `unbounded` materializes rows at their Stage 00 final levels through level
-  21 and encodes them relative to those selected nodes.
-- Both profiles can use the same sidecar definitions, but each profile writes
-  its own sidecar artifacts because profile identity order can differ.
+Remaining work:
 
-Dirty propagation:
+- complete the output-neutral materialization API;
+- drive both profiles from explicit topology mappings;
+- publish aligned render/identity partition manifests;
+- remove duplicated format-specific sorting and merging.
 
-- If a Stage 01 group checksum changes, map its rows to affected final nodes for
-  each profile.
-- Rebuild only those profile nodes when possible.
-- If rebuilt Stage 03 node checksums are unchanged, the profile artifact can be
-  left untouched.
+### E. Packing and sidecars
 
-Short-term packaging behavior:
+Status: complete sequential packing, UUID identities, `identifiers.order`, and
+schema-bearing sidecars exist.
 
-- Stage 03 may fully repack a profile artifact from Stage 03 node outputs.
-- Partial binary patching can be considered later, after the profile manifest
-  and node checksum model are stable.
+Remaining work:
 
-## Change Propagation
+- constrain packing inputs to materialized products only;
+- reuse unchanged materialized partitions during complete repacks;
+- add sidecar partition reuse by sidecar identity;
+- evaluate a sharded final container separately from this migration.
 
-Example: edit one star in one input shard.
+### F. Naming and compatibility cleanup
 
-1. Upstream pipeline rewrites the input shard.
-2. Stage 00 replace mode deletes old fragments for that shard.
-3. Stage 00 writes new fragments and computes group checksums.
-4. Unchanged Stage 00 group checksums stop.
-5. Changed Stage 00 groups mark matching Stage 01 groups dirty.
-6. Stage 01 sorts only dirty groups.
-7. Unchanged Stage 01 checksums stop.
-8. Changed Stage 01 groups mark affected Stage 03 final nodes dirty.
-9. Stage 03 rematerializes dirty final nodes for each output profile.
-10. Unchanged Stage 03 node checksums stop.
-11. Stage 03 repacks or patches profile artifacts only if required.
-12. Stage 03 rebuilds sidecar artifacts only for profiles/sidecars whose inputs
-    changed.
+Status: documentation uses purpose-based products; numeric CLI commands remain.
 
-Example: change render payload encoding but not placement.
+Remaining work:
 
-1. Stage 00 is unchanged.
-2. Stage 01 ordering is unchanged.
-3. Stage 03 rematerializes affected profile nodes from Stage 01 rows.
-4. Stage 03 repacks the profile render artifact.
-5. Stage 03 sidecars rebuild only if they consume changed values.
-
-Example: change magnitude limit or max level.
-
-1. Tree identity changes.
-2. Existing Stage 00 tree is invalid.
-3. Full Stage 00 rebuild is required.
-
-## Work Streams
-
-### A. Stage 00 Durability
-
-Goal: make Stage 00 output reusable, replaceable, and comparable.
-
-Status: implemented.
-
-Remaining cleanup:
-
-- move future profile-selective dirtiness into disk-backed profile manifests;
-  do not restore occupied-node arrays to the shared JSON state
-
-### B. Stage 01 Rewrite
-
-Goal: replace global Stage 01 assembly with local sort and compaction.
-
-Status: implemented.
-
-Remaining cleanup:
-
-- replace the conservative `all` invalidation with disk-backed per-profile
-  invalidation once Stage 03 profile configs exist
-
-### C. Stage 03 Profiles And Final Assembly
-
-Goal: build final render, identity-order, and sidecar artifacts from sorted
-Stage 01 groups for each configured output profile.
-
-Tasks:
-
-- define output profile config, including `classic` level-14 cap and
-  `unbounded` level-21 output
-- define Stage 03 profile manifest schema
-- map Stage 01 final nodes to profile nodes, including classic level clamping
-- merge sorted `(node, shard, kind)` groups into profile node payload and
-  identity order
-- build profile `stars.octree` and `identifiers.order`
-- build each configured sidecar artifact into the profile directory
-- embed each sidecar's schema/descriptor in the sidecar artifact
-- compute per-node, artifact, identity-order, and sidecar checksums
-- preserve dataset UUID and descriptor metadata per profile
-- verify classic profile reader compatibility against today's output semantics
-
-### D. Deletion And Project Model Cleanup
-
-Goal: remove obsolete old-pipeline concepts and make the new process hard to
-misuse.
-
-Delete or replace:
-
-- `stage-02` CLI command
-- `[stage02]` project config and `stage02.max_open_files`
-- old Stage 01 intermediate-shard builder path, including `assembly/build.py`
-  and `assembly/row_source.py`
-- old Stage 03 sidecar builder that assumes global `stage02_output_path` and
-  global `identifiers.order`
-- old tests that only cover the removed Stage 02 command
-- old assembly/combine helpers that are not reused by the new Stage 03 packer
-
-Tasks:
-
-- add project output-profile config
-- make `stage-03` build one or all configured profiles
-- make command output report reused vs rebuilt work per profile and sidecar
-- expose plan/dry-run commands
-- keep project config strict about build-defining identity
-
-## Suggested Implementation Order
-
-1. Define project output-profile config and default `classic` / `unbounded`
-   profiles.
-2. Define Stage 03 profile manifest and state schema.
-3. Implement profile node mapping from Stage 01 groups, including classic
-   level-14 clamping and unbounded level-21 output.
-4. Implement profile `stars.octree` and `identifiers.order` assembly with full
-   repack.
-5. Implement dedicated sidecar build per profile.
-6. Remove the obsolete Stage 02 CLI/config/tests and old global sidecar path.
-7. Add dirty-only Stage 03 rebuild and per-profile reuse reporting.
-8. Optional: add partial artifact patching after full-repack Stage 03 is stable.
-
-This order keeps each step testable and avoids designing partial binary patching
-before profile manifests and node checksums are proven.
-
-## Validation Plan
+- add purpose-based commands when product contracts are stable;
+- retain numeric aliases for a documented compatibility period;
+- rename paths, config sections, and reports without mixing that migration into
+  topology or materialization correctness work.
+
+## Suggested implementation order
+
+1. Freeze sorted cell-summary and dependency-record formats.
+2. Emit per-cell count and field-specific checksum runs during preparation.
+3. Make classic topology an explicit mapping and prove byte-equivalent v1
+   output through shared materialization.
+4. Implement sequential bottom-up terminal count aggregation.
+5. Implement partitioned terminal selection and changed-subtree invalidation.
+6. Move terminal-packed output onto shared materialization.
+7. Replace `clean`/`all` with partitioned dependency invalidation.
+8. Add one-star and one-HEALPix replacement integration tests.
+9. Restrict packing to materialized inputs and add reuse reporting.
+10. Introduce purpose-based CLI/config names and compatibility aliases.
+
+The v1 byte-equivalence milestone comes before reintroducing v2. It validates
+the shared streaming foundation against the trusted output.
+
+## Validation plan
 
 Unit tests:
 
-- same shard input produces same Stage 00 semantic checksums
-- changed input shard dirties only changed groups
-- unchanged Stage 01 sorted checksum stops propagation
-- Stage 03 maps packed staging rows to profile nodes correctly
-- classic profile clamps rows deeper than level 14 into level-14 nodes
-- unbounded profile preserves final levels through level 21
-- sidecar parent UUID validation continues to work per profile
+- equal shard input retains equal routed contribution identities;
+- a changed shard dirties only changed/new/removed groups;
+- Arrow and external sorting publish identical order and checksum;
+- equal sorted identities stop dependency propagation;
+- cell-count merges remain bounded and deterministic;
+- classic topology maps deep natural cells to the configured cap;
+- terminal topology selects the shallowest eligible root;
+- render and identity ranges remain exactly aligned.
 
 Integration tests:
 
-- build one real input shard through Stage 00
-- replace it with identical input and confirm no dirty propagation
-- replace it with one changed row and confirm limited dirty propagation
-- full classic build from scratch equals classic build after incremental
-  replacement
-- full unbounded build from scratch equals unbounded build after incremental
-  replacement
+- replace a shard with identical content and perform no downstream work;
+- change one star without moving groups and rebuild only its contribution path;
+- move one star between groups and invalidate the union of old/new paths;
+- delete one star and invalidate its old contribution and cell;
+- compare full and incremental classic artifacts byte-for-byte;
+- compare full and incremental terminal-packed artifacts semantically;
+- resume after interruption at each publication boundary.
 
-Operational checks:
+Operational measurements:
 
-- report rows in equals rows current at Stage 00
-- report reused vs rebuilt groups and profile nodes at every stage
-- report dirty sets before and after each stage
-- fail fast on tree identity mismatch
+- input and output rows/bytes per second;
+- peak resident memory;
+- temporary bytes read and written;
+- open-file high-water mark;
+- random-write amplification;
+- reuse versus rebuild counts per product; and
+- restart time from the last durable checkpoint.
 
-## Open Decisions
+## Open decisions
 
-- Stage 03 profile manifest shape.
-- Stage 03 intermediate node-output grouping before packaging.
-- Exact sidecar schema descriptor shape and where it lives in the sidecar
-  artifact header/manifest.
-- Whether partial binary patching is worth the complexity after full-repack
-  Stage 03 is stable.
-- Whether the compatibility `--healpix` alias should remain long term once
-  `--shard` is the documented option.
+- Cell-summary partition depth and binary schema.
+- Field-specific identity granularity versus manifest complexity.
+- Topology partition depth and terminal ancestor-summary layout.
+- Materialized partition size and file layout.
+- Whether a sharded final container is worth the runtime and publication
+  complexity.
+- Compatibility lifetime for numeric commands after purpose-based commands
+  exist.
 
 ## Glossary
 
-Input shard:
-: One upstream parquet unit that can be replaced independently. Usually a
-  HEALPix pixel, but older pipeline outputs may be batch-sharded. Stage 00 keys
-  checksums and replacement by this shard id, not by row-level HEALPix columns.
+Input shard
+: One upstream Parquet unit replaceable independently, often a HEALPix pixel.
 
-Staging node:
-: A node in the adaptive Stage 00 filesystem tree. It may hold rows for final
-  nodes below its own depth.
+Routed contribution
+: One shard's immutable rows for one staging bucket and fragment kind.
 
-Final node:
-: The renderer-visible octree node determined by a row's final `level` and
-  `morton_code`.
+Sorted contribution
+: A routed contribution in deterministic canonical order, with semantic
+  checksum and cell summaries.
 
-Output profile:
-: A named Stage 03 build target with its own max output level, node set,
-  `stars.octree`, `identifiers.order`, sidecars, manifest, and dataset UUID.
+Natural cell
+: The cell selected from a row's natural `level` and `morton_code` before an
+  output-profile topology policy is applied.
 
-Packed group:
-: A Stage 00 group whose rows are held at a staging node shallower than some
-  rows' final nodes.
+Final profile cell
+: The renderer-visible cell selected by classic capping or terminal packing.
 
-Lower-mag-limited group:
-: A Stage 00 group resident at a staging node that has crossed the row cap and
-  routes deeper rows to child staging nodes.
+Materialized bucket
+: Canonical encoded render and identity ranges for final profile cells in one
+  spatial partition.
 
-Semantic checksum:
-: A checksum over canonical row content or canonical output bytes, independent
-  of physical parquet metadata and incidental file boundaries.
+Semantic checksum
+: A checksum over canonical logical rows or output bytes, independent of
+  Parquet metadata and incidental fragment boundaries.

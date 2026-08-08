@@ -17,69 +17,66 @@ The octree divides 3D space into nested cells across the 21-bit Morton address s
 
 At runtime, the viewer computes a visibility radius for each level. Bright-star cells have large visibility radii and are loaded from anywhere in the scene; faint-star cells have small radii and load only when the observer is nearby. This gives progressive, distance-dependent detail that mirrors how real starlight works.
 
-## Build stages
+## Build products
 
-The stage model is evolving toward a reusable staging tree followed by
-materialization and packaging:
+The target architecture is a sequence of purpose-named, reusable products:
 
-| Stage | Input | Output | Purpose |
-|-------|-------|--------|---------|
-| **Stage 00** | Input-sharded merged parquet | `(node, input_shard_id, kind)` staging groups | Partitions input rows into the octree staging tree |
-| **Stage 01** | Stage 00 staging folders | Canonical staged parts | Sorts and compacts staged data in place |
-| **Stage 02** | Sorted Stage 01 groups | `stars.octree` + `identifiers.order` | Materializes and packs the traditional/classic output |
-| **Stage 03** | Stage 02 outputs | Named sidecar files (e.g. `meta`) | Builds optional sidecar families |
+| Product/action | Input | Output |
+|---|---|---|
+| **Route** | Input-sharded merged parquet | Immutable `(staging bucket, input shard, kind)` contributions |
+| **Prepare** | Changed routed contributions | Canonical sorted contributions and per-cell summaries |
+| **Plan topology** | Cell summaries plus a profile policy | Natural-cell to profile-cell mapping |
+| **Materialize** | Sorted contributions plus topology | Canonical render and identity ranges per profile bucket |
+| **Pack** | Materialized ranges and manifests | `stars.octree` and `identifiers.order` |
+| **Build sidecars** | Profile identity order plus enrichment | Named sidecar artifacts such as `meta.octree` |
 
-Stage 00 keys replaceability by upstream input shard id. That id comes from the
-input directory name or root-level parquet filename stem, so HEALPix files,
-batch shards, or another stable upstream layout all work; the upstream pipeline
-chooses the rebuild granularity by choosing its shard layout.
+The numeric `stage-00` through `stage-03` commands are current compatibility
+entry points, not the durable architectural vocabulary. New product contracts
+and manifests should use purpose-based names. See
+[`docs/streaming-pipeline.md`](docs/streaming-pipeline.md) for the normative
+target and [`docs/stages.md`](docs/stages.md) for the compatibility mapping.
 
-Stage 00 group checksums are computed from fixed logical Arrow batches, streamed
-across parquet fragment boundaries. Their memory use therefore does not grow
-with an outlier group, and parquet metadata or different fragment boundaries do
-not change the semantic checksum.
+Routing preserves replaceability by upstream input shard id. That id comes from the
+input directory name or root-level parquet filename stem, so a HEALPix file,
+batch shard, or another stable upstream unit can be replaced independently.
+Each shard contributes separately to each staging group. Replacing a shard
+publishes a new contribution only where its semantic checksum changed; equal
+old contributions remain immutable and reusable. The changed set includes old
+groups from which the replacement removed every row.
 
-Initial Stage 00 builds commit after every upstream input shard. A small
-write-ahead journal tracks newly created and superseded fragments, so restart
-either rolls back an uncommitted shard or finishes cleanup for a committed one.
-The final checksum pass uses per-group checkpoint records and resumes without
-rehashing completed groups.
+Contribution checksums are computed from fixed logical Arrow batches streamed
+across parquet fragment boundaries. Initial routing commits after every input
+shard through a write-ahead fragment journal, and independent checksum
+checkpoints make the final validation pass resumable.
 
-Stage 01 keeps the existing in-memory Arrow sort for ordinary groups. Groups
-above the normal row or uncompressed-byte limits automatically use DuckDB's
-disk-backed external sort instead. The fallback respects the `DUCKDB_MEMORY_LIMIT`,
-`DUCKDB_TEMP_DIR`, and `DUCKDB_MAX_TEMP_DIRECTORY_SIZE` settings; without an
-explicit memory limit it uses a bounded 512 MB default. The Stage 01 report and
-CLI summary show how many groups used each path. Each completed group gets a
-small independent checkpoint; the main state is consolidated once at
-completion, avoiding repeated rewrites of a growing global manifest.
+Preparation keeps an explicitly bounded in-memory Arrow fast path for ordinary
+groups. Oversized groups use DuckDB's disk-backed external sort, with a bounded
+512 MB default when `DUCKDB_MEMORY_LIMIT` is unset. DuckDB is an execution
+engine here, not a mutable catalogue store: an explicit run sorter remains an
+option if representative measurements show better throughput or recovery.
+Published sorted fragments are content/policy-addressed, written atomically,
+and checkpointed independently.
 
-Stage 01 state stores only each group's scalar `natural_max_level`. It does not
-enumerate occupied final nodes. Downstream invalidation is currently a bounded
-`clean`/`all` flag; selective profile invalidation can later be represented in a
-profile-specific disk-backed manifest without making the shared JSON state grow
-with the star count.
+Invalidation is checksum- and dependency-directed. A one-star change in one
+HEALPix shard may require rereading that shard to discover moved rows, but an
+unchanged contribution must not be sorted or materialized again. Separate
+routing, ordering, render, identity, and sidecar identities stop propagation as
+soon as the relevant semantic content is unchanged. The current shared state
+still has a conservative downstream `clean`/`all` fallback; that is a migration
+constraint, not the target model.
 
-Stage 00 calculates only the routing fields (`morton_code` and natural
-`level`) from raw Cartesian input. Stage 01 preserves the raw position,
-magnitude, and temperature fields. The classic Stage 02 output clamps rows
-below `stage02.classic_max_level` (default 14) into their ancestor node. STAR
-v2 builds then collapse complete subtrees of at most
-`stage02.terminal_waterline` stars (default 1,000) before creating the
-node-relative 16-byte render record. Version 2 is the default;
-`stage02.star_format_version = 1` retains the unpacked v1 output.
+Routing calculates only placement fields such as `morton_code` and natural
+`level`, while retaining raw position, magnitude, temperature, and identity
+fields. Topology planning then selects the actual profile cell. Both classic
+level capping and terminal-subtree packing feed the same materialization
+machinery, which encodes node-relative coordinates once, writes aligned render
+and identity streams, and uses bounded sorting and merging. DuckDB is suitable
+for oversized local sorts when it is the measured best engine.
 
-Classic materialization consumes Stage 01 as checksum-tracked sorted groups. It
-does not globally re-sort the catalogue: groups that do not need level folding
-remain in their Stage 01 order, folded groups are reordered locally, and final
-cells are combined with a bounded fan-in merge. Disjoint cells stay on the
-Arrow chunk path; overlapping cells use a native Arrow sort and spill through
-DuckDB when they exceed the configured batch or memory bound. Deep output
-levels are split into spatial partitions using `stage02.partition_from_level` and
-`stage02.partition_prefix_bits`. Completed group runs and output partitions are
-checkpointed in `.classic-intermediates.work`, so an interrupted build resumes
-without repeating completed work. Final payload relocation reuses a bounded LRU
-set of open shard and relocation files instead of reopening files per cell.
+Packing consumes only materialized byte ranges and manifests. The current
+monolithic artifact may still need a complete sequential rewrite after a local
+change, but that rewrite reuses unchanged materialized partitions and does not
+repeat routing, sorting, topology planning, or encoding.
 
 Each render octree carries a `dataset_uuid`. Sidecars carry a `parent_dataset_uuid` so readers can validate the pairing before opening them.
 
@@ -101,7 +98,7 @@ uv run fis-octree --help
 
 ### Project configuration
 
-All build stages require an explicit TOML project file:
+Current compatibility build commands require an explicit TOML project file:
 
 ```bash
 uv run fis-octree project init project.toml
@@ -111,9 +108,8 @@ uv run fis-octree stage-02 --project project.toml
 uv run fis-octree stage-03 --project project.toml
 ```
 
-The implementation is currently being migrated toward the stage model described
-in [`docs/stages.md`](docs/stages.md), so the available commands may temporarily
-lag the planned stage numbering.
+These numeric names will remain usable during migration; they should not be
+copied into new product or manifest names.
 
 Generate a starter config:
 
@@ -163,13 +159,14 @@ DuckDB memory and threading behaviour can be tuned at runtime via environment va
 
 ```
 src/foundinspace/octree/
-  _cli.py             # Click root; stage-00, stage-01, stage-02, stage-03, stats, project subcommands
+  _cli.py             # Click root and current compatibility commands
   project.py          # TOML project file loading and validation
   config.py           # Build defaults (world size, Morton bits, max level)
-  classic.py          # Stage 02 — classic node materialization and final build
+  classic.py          # Compatibility orchestration for classic materialization and packing
+  materialization/    # Shared bounded run generation and merge machinery
   mag_levels.py       # Magnitude/level threshold calculations
   duckdb_util.py      # Shared DuckDB connection helper with env-variable tuning
-  sources/            # Stage 00 — packed octree staging
+  sources/            # Routed and sorted contribution preparation
   assembly/           # Shard assembly, manifests, build plan
   combine/            # Final octree combine (DFS traversal, lookup, records)
   identifiers_order.py # identifiers.order artifact assembly
@@ -180,8 +177,10 @@ src/foundinspace/octree/
 
 ## Documentation
 
-Current stage overview and supporting notes:
+Pipeline architecture and supporting notes:
 
+- [`docs/streaming-pipeline.md`](docs/streaming-pipeline.md) — target
+  bounded-memory, immutable-contribution architecture
 - [`docs/staged-pipeline-plan.md`](docs/staged-pipeline-plan.md)
 - [`docs/stages.md`](docs/stages.md)
 - [`docs/sidecars.md`](docs/sidecars.md)

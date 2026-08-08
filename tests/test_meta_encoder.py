@@ -51,6 +51,24 @@ def _write_ident_map(path, rows: list[dict]) -> None:
 
 
 class TestIdentifiersMap:
+    def test_small_map_uses_bounded_memory_backend(self, tmp_path):
+        p = tmp_path / "id.parquet"
+        _write_ident_map(
+            p,
+            [
+                {
+                    "source": "hip",
+                    "source_id": "1",
+                    "proper_name": "Alpha",
+                }
+            ],
+        )
+
+        with IdentifiersMap(p, memory_limit_bytes=4096) as ident_map:
+            assert ident_map.backend == "memory"
+            assert 0 < ident_map.estimated_memory_bytes <= 4096
+            assert ident_map.lookup("hip", "1") == {"proper_name": "Alpha"}
+
     def test_lookup_hit(self, tmp_path):
         p = tmp_path / "id.parquet"
         _write_ident_map(
@@ -146,6 +164,48 @@ class TestIdentifiersMap:
 
         with pytest.raises(RuntimeError, match="closed"):
             ident_map.lookup("gaia", "1")
+
+    def test_memory_and_sqlite_backends_are_byte_equivalent(self, tmp_path):
+        p = tmp_path / "id.parquet"
+        _write_ident_map(
+            p,
+            [
+                {
+                    "source": "hip",
+                    "source_id": "1",
+                    "proper_name": "First",
+                    "hip_id": 1,
+                },
+                {
+                    "source": "hip",
+                    "source_id": "1",
+                    "proper_name": "Last",
+                    "hip_id": 1,
+                },
+                {
+                    "source": "manual",
+                    "source_id": "sun",
+                    "proper_name": " Sol ",
+                    "hip_id": None,
+                },
+            ],
+        )
+        identities = [("manual", "sun"), ("missing", "2"), ("hip", "1")]
+
+        with (
+            IdentifiersMap(p, memory_limit_bytes=1024 * 1024) as memory_map,
+            IdentifiersMap(p, memory_limit_bytes=0) as sqlite_map,
+        ):
+            assert memory_map.backend == "memory"
+            assert sqlite_map.backend == "sqlite"
+            assert len(memory_map) == len(sqlite_map) == 2
+            assert list(memory_map.iter_json_entries(identities)) == list(
+                sqlite_map.iter_json_entries(identities)
+            )
+            assert build_meta_payload(identities, memory_map) == build_meta_payload(
+                identities,
+                sqlite_map,
+            )
 
 
 class TestBuildMetaPayload:

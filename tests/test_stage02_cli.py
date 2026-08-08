@@ -63,6 +63,8 @@ def test_stage02_help() -> None:
     assert "--max-level" in result.output
     assert "--star-format-version" in result.output
     assert "--terminal-waterline" in result.output
+    assert "--intermediates-dir" in result.output
+    assert "--work-dir" in result.output
 
 
 def test_stage02_requires_project() -> None:
@@ -119,6 +121,10 @@ def test_stage02_builds_classic_output_from_project(
             "1",
             "--terminal-waterline",
             "250",
+            "--intermediates-dir",
+            str(tmp_path / "v2-intermediates"),
+            "--work-dir",
+            str(tmp_path / "v2-work"),
         ],
     )
 
@@ -131,6 +137,8 @@ def test_stage02_builds_classic_output_from_project(
     assert calls[0].max_level == 13
     assert calls[0].star_format_version == 1
     assert calls[0].terminal_waterline == 250
+    assert calls[0].intermediates_dir == tmp_path / "v2-intermediates"
+    assert calls[0].work_dir == tmp_path / "v2-work"
     assert "rows=12" in result.output
     assert "folded_rows=3" in result.output
     assert "star_format_version=1" in result.output

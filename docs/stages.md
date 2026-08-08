@@ -1,267 +1,239 @@
-# Pipeline Stages
+# Pipeline Products and Compatibility Stages
 
-This document captures the working stage model. It is intentionally
-purpose-level: the exact file names, manifests, and packing formats are still
-expected to move while the architecture settles.
+The durable octree flow is defined by the products it publishes, not by a
+numbered sequence. Numeric stage names describe the current CLI and directory
+layout only. They remain compatibility labels while the implementation moves to
+the purpose-based contracts in
+[`streaming-pipeline.md`](streaming-pipeline.md).
 
-The durable idea is that the expensive spatial indexing work should produce a
-reusable staging tree. Later stages should sort, encode, materialize, and pack
-that staged data without repeatedly duplicating the whole catalogue.
+The central requirement is selective reuse: changing one star in one upstream
+shard must not rewrite a routed contribution, sorted group, topology partition,
+or materialized bucket whose relevant semantic checksum is unchanged.
 
-The current compatibility CLI collapses materialization and packing for the
-traditional level-capped output into `stage-02`. The finer-grained stages below
-remain the target decomposition for additional output variants.
+## Product flow
 
-The implementation plan, manifest sketches, and work streams are tracked in
-[`staged-pipeline-plan.md`](staged-pipeline-plan.md).
-
-## Overview
-
-| Stage | Purpose | Typical Input | Typical Output |
-|---|---|---|---|
-| Stage 00 | Partition input shards into octree staging buckets. | Merged parquet shards from the catalogue pipeline. | `(node, input_shard_id, kind)` staging groups. |
-| Stage 01 | Sort and compact staged `(node, input_shard_id, kind)` groups in place. | Stage 00 staging folders. | Canonical, replaceable staged parts. |
-| Stage 02 | Optionally rewrite payload bytes without re-indexing. | Stage 01 staged parts. | Updated staged payload columns or payload fragments. |
-| Stage 03 | Materialize canonical per-node payload order. | Sorted staged parts. | Payload-order byte arrays plus star identity indexes. |
-| Stage 04 | Pack canonical node outputs into final octree artifacts. | Stage 03 byte arrays and indexes. | `stars.octree` and companion identity/order artifacts. |
-| Stage 05 | Build optional derived sidecar families. | Stage 04 base dataset plus enrichment inputs. | Named sidecar octrees such as `meta.octree`. |
-
-## Tree Manifests
-
-Every stage that writes into an existing tree should check the top-level tree
-manifest before touching data. The manifest is the guardrail against accidentally
-mixing rows indexed under different semantics.
-
-The top-level manifest should contain build-defining identity such as:
-
-- coordinate frame and coordinate convention
-- world origin, world bounds, and Morton bit depth
-- magnitude-to-level configuration
-- staging bucket size and split policy
-- input catalogue identity
-- row schema and payload schema versions where relevant
-
-If any setting can move a star to a different staging or final node, Stage 00
-must refuse to append to the existing tree. Later stages can usually tolerate
-changes that only affect payload encoding or final package layout.
-
-Progress and dirtiness should live separately from the build identity. A mutable
-stage-state manifest can record:
-
-- completed stages
-- dirty input shards
-- dirty staging nodes
-- fragment counts, row counts, and checksums
-- stage-specific output versions
-
-Filename markers are useful for quick scans, but the manifest should be the
-source of truth. A command should never trust a filename suffix without checking
-that the tree manifest matches the requested build.
-
-## Stage 00: Partition
-
-Stage 00 reads merged parquet shards and routes each row into the staging tree.
-The durable output shape is `(node, input_shard_id, kind)`: each staging node
-keeps rows grouped by the upstream shard that produced them.
-
-The `input_shard_id` is derived from the input directory name or root-level
-parquet filename stem. HEALPix files are one useful shard layout, but batch
-files are valid too. Stage 00 does not reinterpret row-level HEALPix columns as
-the rebuild boundary; the upstream catalogue pipeline owns the sharding
-strategy and should choose stable shards that match its desired rebuild
-workflow.
-
-The important semantic point is that Stage 00 should not change which final
-octree node a star belongs to. It may pack rows into a shallower staging node,
-but that is only an intermediate layout choice.
-
-Current direction:
-
-- Require placement fields needed for routing, currently `morton_code` and
-  natural `level`; the explicit raw Cartesian filter may calculate them.
-- Preserve every input row and pass non-routing columns through unchanged.
-- Preserve raw `x_icrs_pc`, `y_icrs_pc`, `z_icrs_pc`, `mag_abs`, and optional
-  `teff` through staging so final output profiles can choose their actual node.
-- Allow routing enrichment only through an explicitly configured pre-filter
-  that must preserve row count and must not create node-relative render
-  coordinates.
-- Keep sparse regions shallow in the staging filesystem.
-- Let dense staging nodes become lower-magnitude limited only after they reach
-  the configured row cap.
-- Preserve enough input shard identity that one shard can be deleted and
-  rebuilt without rewriting unrelated shards.
-- Commit initial builds after each input shard through a write-ahead fragment
-  journal. A restart rolls back only the uncommitted shard.
-- Checkpoint semantic checksums per group so the final validation pass can
-  resume without re-reading groups already verified.
-
-## Stage 01: Sort And Pack
-
-Stage 01 canonicalizes the `(node, input_shard_id, kind)` groups in place. It
-sorts any unsorted fragments, compacts small fragments where useful, and marks
-the result as ready for downstream materialization.
-
-This stage should be rerunnable over the staging tree. If Stage 00 adds fresh
-unsorted parts for one input shard, Stage 01 should only need to revisit the
-affected folders.
-
-Current direction:
-
-- Preserve the `(node, input_shard_id, kind)` replaceability boundary.
-- Preserve raw position and photometry columns; do not encode a 16-byte render
-  record while final node placement is still profile-dependent.
-- Keep the in-memory Arrow sort for ordinary groups, but route groups above the
-  normal row or uncompressed-byte limits through a disk-backed DuckDB external
-  sort with bounded memory.
-- Use atomic temp files and renames for rewritten fragments.
-- Write one small recovery checkpoint per completed group, then consolidate the
-  main stage-state manifest once at completion.
-- Store only bounded group summaries such as `natural_max_level`; do not store
-  occupied final-node arrays in shared JSON state.
-- Use a bounded `clean`/`all` downstream invalidation flag until Stage 03 owns a
-  disk-backed profile-specific invalidation index.
-- Use filename markers as an optimization, for example `unsorted`, `sorted`, or
-  `packed`, while still validating against manifests.
-
-## Stage 02: Re-Encode Payloads
-
-Stage 02 is optional. It exists for the case where the spatial index is still
-valid, but the render payload format changes.
-
-For example, if the payload byte layout changes but Morton codes, final render
-levels, and node membership do not, Stage 02 can rewrite payload bytes from the
-existing staged rows without repeating Stage 00.
-
-Current direction:
-
-- Refuse to run if the requested change affects node membership or ordering
-  keys.
-- Keep the same selective rebuild boundary as Stage 01.
-- Allow old staged row data to be converted into new payload bytes before final
-  materialization.
-
-## Stage 03: Materialize Node Payload Order
-
-Stage 03 is where packed staging becomes canonical node payload data.
-
-This is the natural point to split non-lower-mag-limited staging nodes into the
-final magnitude-limited payload structure. Stage 00 and Stage 01 may keep a
-sparse field packed high in the staging tree, but Stage 03 must materialize the
-final node payloads in the order expected by the renderer and sidecar builders.
-
-Current direction:
-
-- Read all `(node, input_shard_id, kind)` staged parts that contribute to a
-  node.
-- Interleave shard fragments into canonical payload order.
-- Preserve each Stage 01 group's existing canonical order when profile mapping
-  does not change it; do not introduce a full-catalogue sort.
-- Reorder only bounded group runs affected by output-profile level folding,
-  then combine final cells with a bounded fan-in merge.
-- Keep disjoint cells on the Arrow chunk path. Sort overlapping cells with
-  native Arrow operations, spilling oversized cells through DuckDB rather than
-  merging their rows in Python.
-- Fan out rows from packed staging nodes into their final payload nodes when the
-  final render level is deeper than the staging node.
-- Encode node-relative coordinates once, after the output profile has selected
-  each row's actual final node.
-- Write raw payload bytes directly to disk in payload order.
-- Write an identity index or order file beside those payload bytes.
-- Record per-node offsets, row counts, checksums, and dirty state in a manifest.
-- Checkpoint normalized group runs and completed spatial output partitions so
-  interrupted materialization can resume.
-- Keep bounded caches of payload and relocation file handles during final DFS
-  packing; do not perform an open/close cycle for every output cell.
-
-The useful handoff to Stage 04 is a file layout like:
-
-- one large raw payload byte array per materialized node group
-- one identity/order side file for the same star order
-- one manifest describing byte ranges for each final node payload
-
-That lets Stage 04 avoid opening parquet or re-sorting rows. It can memory-map
-the raw byte arrays, read the byte range for a final node, compress that slice,
-and write the final artifact payload.
-
-## Stage 04: Pack Final Artifacts
-
-Stage 04 turns Stage 03 node outputs into the final octree package.
-
-The key job is packaging, not re-indexing. Stage 04 should consume canonical
-payload byte ranges and identity/order ranges, compress the slices needed by the
-final format, and build the final octree indexes.
-
-Current direction:
-
-- Memory-map Stage 03 byte arrays where practical.
-- Compress final node payload slices as they are written.
-- Build the final render octree shape and lookup/index structures.
-- Produce the companion identity/order artifact from the Stage 03 star identity
-  order.
-- Avoid reading Stage 00/01 parquet unless a node needs to be rematerialized.
-
-Partial Stage 04 rebuilds may be possible if the final package format supports
-localized replacement. If not, Stage 04 can still rebuild from compact Stage 03
-outputs without repeating spatial indexing.
-
-## Stage 05: Sidecars
-
-Stage 05 builds optional sidecar families for an existing Stage 04 dataset.
-Sidecars add extra data without changing the base render octree.
-
-The first implemented family is `meta`, but the boundary is deliberately family
-oriented: additional sidecars should be able to reuse the same Stage 04 package
-and identity order.
-
-Current direction:
-
-- Build sidecars by configured family name.
-- Stamp sidecars with the parent render dataset UUID.
-- Use the Stage 04 identity/order artifact to keep sidecar star order aligned
-  with render payload order.
-- Allow sidecar families to be rebuilt independently from the base dataset.
-
-## Selective Rebuild Flow
-
-The staging tree should make local rebuilds cheap:
-
-1. Mark the affected input shard or staging node dirty.
-2. Delete that input shard's staged fragments from affected
-   `(node, input_shard_id, kind)` groups.
-3. Re-run Stage 00 for the changed input shard.
-4. Re-run Stage 01 over dirty or unsorted staged folders.
-5. Re-run Stage 02 only if the payload encoding changed.
-6. Re-run Stage 03 for affected materialized nodes.
-7. Re-run Stage 04 as a partial pack if supported, or rebuild the final package
-   from Stage 03 outputs.
-8. Rebuild Stage 05 sidecars that depend on changed identity/order or enrichment
-   data.
-
-## Stable Ideas
-
-- Stages communicate through files, not shared in-memory state.
-- Expensive catalogue merge and reconciliation work belongs upstream of this
-  repository.
-- Stage 00/01 remain input-shard-replaceable.
-- Stage 03 is the boundary where node payload order becomes canonical.
-- Large stages should be bounded-memory by design.
-- Render, identity/order, and sidecar artifacts should carry enough metadata for
-  readers to reject mismatched files.
-
-## CLI Shape
-
-The final command names are expected to follow the stage numbers, but not every
-stage in this document is implemented yet:
-
-```bash
-uv run fis-octree stage-00 --project project.toml
-uv run fis-octree stage-01 --project project.toml
-uv run fis-octree stage-02 --project project.toml
-uv run fis-octree stage-03 --project project.toml
-uv run fis-octree stage-04 --project project.toml
-uv run fis-octree stage-05 --project project.toml
+```text
+upstream shards
+    -> routed contributions
+    -> sorted contributions + cell summaries
+    -> profile topology
+    -> materialized buckets
+    -> packed base artifacts
+    -> optional sidecars
 ```
 
-Build-defining paths and knobs live in the project TOML. Details that are still
-being tuned should be treated as operational configuration rather than published
-format guarantees.
+| Product | Rebuild boundary | Durable output |
+|---|---|---|
+| Routed contributions | Input shard and staging group | Immutable raw row fragments |
+| Sorted contributions | One changed routed contribution | Canonical rows plus cell summaries |
+| Profile topology | Changed spatial partition and ancestor spine | Natural-cell to profile-cell mapping |
+| Materialized buckets | Profile and affected spatial partition | Aligned render and identity byte ranges |
+| Packed artifacts | Output profile | `stars.octree` and `identifiers.order` |
+| Sidecars | Profile, family, and affected identity range | Schema-bearing sidecar artifacts |
+
+## Compatibility mapping
+
+The current commands collapse some target products together:
+
+| Compatibility command | Current responsibility | Target action/product |
+|---|---|---|
+| `stage-00` | Route input shards into the adaptive staging tree | `route` / routed contributions |
+| `stage-01` | Sort and compact changed staging groups | `prepare` / sorted contributions |
+| `stage-02` | Plan classic or terminal topology, materialize, and pack | `materialize` plus `pack` |
+| `stage-03` | Build optional sidecars | `sidecars` |
+
+No new architecture, manifest, or module should acquire another numbered-stage
+name. The intended public vocabulary is `route`, `prepare`, `materialize`,
+`pack`, `sidecars`, and `build`. Renaming the existing CLI is a separate
+migration and is not implied by this document.
+
+## Shared identities and manifests
+
+A tree identity manifest protects build-defining semantics. It should include:
+
+- coordinate frame and coordinate convention;
+- world origin, bounds, and Morton bit depth;
+- magnitude-to-natural-level configuration;
+- staging bucket size and routing policy;
+- source and row-schema identities;
+- canonical ordering policy; and
+- output-profile topology and encoding versions where applicable.
+
+Mutable progress and dependency records remain separate. Small JSON manifests
+may track product identities and checkpoint locations, but catalogue-scale
+cell or dependency records belong in sorted binary or Parquet partitions. One
+large JSON dirty-node array is not a scalable dependency index.
+
+Use multiple semantic identities because different changes affect different
+products:
+
+- routing identity: fields that determine staging-group membership;
+- ordering identity: natural cell and canonical sort fields;
+- render identity: fields used by the encoded render record;
+- star identity: `source` and `source_id` ordering/output;
+- topology identity: cell counts plus profile policy; and
+- sidecar identity: fields and schema used by that sidecar family.
+
+Dirty propagation stops whenever the identity relevant to the next consumer is
+unchanged. The current `clean`/`all` downstream marker is a conservative
+compatibility fallback, not the target contract.
+
+## Routed contributions
+
+Routing reads one replaceable upstream shard and publishes its contribution to
+each staging group:
+
+```text
+(staging bucket, input shard id, fragment kind)
+```
+
+`input_shard_id` comes from the input directory name or root-level Parquet file
+stem. A HEALPix file is a useful shard boundary, but batch files are valid too;
+the upstream catalogue controls replacement granularity.
+
+Routing requirements:
+
+- calculate only placement fields such as `morton_code` and natural `level`;
+- retain raw coordinates, photometry, temperature, identity, and sidecar input
+  fields;
+- never encode node-relative render coordinates before profile topology is
+  selected;
+- write new shard contributions to temporary paths;
+- compare every old and new group by semantic checksum;
+- atomically retain equal old contributions rather than rewriting them; and
+- include old groups absent from the replacement in the changed set.
+
+A replacement may read the complete shard because that is how moved and
+deleted rows are discovered. It must not republish another contribution merely
+because the same shard was reread.
+
+Initial routing commits after each shard through a write-ahead fragment journal.
+Independent per-group checksum checkpoints let validation resume after an
+interruption without rehashing completed work.
+
+## Sorted contributions
+
+Preparation canonicalizes one changed routed contribution while preserving the
+same `(staging bucket, input shard, kind)` replacement boundary. It does not
+perform a global catalogue sort.
+
+The current primary key is:
+
+```text
+level, final_node_id, mag_abs, source, source_id
+```
+
+where:
+
+```text
+final_node_id = morton_code >> (3 * (MORTON_BITS - level))
+```
+
+Remaining columns provide a deterministic schema-order tie-break so Arrow and
+external-sort engines publish the same checksum even when all primary fields
+match. Nulls sort last, and the policy identity changes if ordering semantics
+change.
+
+Preparation should emit canonical rows together with sorted per-cell row counts
+and content checksums. Those summaries drive dependency-directed topology and
+materialization invalidation without rescanning every row.
+
+Ordinary groups use a bounded in-memory Arrow path. Large groups use a bounded
+external sorter. DuckDB is appropriate when its vectorized scan, sort, and
+controlled spill outperform a custom run merger. Explicit immutable sorted
+runs and bounded fan-in merging remain appropriate when measurements show an
+advantage or stronger restart reuse matters. The architectural requirement is
+bounded, deterministic, sequential publication—not a ban on a particular
+engine.
+
+Published sorted fragments are immutable and content/policy-addressed. A
+completed group is checkpointed before superseded fragments are garbage
+collected.
+
+## Profile topology
+
+Topology planning maps natural cells to final cells without reading or encoding
+render payloads.
+
+- The classic profile maps cells through a configured maximum-level cap.
+- The terminal-packed profile aggregates ordered cell-count runs bottom-up and
+  selects the shallowest eligible terminal root.
+
+Terminal counts should be sequential level or spatial-partition products. A
+changed leaf updates its containing partition and the small ancestor spine. If
+a terminal decision changes, the covered subtree is the correct invalidation
+unit; unrelated branches remain reusable.
+
+Topology policy is profile-specific. Count aggregation, partitioning,
+checkpointing, and sequential merge mechanics are shared.
+
+## Materialized buckets
+
+Materialization is shared machinery parameterized by a profile topology. It:
+
+1. streams sorted contributions;
+2. maps natural cells to final profile cells;
+3. encodes coordinates relative to the selected final cell;
+4. preserves existing order where mapping does not disturb it;
+5. creates bounded sorted runs for affected or overlapping cells;
+6. combines those runs with bounded fan-in merging; and
+7. publishes aligned render and identity ranges with per-cell checksums.
+
+DuckDB may handle oversized local sorts when it is the measured best engine.
+It is not used as a mutable catalogue row store. Disjoint cells remain on the
+Arrow streaming path.
+
+Materialized products are separate per profile because classic capping and
+terminal packing can assign the same row to different cells. Completed group
+runs and spatial output partitions are checkpointed, so a restart reuses
+verified immutable outputs.
+
+## Packing and sidecars
+
+Packing consumes materialized byte ranges and manifests only. It must not read
+source Parquet, repeat routing, recalculate topology, or independently rebuild
+identity order.
+
+The current monolithic binary may require a full sequential rewrite after a
+local change because compressed payload offsets move. That is acceptable while
+the packer reuses unchanged materialized partitions. True partial publication
+requires a separate container-format decision.
+
+`identifiers.order` is produced from exactly the same materialized stream as
+the render payload. Every render octree carries a `dataset_uuid`; sidecars and
+identity artifacts carry the matching parent identity. A sidecar family may be
+rebuilt independently when only its own source identity changed.
+
+## One-shard and one-star replacement
+
+For a replacement HEALPix shard:
+
+1. Route the new shard to temporary per-group contributions.
+2. Compare the union of old and new group keys.
+3. Reuse equal immutable contributions.
+4. Prepare only changed, new, or deleted contributions.
+5. Compare old and new per-cell summaries.
+6. Replan only affected profile topology branches.
+7. Rematerialize only dependent profile partitions.
+8. Repack from changed and reused materialized products.
+9. Rebuild only sidecars whose own identity changed.
+
+A single changed star commonly alters only one routed contribution. Other
+groups from the same shard stop after checksum comparison. A no-op replacement
+stops before sorting. A sidecar-only field change can stop before base render
+materialization.
+
+## Publication and recovery
+
+Every expensive product follows the same protocol:
+
+1. derive an input and policy identity;
+2. write immutable temporary runs or partitions;
+3. checkpoint each completed output;
+4. verify row counts and semantic checksums;
+5. atomically publish files;
+6. publish the parent manifest last; and
+7. garbage-collect unreachable old files only after durable publication.
+
+A restart validates completed products and continues. It never deletes the
+last published version before its replacement is durable.

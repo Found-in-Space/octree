@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import struct
 from pathlib import Path
@@ -12,6 +13,10 @@ from combine_helpers import (
     PayloadNode,
     build_identifiers_intermediates,
     build_intermediates,
+)
+from foundinspace.octree.assembly.meta_encoder import (
+    IdentifiersMap,
+    write_meta_payload,
 )
 from foundinspace.octree.combine import CombinePlan, combine_octree
 from foundinspace.octree.combine.records import PackedDescriptorFields
@@ -69,19 +74,31 @@ def _write_ident_map(path: Path, rows: list[dict]) -> None:
     pq.write_table(table, path)
 
 
-def _make_project(tmp_path: Path) -> OctreeProject:
+def _make_project(
+    tmp_path: Path,
+    *,
+    identities: list[tuple[str, str]] | None = None,
+    identifier_rows: list[dict] | None = None,
+    batch_size: int = 1000,
+) -> OctreeProject:
+    if identities is None:
+        identities = [("manual", "sun"), ("hip", "71683")]
     payload = b"".join(
-        [
-            _encode_star(x_rel=0.0, y_rel=0.0, z_rel=0.0, abs_mag=4.8, teff_log8=128),
-            _encode_star(x_rel=1.0e-5, y_rel=0.0, z_rel=0.0, abs_mag=5.0, teff_log8=80),
-        ]
+        _encode_star(
+            x_rel=index * 1.0e-5,
+            y_rel=0.0,
+            z_rel=0.0,
+            abs_mag=4.8 + index * 0.2,
+            teff_log8=max(0, 128 - index * 48),
+        )
+        for index in range(len(identities))
     )
     node = PayloadNode(
         level=0,
         node_id=0,
-        star_count=2,
+        star_count=len(identities),
         raw_payload=payload,
-        identities=[("manual", "sun"), ("hip", "71683")],
+        identities=identities,
     )
 
     stage01_dir = tmp_path / "stage01"
@@ -118,9 +135,8 @@ def _make_project(tmp_path: Path) -> OctreeProject:
     )
 
     identifiers_map_path = tmp_path / "identifiers_map.parquet"
-    _write_ident_map(
-        identifiers_map_path,
-        [
+    if identifier_rows is None:
+        identifier_rows = [
             _NULL_IDENT
             | {
                 "source": "manual",
@@ -134,8 +150,8 @@ def _make_project(tmp_path: Path) -> OctreeProject:
                 "hip_id": 71683,
                 "proper_name": "Rigil Kentaurus",
             },
-        ],
-    )
+        ]
+    _write_ident_map(identifiers_map_path, identifier_rows)
 
     return OctreeProject(
         project_path=tmp_path / "project.toml",
@@ -159,7 +175,7 @@ def _make_project(tmp_path: Path) -> OctreeProject:
         ),
         stage01=Stage01ProjectConfig(
             input_glob="unused/*.parquet",
-            batch_size=1000,
+            batch_size=batch_size,
             deep_shard_from_level=99,
             deep_prefix_bits=3,
         ),
@@ -230,3 +246,47 @@ def test_build_stage03_sidecars_rebuilds_with_fresh_sidecar_uuid(
     assert first_uuid is not None
     assert second_uuid is not None
     assert second_uuid != first_uuid
+
+
+def test_build_stage03_sidecars_streams_cell_larger_than_batch(
+    tmp_path: Path,
+) -> None:
+    identities = [("gaia", str(index)) for index in range(23)]
+    identifier_rows = [
+        _NULL_IDENT
+        | {
+            "source": source,
+            "source_id": source_id,
+            "proper_name": f"Star {source_id}",
+        }
+        for source, source_id in identities
+    ]
+    project = _make_project(
+        tmp_path,
+        identities=identities,
+        identifier_rows=identifier_rows,
+        batch_size=3,
+    )
+
+    build_stage03_sidecars(project)
+
+    payload_path = next(
+        (project.paths.stage03_output_dir / "intermediates" / "meta").glob(
+            "*.meta.payload"
+        )
+    )
+    payload = payload_path.read_bytes()
+    with IdentifiersMap(
+        project.paths.identifiers_map_path,
+        fields=["proper_name", "hip_id"],
+    ) as ident_map:
+        expected_path = tmp_path / "expected" / payload_path.name
+        expected_path.parent.mkdir()
+        with open(expected_path, "wb") as target:
+            write_meta_payload(identities, ident_map, target)
+    assert payload == expected_path.read_bytes()
+    rows = json.loads(gzip.decompress(payload))
+    assert [(row["source"], row["source_id"]) for row in rows] == identities
+    assert [row["proper_name"] for row in rows] == [
+        f"Star {index}" for index in range(23)
+    ]

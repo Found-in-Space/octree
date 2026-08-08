@@ -18,8 +18,30 @@ The command-line overrides are `--star-format-version {1,2}` and
 `--terminal-waterline N`. Selecting version 1 disables terminal packing and
 emits the existing byte-compatible STAR v1 index.
 
-For v2, Stage 02 first builds a resumable SQLite count map from the capped
-Stage 01 cells. A node becomes terminal when:
+For v2, topology planning first writes immutable, content-addressed count runs
+for each sorted input group and occupied octree level. Input is read in bounded
+batches; each batch is vector-counted with NumPy and added to a levelled run
+accumulator. Runs are reduced through a bounded fan-in merge, so memory and
+open-file use do not grow with the catalogue. An unchanged group identity
+reuses its published count files without reopening its Parquet input.
+
+Per-level group runs are merged into immutable own-count runs. Subtree counts
+are then derived bottom-up as sequential, node-ID-ordered files, and terminal
+nodes are selected shallow-to-deep. Each group, aggregate level, node level,
+and terminal plan has an atomic manifest and content identity, providing
+restart checkpoints without a catalogue-scale mutable database. A source
+change whose capped cell counts are unchanged can reuse the existing topology.
+
+The merge uses fixed-size NumPy arrays rather than a Python record-at-a-time
+heap. A bounded window from each already-sorted input is combined, sorted and
+reduced in vectorized native code. This is preferable here to a DuckDB `GROUP
+BY`: the inputs are already compact 16-byte sorted count records, so the merge
+does not need to parse Parquet, build a general hash table, or create another
+database-owned spill tree. DuckDB remains appropriate for analytical work, but
+would discard the per-group immutability and fine-grained reuse that this
+topology product relies on.
+
+A node becomes terminal when:
 
 - it has at least one natural descendant;
 - its complete subtree, including its own payload, contains between one and

@@ -2,20 +2,15 @@ from __future__ import annotations
 
 import gzip
 import hashlib
-import heapq
-import io
 import json
 import os
 import shutil
-import tempfile
 from collections.abc import Iterator, Sequence
-from contextlib import redirect_stdout
 from dataclasses import dataclass
 from itertools import groupby
 from pathlib import Path
 from typing import Any
 
-import duckdb
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -43,21 +38,18 @@ from .config import (
     DEFAULT_TERMINAL_WATERLINE,
     MORTON_BITS,
 )
-from .duckdb_util import (
-    MEMORY_LIMIT,
-    PRESERVE_INSERTION_ORDER,
-    TEMP_DIR,
-    configure_connection,
-)
 from .encoding.render import RENDER_RECORD_SIZE, encode_render_records
+from .materialization import runs as shared_runs
 from .sources.stage00 import _atomic_write_json
 from .terminal_packing import TerminalMap, build_terminal_map
 
 CLASSIC_BUILD_STATE_NAME = "classic-build-state.json"
 CLASSIC_BUILD_STATE_FORMAT = "foundinspace.octree.classic-build/v1"
 CLASSIC_WORK_STATE_NAME = "classic-work-state.json"
-CLASSIC_WORK_STATE_FORMAT = "foundinspace.octree.classic-work/v1"
-CLASSIC_ALGORITHM_VERSION = "sorted-cell-merge-terminal-packing/v3"
+CLASSIC_WORK_STATE_FORMAT = "foundinspace.octree.classic-work/v2"
+CLASSIC_ALGORITHM_VERSION = "sorted-cell-merge-terminal-packing/v4"
+CLASSIC_PARTITION_CACHE_DIR = "partition-cache"
+CLASSIC_TOPOLOGY_CACHE_DIR = "topology-cache"
 CLASSIC_OVERLAP_IN_MEMORY_MAX_BYTES = 256 * 1024 * 1024
 CLASSIC_OVERLAP_EXTERNAL_SORT_MEMORY_LIMIT = "512MB"
 # Merge runs are sequential-scan intermediates.  Keep their physical writes
@@ -108,6 +100,14 @@ _OVERLAP_SORT_KEYS = [
     (_CONTRIBUTOR_COLUMN, "ascending"),
     (_CONTRIBUTOR_ROW_COLUMN, "ascending"),
 ]
+_RUN_LAYOUT = shared_runs.SortedRunLayout(
+    schema=_COMPACT_SCHEMA,
+    cell_level_column="final_level",
+    cell_node_column="final_node_id",
+    overlap_sort_keys=tuple(_OVERLAP_SORT_KEYS[:-2]),
+    contributor_column=_CONTRIBUTOR_COLUMN,
+    contributor_row_column=_CONTRIBUTOR_ROW_COLUMN,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -152,70 +152,6 @@ class _RunInfo:
     row_count: int
 
 
-class _RunCursor:
-    def __init__(self, path: Path, *, batch_size: int) -> None:
-        parquet = pq.ParquetFile(path)
-        self._batches = iter(
-            parquet.iter_batches(
-                batch_size=batch_size,
-                columns=list(_COMPACT_COLUMNS),
-            )
-        )
-        self._table: pa.Table | None = None
-        self._cell_ends = np.empty(0, dtype=np.int64)
-        self._offset = 0
-        self._load_batch()
-
-    @property
-    def exhausted(self) -> bool:
-        return self._table is None
-
-    @property
-    def cell_key(self) -> tuple[int, int]:
-        table = self._require_table()
-        return (
-            int(table.column("final_level")[self._offset].as_py()),
-            int(table.column("final_node_id")[self._offset].as_py()),
-        )
-
-    def take_cell_chunk(self, key: tuple[int, int]) -> pa.Table:
-        table = self._require_table()
-        start = self._offset
-        boundary_index = int(np.searchsorted(self._cell_ends, start, side="right"))
-        end = int(self._cell_ends[boundary_index])
-        chunk = table.slice(start, end - start)
-        self._offset = end
-        self._load_batch_if_consumed()
-        return chunk
-
-    def _load_batch_if_consumed(self) -> None:
-        if self._table is not None and self._offset >= len(self._table):
-            self._load_batch()
-
-    def _load_batch(self) -> None:
-        for batch in self._batches:
-            if len(batch) == 0:
-                continue
-            self._table = pa.Table.from_batches([batch], schema=_COMPACT_SCHEMA)
-            levels = np.asarray(self._table.column("final_level"), dtype=np.int16)
-            nodes = np.asarray(self._table.column("final_node_id"), dtype=np.uint64)
-            self._cell_ends = np.append(
-                np.flatnonzero((levels[1:] != levels[:-1]) | (nodes[1:] != nodes[:-1]))
-                + 1,
-                len(self._table),
-            )
-            self._offset = 0
-            return
-        self._table = None
-        self._cell_ends = np.empty(0, dtype=np.int64)
-        self._offset = 0
-
-    def _require_table(self) -> pa.Table:
-        if self._table is None:
-            raise RuntimeError("Sorted run cursor is exhausted")
-        return self._table
-
-
 def classic_input_identity(
     groups: Sequence[Stage01GroupInput],
     plan: ClassicMaterializationPlan,
@@ -228,9 +164,8 @@ def classic_input_identity(
                 "key": group.key,
                 "checksum": group.checksum,
                 "row_count": group.row_count,
-                "files": [path.as_posix() for path in group.files],
             }
-            for group in groups
+            for group in sorted(groups, key=lambda item: item.key)
         ],
         "max_level": plan.max_level,
         "mag_limit": plan.mag_limit,
@@ -244,12 +179,106 @@ def classic_input_identity(
         "render_record_size": RENDER_RECORD_SIZE,
         "sort_keys": [name for name, _order in _CANONICAL_SORT_KEYS],
     }
+    return _materialization_identity(canonical)
+
+
+def _topology_identity(
+    plan: ClassicMaterializationPlan,
+    terminal_map_path: Path | None,
+) -> str:
+    if plan.star_format_version == 1:
+        return _materialization_identity(
+            {
+                "kind": "level-cap/v1",
+                "max_level": plan.max_level,
+            }
+        )
+    if terminal_map_path is None:
+        raise ValueError("STAR v2 materialization requires a terminal map")
+    raw = json.loads(terminal_map_path.read_text(encoding="utf-8"))
+    level_content: list[dict[str, Any]] = []
+    for entry in raw.get("levels", []):
+        relative = Path(str(entry["path"]))
+        level_content.append(
+            {
+                "level": int(entry["level"]),
+                "count": int(entry["count"]),
+                "checksum": _file_identity(terminal_map_path.parent / relative),
+            }
+        )
+    return _materialization_identity(
+        {
+            "kind": "terminal-map/v1",
+            "max_level": plan.max_level,
+            "waterline": plan.terminal_waterline,
+            # Deliberately exclude counts/source identities and physical paths.
+            # Equal terminal decisions must have equal materialization identity,
+            # even when different source counts produced those decisions.
+            "levels": level_content,
+        }
+    )
+
+
+def _group_materialization_identity(
+    group: Stage01GroupInput,
+    *,
+    plan: ClassicMaterializationPlan,
+    topology_identity: str,
+) -> str:
+    return _materialization_identity(
+        {
+            "format": "foundinspace.octree.normalized-group/v1",
+            "algorithm": CLASSIC_ALGORITHM_VERSION,
+            "group_key": group.key,
+            "checksum": group.checksum,
+            "row_count": group.row_count,
+            "natural_max_level": group.natural_max_level,
+            "max_level": plan.max_level,
+            "partition_from_level": plan.partition_from_level,
+            "partition_prefix_bits": plan.partition_prefix_bits,
+            "star_format_version": plan.star_format_version,
+            "topology_identity": topology_identity,
+            "compact_schema": str(_COMPACT_SCHEMA),
+            "sort_keys": _CANONICAL_SORT_KEYS,
+        }
+    )
+
+
+def _partition_materialization_identity(
+    partition_key: str,
+    *,
+    contributors: list[dict[str, Any]],
+    topology_identity: str,
+    plan: ClassicMaterializationPlan,
+) -> str:
+    return _materialization_identity(
+        {
+            "format": "foundinspace.octree.materialized-partition/v1",
+            "algorithm": CLASSIC_ALGORITHM_VERSION,
+            "partition_key": partition_key,
+            "contributors": contributors,
+            "topology_identity": topology_identity,
+            "star_format_version": plan.star_format_version,
+            "max_level": plan.max_level,
+        }
+    )
+
+
+def _materialization_identity(value: Any) -> str:
     payload = json.dumps(
-        canonical,
+        value,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
     return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
+def _file_identity(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fp:
+        while chunk := fp.read(1024 * 1024):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
 
 
 def load_published_materialization(
@@ -328,42 +357,67 @@ def materialize_classic_groups(
 ) -> ClassicMaterializationResult:
     if not groups:
         raise ValueError("Classic materialization requires Stage 01 groups")
+    groups = tuple(sorted(groups, key=lambda group: group.key))
+    if len({group.key for group in groups}) != len(groups):
+        raise ValueError("Classic materialization group keys must be unique")
     input_identity = classic_input_identity(groups, plan)
     state = _prepare_work_state(work_dir, input_identity=input_identity)
     runs_dir = work_dir / "runs"
     merge_dir = work_dir / "merge"
     artifacts_dir = work_dir / "artifacts"
+    partition_cache_dir = work_dir / CLASSIC_PARTITION_CACHE_DIR
+    topology_cache_dir = work_dir / CLASSIC_TOPOLOGY_CACHE_DIR
     runs_dir.mkdir(parents=True, exist_ok=True)
     merge_dir.mkdir(parents=True, exist_ok=True)
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    partition_cache_dir.mkdir(parents=True, exist_ok=True)
+    topology_cache_dir.mkdir(parents=True, exist_ok=True)
     terminal_map: TerminalMap | None = None
-    terminal_map_manifest_path: Path | None = None
+    cached_terminal_map_path: Path | None = None
     if plan.star_format_version == 2:
-        terminal_map_manifest_path = build_terminal_map(
+        cached_terminal_map_path = build_terminal_map(
             groups=groups,
             work_dir=work_dir,
-            artifacts_dir=artifacts_dir,
+            artifacts_dir=topology_cache_dir,
             max_level=plan.max_level,
             waterline=plan.terminal_waterline,
             batch_size=plan.batch_size,
         )
-        terminal_map = TerminalMap(terminal_map_manifest_path)
+        terminal_map = TerminalMap(cached_terminal_map_path)
+    topology_identity = _topology_identity(plan, cached_terminal_map_path)
 
-    completed_groups = state.setdefault("completed_groups", {})
+    active_group_keys = {group.key for group in groups}
+    completed_groups = {
+        str(key): value
+        for key, value in state.get("completed_groups", {}).items()
+        if str(key) in active_group_keys
+    }
+    state["completed_groups"] = completed_groups
     for group in groups:
+        group_identity = _group_materialization_identity(
+            group,
+            plan=plan,
+            topology_identity=topology_identity,
+        )
         existing = completed_groups.get(group.key)
-        if _completed_group_is_valid(work_dir, existing):
+        if _completed_group_is_valid(
+            work_dir,
+            existing,
+            expected_identity=group_identity,
+        ):
             continue
         group_result = _normalize_group(
             group,
             runs_dir=runs_dir,
             plan=plan,
             terminal_map=terminal_map,
+            group_identity=group_identity,
         )
+        group_result["identity"] = group_identity
         completed_groups[group.key] = group_result
         _atomic_write_json(work_dir / CLASSIC_WORK_STATE_NAME, state)
 
     runs_by_partition: dict[str, list[_RunInfo]] = {}
+    contributors_by_partition: dict[str, list[dict[str, Any]]] = {}
     folded_row_count = 0
     row_count = 0
     for group in groups:
@@ -372,7 +426,15 @@ def materialize_classic_groups(
         folded_row_count += int(result["folded_row_count"])
         for raw_run in result.get("runs", []):
             run = _run_from_state(work_dir, raw_run)
-            runs_by_partition.setdefault(_shard_state_key(run.shard), []).append(run)
+            partition_key = _shard_state_key(run.shard)
+            runs_by_partition.setdefault(partition_key, []).append(run)
+            contributors_by_partition.setdefault(partition_key, []).append(
+                {
+                    "group_key": group.key,
+                    "group_identity": result["identity"],
+                    "row_count": run.row_count,
+                }
+            )
 
     expected_rows = sum(group.row_count for group in groups)
     if row_count != expected_rows:
@@ -381,22 +443,55 @@ def materialize_classic_groups(
             f"expected={expected_rows}, actual={row_count}"
         )
 
-    completed_partitions = state.setdefault("completed_partitions", {})
+    completed_partitions = {
+        str(key): value
+        for key, value in state.get("completed_partitions", {}).items()
+        if str(key) in runs_by_partition
+    }
+    state["completed_partitions"] = completed_partitions
     for partition_key in sorted(runs_by_partition, key=_shard_state_sort_key):
         runs = runs_by_partition[partition_key]
         shard = runs[0].shard
+        partition_identity = _partition_materialization_identity(
+            partition_key,
+            contributors=contributors_by_partition[partition_key],
+            topology_identity=topology_identity,
+            plan=plan,
+        )
         existing = completed_partitions.get(partition_key)
-        if _completed_partition_is_valid(artifacts_dir, existing):
+        if _completed_partition_is_valid(
+            work_dir,
+            existing,
+            expected_identity=partition_identity,
+        ):
             continue
+        cache_dir = (
+            partition_cache_dir
+            / _safe_partition_dir_name(partition_key)
+            / partition_identity.removeprefix("sha256:")
+        )
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir)
+        cache_dir.mkdir(parents=True)
         result = _materialize_partition(
             runs,
             shard=shard,
             merge_root=merge_dir,
-            artifacts_dir=artifacts_dir,
+            artifacts_dir=cache_dir,
             plan=plan,
         )
+        result["identity"] = partition_identity
+        result["cache_dir"] = cache_dir.relative_to(work_dir).as_posix()
+        result["contributors"] = contributors_by_partition[partition_key]
         completed_partitions[partition_key] = result
         _atomic_write_json(work_dir / CLASSIC_WORK_STATE_NAME, state)
+
+    published_terminal_map_path = _assemble_publication_artifacts(
+        work_dir=work_dir,
+        artifacts_dir=artifacts_dir,
+        completed_partitions=completed_partitions,
+        cached_terminal_map_path=cached_terminal_map_path,
+    )
 
     render_entries: list[dict[str, Any]] = []
     identifiers_entries: list[dict[str, Any]] = []
@@ -422,7 +517,7 @@ def materialize_classic_groups(
         index_magic=INDEX_MAGIC,
         mag_limit=plan.mag_limit,
         name=RENDER_MANIFEST_NAME,
-        terminal_map_path=terminal_map_manifest_path,
+        terminal_map_path=published_terminal_map_path,
     )
     identifiers_manifest_path = write_manifest(
         artifacts_dir,
@@ -443,6 +538,14 @@ def materialize_classic_groups(
             "cell_count": cell_count,
         },
     )
+    state["input_identity"] = input_identity
+    state["topology_identity"] = topology_identity
+    _atomic_write_json(work_dir / CLASSIC_WORK_STATE_NAME, state)
+    _prune_inactive_materialization_cache(
+        work_dir,
+        completed_groups=completed_groups,
+        completed_partitions=completed_partitions,
+    )
     return ClassicMaterializationResult(
         render_manifest_path=render_manifest_path,
         identifiers_manifest_path=identifiers_manifest_path,
@@ -460,10 +563,8 @@ def _prepare_work_state(work_dir: Path, *, input_identity: str) -> dict[str, Any
             state = json.loads(state_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             state = {}
-        if (
-            state.get("format") == CLASSIC_WORK_STATE_FORMAT
-            and state.get("input_identity") == input_identity
-        ):
+        if state.get("format") == CLASSIC_WORK_STATE_FORMAT:
+            state["input_identity"] = input_identity
             return state
     if work_dir.exists():
         shutil.rmtree(work_dir)
@@ -484,8 +585,13 @@ def _normalize_group(
     runs_dir: Path,
     plan: ClassicMaterializationPlan,
     terminal_map: TerminalMap | None,
+    group_identity: str,
 ) -> dict[str, Any]:
-    group_dir = runs_dir / _safe_group_dir_name(group.key)
+    group_dir = (
+        runs_dir
+        / _safe_group_dir_name(group.key)
+        / group_identity.removeprefix("sha256:")
+    )
     if group_dir.exists():
         shutil.rmtree(group_dir)
     group_dir.mkdir(parents=True)
@@ -494,24 +600,28 @@ def _normalize_group(
             "row_count": 0,
             "folded_row_count": 0,
             "runs": [],
+            "cache_dir": group_dir.relative_to(runs_dir.parent).as_posix(),
         }
     requires_folding = _group_requires_folding(group, max_level=plan.max_level)
     requires_terminal_reordering = (
         terminal_map is not None and terminal_map.terminal_count > 0
     )
     if not requires_folding and not requires_terminal_reordering:
-        return _stream_ordered_group(
+        result = _stream_ordered_group(
             group,
             group_dir=group_dir,
             plan=plan,
             terminal_map=terminal_map,
         )
-    return _externally_sort_folded_group(
-        group,
-        group_dir=group_dir,
-        plan=plan,
-        terminal_map=terminal_map,
-    )
+    else:
+        result = _externally_sort_folded_group(
+            group,
+            group_dir=group_dir,
+            plan=plan,
+            terminal_map=terminal_map,
+        )
+    result["cache_dir"] = group_dir.relative_to(runs_dir.parent).as_posix()
+    return result
 
 
 def _stream_ordered_group(
@@ -536,7 +646,7 @@ def _stream_ordered_group(
         runs.append(
             _run_state(
                 path=current_path,
-                work_dir=group_dir.parent.parent,
+                work_dir=group_dir.parents[2],
                 shard=current_shard,
                 row_count=current_rows,
             )
@@ -662,7 +772,7 @@ def _externally_sort_folded_group(
         runs.append(
             _run_state(
                 path=output,
-                work_dir=group_dir.parent.parent,
+                work_dir=group_dir.parents[2],
                 shard=shard,
                 row_count=rows_by_shard[shard],
             )
@@ -975,32 +1085,19 @@ def _reduce_runs(
     batch_size: int,
     fan_in: int,
 ) -> list[Path]:
-    current = list(paths)
-    generated: set[Path] = set()
-    round_index = 0
-    while len(current) > fan_in:
-        next_round: list[Path] = []
-        for chunk_index, offset in enumerate(range(0, len(current), fan_in)):
-            chunk = current[offset : offset + fan_in]
-            if len(chunk) == 1:
-                next_round.append(chunk[0])
-                continue
-            output = partition_dir / (
-                f"merge-{round_index:03d}-{chunk_index:06d}.parquet"
-            )
-            _write_merged_run(
-                chunk,
-                output,
-                batch_size=batch_size,
-            )
-            next_round.append(output)
-            generated.add(output)
-        for path in current:
-            if path in generated and path not in next_round:
-                path.unlink(missing_ok=True)
-        current = next_round
-        round_index += 1
-    return current
+    return shared_runs.reduce_sorted_runs(
+        paths,
+        partition_dir=partition_dir,
+        batch_size=batch_size,
+        fan_in=fan_in,
+        layout=_RUN_LAYOUT,
+        bounds=_classic_merge_bounds(),
+        write_run=lambda source, output, rows: _write_merged_run(
+            source,
+            output,
+            batch_size=rows,
+        ),
+    )
 
 
 def _write_merged_run(
@@ -1009,84 +1106,23 @@ def _write_merged_run(
     *,
     batch_size: int,
 ) -> None:
-    if batch_size <= 0:
-        raise ValueError("Classic merge batch_size must be > 0")
-    tmp_path = output.with_name(f".{output.name}.tmp")
-    writer = pq.ParquetWriter(
-        tmp_path,
-        _COMPACT_SCHEMA,
-        compression="zstd",
-        # These files are consumed in canonical order, never predicate-scanned.
-        # Per-column statistics only enlarge their footer.
-        write_statistics=False,
+    def merge_batches(
+        source: Sequence[Path], rows: int, spill_dir: Path
+    ) -> Iterator[tuple[tuple[int, int], pa.Table]]:
+        yield from _iter_merged_batches(
+            source,
+            batch_size=rows,
+            spill_dir=spill_dir,
+        )
+
+    shared_runs.write_merged_run(
+        paths,
+        output,
+        batch_size=batch_size,
+        layout=_RUN_LAYOUT,
+        bounds=_classic_merge_bounds(),
+        merge_batches=merge_batches,
     )
-    buffered: list[pa.Table] = []
-    buffered_rows = 0
-    buffered_bytes = 0
-
-    def flush() -> None:
-        nonlocal buffered, buffered_rows, buffered_bytes
-        if not buffered:
-            return
-        table = pa.concat_tables(buffered, promote_options="none")
-        writer.write_table(table, row_group_size=batch_size)
-        buffered = []
-        buffered_rows = 0
-        buffered_bytes = 0
-
-    def compact_pieces() -> None:
-        nonlocal buffered, buffered_bytes
-        # Arrow table slices retain their parent buffers.  Combining chunks here
-        # caps both metadata and retained-buffer counts for many tiny cells.
-        table = pa.concat_tables(buffered, promote_options="none").combine_chunks()
-        buffered = [table]
-        buffered_bytes = table.nbytes
-
-    try:
-        for _key, batch in _iter_merged_batches(
-            paths,
-            batch_size=batch_size,
-            spill_dir=output.parent,
-        ):
-            offset = 0
-            while offset < len(batch):
-                if buffered_rows >= batch_size:
-                    flush()
-                row_room = batch_size - buffered_rows
-                piece_rows = min(row_room, len(batch) - offset)
-                piece = batch.slice(offset, piece_rows)
-
-                # A row bound alone is insufficient for variable-width identity
-                # fields.  Shrink a piece until its logical size fits the byte
-                # budget (a single unusually large row is the unavoidable floor).
-                while len(piece) > 1 and piece.nbytes > CLASSIC_MERGE_WRITE_MAX_BYTES:
-                    piece_rows = max(1, piece_rows // 2)
-                    piece = batch.slice(offset, piece_rows)
-
-                if buffered and (
-                    buffered_bytes + piece.nbytes > CLASSIC_MERGE_WRITE_MAX_BYTES
-                ):
-                    flush()
-                    continue
-
-                buffered.append(piece)
-                buffered_rows += len(piece)
-                buffered_bytes += piece.nbytes
-                offset += len(piece)
-                if len(buffered) >= CLASSIC_MERGE_WRITE_MAX_PIECES:
-                    compact_pieces()
-                if (
-                    buffered_rows >= batch_size
-                    or buffered_bytes >= CLASSIC_MERGE_WRITE_MAX_BYTES
-                ):
-                    flush()
-        flush()
-    except Exception:
-        writer.close()
-        tmp_path.unlink(missing_ok=True)
-        raise
-    writer.close()
-    os.replace(tmp_path, output)
 
 
 def _iter_merged_batches(
@@ -1095,126 +1131,27 @@ def _iter_merged_batches(
     batch_size: int,
     spill_dir: Path,
 ) -> Iterator[tuple[tuple[int, int], pa.Table]]:
-    if batch_size <= 0:
-        raise ValueError("Classic merge batch_size must be > 0")
-    if not paths:
-        return
-    cursor_batch_size = max(1, batch_size // len(paths))
-    cursors = [_RunCursor(path, batch_size=cursor_batch_size) for path in paths]
-    cell_heap: list[tuple[int, int, int]] = []
-    for index, cursor in enumerate(cursors):
-        if not cursor.exhausted:
-            level, node_id = cursor.cell_key
-            heapq.heappush(cell_heap, (level, node_id, index))
-
-    while cell_heap:
-        level, node_id, index = heapq.heappop(cell_heap)
-        key = (level, node_id)
-        contributors = [index]
-        while cell_heap and (cell_heap[0][0], cell_heap[0][1]) == key:
-            _level, _node, other_index = heapq.heappop(cell_heap)
-            contributors.append(other_index)
-
-        if len(contributors) == 1:
-            cursor = cursors[index]
-            while not cursor.exhausted and cursor.cell_key == key:
-                yield key, cursor.take_cell_chunk(key)
-        else:
-            yield from _merge_overlapping_cell(
-                cursors,
-                contributors,
-                key=key,
-                batch_size=batch_size,
-                spill_dir=spill_dir,
-            )
-
-        for contributor in contributors:
-            cursor = cursors[contributor]
-            if not cursor.exhausted:
-                next_level, next_node_id = cursor.cell_key
-                heapq.heappush(
-                    cell_heap,
-                    (next_level, next_node_id, contributor),
-                )
-
-
-def _merge_overlapping_cell(
-    cursors: Sequence[_RunCursor],
-    contributors: Sequence[int],
-    *,
-    key: tuple[int, int],
-    batch_size: int,
-    spill_dir: Path,
-) -> Iterator[tuple[tuple[int, int], pa.Table]]:
-    buffered: list[pa.Table] = []
-    buffered_rows = 0
-    buffered_bytes = 0
-    temporary_dir: tempfile.TemporaryDirectory | None = None
-    spill_path: Path | None = None
-    spill_writer: pq.ParquetWriter | None = None
-
-    def start_spilling() -> None:
-        nonlocal temporary_dir, spill_path, spill_writer
-        temporary_dir = tempfile.TemporaryDirectory(
-            prefix=".classic-overlap-sort-",
-            dir=spill_dir,
-        )
-        spill_path = Path(temporary_dir.name) / "cell.parquet"
-        spill_writer = pq.ParquetWriter(
-            spill_path,
-            _OVERLAP_SCHEMA,
-            compression="zstd",
-        )
-        for table in buffered:
-            spill_writer.write_table(table, row_group_size=batch_size)
-        buffered.clear()
-
-    try:
-        for index in contributors:
-            contributor_row = 0
-            cursor = cursors[index]
-            while not cursor.exhausted and cursor.cell_key == key:
-                chunk = cursor.take_cell_chunk(key)
-                tagged = _tag_overlap_chunk(
-                    chunk,
-                    contributor_index=index,
-                    contributor_row=contributor_row,
-                )
-                contributor_row += len(tagged)
-                if spill_writer is None and (
-                    buffered_rows + len(tagged) > batch_size
-                    or buffered_bytes + tagged.nbytes
-                    > CLASSIC_OVERLAP_IN_MEMORY_MAX_BYTES
-                ):
-                    start_spilling()
-                if spill_writer is None:
-                    buffered.append(tagged)
-                    buffered_rows += len(tagged)
-                    buffered_bytes += tagged.nbytes
-                else:
-                    spill_writer.write_table(tagged, row_group_size=batch_size)
-
-        if spill_writer is None:
-            yield from _iter_in_memory_sorted_overlap(
-                buffered,
-                key=key,
-                batch_size=batch_size,
-            )
-            return
-
-        spill_writer.close()
-        spill_writer = None
-        assert spill_path is not None
+    def external_sort(
+        spill_path: Path,
+        *,
+        key: tuple[int, int],
+        batch_size: int,
+        **_ignored: Any,
+    ) -> Iterator[tuple[tuple[int, int], pa.Table]]:
         yield from _iter_externally_sorted_overlap(
             spill_path,
             key=key,
             batch_size=batch_size,
         )
-    finally:
-        if spill_writer is not None:
-            spill_writer.close()
-        if temporary_dir is not None:
-            temporary_dir.cleanup()
+
+    yield from shared_runs.iter_merged_batches(
+        paths,
+        batch_size=batch_size,
+        spill_dir=spill_dir,
+        layout=_RUN_LAYOUT,
+        bounds=_classic_merge_bounds(),
+        external_overlap_sort=external_sort,
+    )
 
 
 def _tag_overlap_chunk(
@@ -1223,23 +1160,11 @@ def _tag_overlap_chunk(
     contributor_index: int,
     contributor_row: int,
 ) -> pa.Table:
-    row_count = len(chunk)
-    return chunk.append_column(
-        pa.field(_CONTRIBUTOR_COLUMN, pa.int32(), nullable=False),
-        pa.array(
-            np.full(row_count, contributor_index, dtype=np.int32),
-            type=pa.int32(),
-        ),
-    ).append_column(
-        pa.field(_CONTRIBUTOR_ROW_COLUMN, pa.int64(), nullable=False),
-        pa.array(
-            np.arange(
-                contributor_row,
-                contributor_row + row_count,
-                dtype=np.int64,
-            ),
-            type=pa.int64(),
-        ),
+    return shared_runs._tag_overlap_chunk(
+        chunk,
+        contributor_index=contributor_index,
+        contributor_row=contributor_row,
+        layout=_RUN_LAYOUT,
     )
 
 
@@ -1249,15 +1174,12 @@ def _iter_in_memory_sorted_overlap(
     key: tuple[int, int],
     batch_size: int,
 ) -> Iterator[tuple[tuple[int, int], pa.Table]]:
-    combined = pa.concat_tables(chunks, promote_options="none")
-    order = pc.sort_indices(
-        combined,
-        sort_keys=_OVERLAP_SORT_KEYS,
-        null_placement="at_end",
+    yield from shared_runs._iter_in_memory_sorted_overlap(
+        chunks,
+        key=key,
+        batch_size=batch_size,
+        layout=_RUN_LAYOUT,
     )
-    sorted_table = combined.take(order).select(_COMPACT_COLUMNS)
-    for offset in range(0, len(sorted_table), batch_size):
-        yield key, sorted_table.slice(offset, batch_size)
 
 
 def _iter_externally_sorted_overlap(
@@ -1266,60 +1188,118 @@ def _iter_externally_sorted_overlap(
     key: tuple[int, int],
     batch_size: int,
 ) -> Iterator[tuple[tuple[int, int], pa.Table]]:
-    local_spill_dir: Path | None = None
-    if TEMP_DIR is None:
-        local_spill_dir = spill_path.parent / "duckdb-spill"
-        local_spill_dir.mkdir()
-
-    con = duckdb.connect()
-    try:
-        with redirect_stdout(io.StringIO()):
-            configure_connection(con)
-        if local_spill_dir is not None:
-            con.execute("SET temp_directory = ?", [str(local_spill_dir)])
-        if MEMORY_LIMIT is None:
-            con.execute(
-                "SET memory_limit = ?",
-                [CLASSIC_OVERLAP_EXTERNAL_SORT_MEMORY_LIMIT],
-            )
-        if PRESERVE_INSERTION_ORDER is None:
-            con.execute("SET preserve_insertion_order = false")
-        con.execute(_overlap_sort_query(spill_path))
-        for batch in con.to_arrow_reader(batch_size=batch_size):
-            table = pa.Table.from_batches([batch])
-            if not table.schema.equals(_COMPACT_SCHEMA, check_metadata=False):
-                table = table.cast(_COMPACT_SCHEMA)
-            yield key, table.replace_schema_metadata(None)
-    finally:
-        con.close()
-        if local_spill_dir is not None:
-            shutil.rmtree(local_spill_dir, ignore_errors=True)
+    yield from shared_runs._iter_externally_sorted_overlap(
+        spill_path,
+        key=key,
+        batch_size=batch_size,
+        layout=_RUN_LAYOUT,
+        bounds=_classic_merge_bounds(),
+    )
 
 
 def _overlap_sort_query(path: Path) -> str:
-    escaped = path.as_posix().replace("'", "''")
-    return f"""
-        SELECT
-            final_level,
-            final_node_id,
-            mag_abs,
-            source,
-            source_id,
-            render
-        FROM read_parquet(
-            '{escaped}',
-            hive_partitioning = false,
-            union_by_name = false
+    return shared_runs._overlap_sort_query(path, layout=_RUN_LAYOUT)
+
+
+def _classic_merge_bounds() -> shared_runs.RunMergeBounds:
+    return shared_runs.RunMergeBounds(
+        overlap_in_memory_max_bytes=CLASSIC_OVERLAP_IN_MEMORY_MAX_BYTES,
+        external_sort_memory_limit=CLASSIC_OVERLAP_EXTERNAL_SORT_MEMORY_LIMIT,
+        write_max_bytes=CLASSIC_MERGE_WRITE_MAX_BYTES,
+        write_max_pieces=CLASSIC_MERGE_WRITE_MAX_PIECES,
+    )
+
+
+def _assemble_publication_artifacts(
+    *,
+    work_dir: Path,
+    artifacts_dir: Path,
+    completed_partitions: dict[str, Any],
+    cached_terminal_map_path: Path | None,
+) -> Path | None:
+    """Assemble a disposable publication tree from durable cached products."""
+    if artifacts_dir.exists():
+        shutil.rmtree(artifacts_dir)
+    artifacts_dir.mkdir(parents=True)
+    for partition_key in sorted(completed_partitions, key=_shard_state_sort_key):
+        result = completed_partitions[partition_key]
+        cache_dir = work_dir / str(result["cache_dir"])
+        for entry_name in ("render_entry", "identifiers_entry"):
+            entry = result[entry_name]
+            for path_name in ("index_path", "payload_path"):
+                relative = Path(str(entry[path_name]))
+                _link_or_copy_cached_file(
+                    cache_dir / relative,
+                    artifacts_dir / relative,
+                )
+
+    if cached_terminal_map_path is None:
+        return None
+    raw = json.loads(cached_terminal_map_path.read_text(encoding="utf-8"))
+    for entry in raw.get("levels", []):
+        relative = Path(str(entry["path"]))
+        _link_or_copy_cached_file(
+            cached_terminal_map_path.parent / relative,
+            artifacts_dir / relative,
         )
-        ORDER BY
-            final_level ASC,
-            final_node_id ASC,
-            mag_abs ASC NULLS LAST,
-            source ASC,
-            source_id ASC,
-            {_CONTRIBUTOR_COLUMN} ASC,
-            {_CONTRIBUTOR_ROW_COLUMN} ASC
-    """
+    published_manifest = artifacts_dir / cached_terminal_map_path.name
+    _link_or_copy_cached_file(cached_terminal_map_path, published_manifest)
+    return published_manifest
+
+
+def _link_or_copy_cached_file(source: Path, target: Path) -> None:
+    if not source.is_file():
+        raise FileNotFoundError(f"Missing cached materialization file: {source}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(source, target)
+    except OSError:
+        # Hardlinks preserve inode/mtime on the common same-device path. A
+        # configured cross-device cache must still publish correctly.
+        shutil.copy2(source, target)
+
+
+def _prune_inactive_materialization_cache(
+    work_dir: Path,
+    *,
+    completed_groups: dict[str, Any],
+    completed_partitions: dict[str, Any],
+) -> None:
+    active_group_dirs = {
+        (work_dir / str(result["cache_dir"])).resolve()
+        for result in completed_groups.values()
+    }
+    runs_dir = work_dir / "runs"
+    if runs_dir.is_dir():
+        for group_root in runs_dir.iterdir():
+            if not group_root.is_dir():
+                continue
+            for identity_dir in group_root.iterdir():
+                if (
+                    identity_dir.is_dir()
+                    and identity_dir.resolve() not in active_group_dirs
+                ):
+                    shutil.rmtree(identity_dir)
+            if not any(group_root.iterdir()):
+                group_root.rmdir()
+
+    active_partition_dirs = {
+        (work_dir / str(result["cache_dir"])).resolve()
+        for result in completed_partitions.values()
+    }
+    partition_root = work_dir / CLASSIC_PARTITION_CACHE_DIR
+    if partition_root.is_dir():
+        for shard_root in partition_root.iterdir():
+            if not shard_root.is_dir():
+                continue
+            for identity_dir in shard_root.iterdir():
+                if (
+                    identity_dir.is_dir()
+                    and identity_dir.resolve() not in active_partition_dirs
+                ):
+                    shutil.rmtree(identity_dir)
+            if not any(shard_root.iterdir()):
+                shard_root.rmdir()
 
 
 def _fixed_binary_bytes(column: pa.ChunkedArray) -> bytes:
@@ -1334,10 +1314,20 @@ def _fixed_binary_bytes(column: pa.ChunkedArray) -> bytes:
     return bytes(memoryview(data)[start:end])
 
 
-def _completed_group_is_valid(work_dir: Path, raw: Any) -> bool:
+def _completed_group_is_valid(
+    work_dir: Path,
+    raw: Any,
+    *,
+    expected_identity: str | None = None,
+) -> bool:
     if not isinstance(raw, dict):
         return False
     try:
+        if expected_identity is not None and raw.get("identity") != expected_identity:
+            return False
+        cache_dir = _cached_state_dir(work_dir, raw)
+        if not cache_dir.is_dir():
+            return False
         expected_rows = int(raw["row_count"])
         state_rows = sum(int(run["row_count"]) for run in raw["runs"])
         if state_rows != expected_rows:
@@ -1345,6 +1335,8 @@ def _completed_group_is_valid(work_dir: Path, raw: Any) -> bool:
         actual_rows = 0
         for run in raw["runs"]:
             path = work_dir / str(run["path"])
+            if not path.resolve().is_relative_to(cache_dir.resolve()):
+                return False
             if not path.is_file() or not pq.read_schema(path).equals(_COMPACT_SCHEMA):
                 return False
             actual_rows += pq.read_metadata(path).num_rows
@@ -1353,23 +1345,43 @@ def _completed_group_is_valid(work_dir: Path, raw: Any) -> bool:
         return False
 
 
-def _completed_partition_is_valid(artifacts_dir: Path, raw: Any) -> bool:
+def _completed_partition_is_valid(
+    work_dir: Path,
+    raw: Any,
+    *,
+    expected_identity: str | None = None,
+) -> bool:
     if not isinstance(raw, dict):
         return False
     try:
+        if expected_identity is not None and raw.get("identity") != expected_identity:
+            return False
+        cache_dir = _cached_state_dir(work_dir, raw)
+        if not cache_dir.is_dir():
+            return False
         validate_shard(
-            artifacts_dir,
+            cache_dir,
             raw["render_entry"],
             expected_magic=INDEX_MAGIC,
         )
         validate_shard(
-            artifacts_dir,
+            cache_dir,
             raw["identifiers_entry"],
             expected_magic=IDENTIFIERS_INDEX_MAGIC,
         )
         return True
     except (KeyError, OSError, TypeError, ValueError):
         return False
+
+
+def _cached_state_dir(work_dir: Path, raw: dict[str, Any]) -> Path:
+    relative = Path(str(raw["cache_dir"]))
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError(f"Invalid materialization cache path: {relative}")
+    path = work_dir / relative
+    if not path.resolve().is_relative_to(work_dir.resolve()):
+        raise ValueError(f"Materialization cache escapes work directory: {relative}")
+    return path
 
 
 def _run_from_state(work_dir: Path, raw: dict[str, Any]) -> _RunInfo:
@@ -1387,6 +1399,11 @@ def _run_from_state(work_dir: Path, raw: dict[str, Any]) -> _RunInfo:
 def _safe_group_dir_name(key: str) -> str:
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:20]
     return f"group-{digest}"
+
+
+def _safe_partition_dir_name(key: str) -> str:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:20]
+    return f"partition-{digest}"
 
 
 def _shard_state_key(shard: ShardKey) -> str:

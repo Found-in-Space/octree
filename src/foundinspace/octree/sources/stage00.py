@@ -172,6 +172,13 @@ class _Stage00Transaction:
             self.obsolete_files.append(rel_path)
             self._write_journal()
 
+    def preserve(self, path: Path) -> None:
+        """Keep a previously published file after candidate comparison."""
+        rel_path = path.relative_to(self.output_dir).as_posix()
+        if rel_path in self.obsolete_files:
+            self.obsolete_files.remove(rel_path)
+            self._write_journal()
+
     def commit_state(
         self,
         state_path: Path,
@@ -373,6 +380,47 @@ class _Stage00Builder:
                 node.current_files.discard(path)
                 self._mark_obsolete(path)
             node.row_count = max(0, node.row_count - int(group.get("row_count", 0)))
+
+    def reuse_existing_group(
+        self,
+        *,
+        candidate: dict[str, Any],
+        existing: dict[str, Any],
+    ) -> None:
+        """Discard a replacement candidate and restore its immutable group."""
+        if self._transaction is None:
+            raise ValueError("Reusing a Stage 00 group requires a transaction")
+        if candidate["key"] != existing["key"]:
+            raise ValueError("Cannot reuse a Stage 00 group with a different key")
+
+        candidate_rows = int(candidate["row_count"])
+        existing_rows = int(existing["row_count"])
+        _ensure_equal_row_count(
+            before=candidate_rows,
+            after=existing_rows,
+            context=f"reusing Stage 00 group {candidate['key']}",
+        )
+        node = self._node_for_path(tuple(int(v) for v in candidate["path_octants"]))
+        for rel_file in candidate.get("files", []):
+            path = self._config.output_dir / str(rel_file)
+            node.current_files.discard(path)
+            self._mark_obsolete(path)
+
+        old_file_rows = list(existing.get("file_row_counts", []))
+        for index, rel_file in enumerate(existing.get("files", [])):
+            path = self._config.output_dir / str(rel_file)
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"Missing published Stage 00 group fragment: {path}"
+                )
+            self._transaction.preserve(path)
+            node.current_files.add(path)
+            if index < len(old_file_rows):
+                self._file_rows[path] = int(old_file_rows[index])
+            else:
+                self._file_rows[path] = pq.read_metadata(path).num_rows
+
+        node.row_count += existing_rows - candidate_rows
 
     def _load_existing_state(self, state: dict[str, Any]) -> None:
         for node_record in sorted(
@@ -1010,35 +1058,36 @@ def _run_stage00_replacement(
     old_total_rows = _sum_group_rows(state.get("stage00_groups", []))
     old_target_rows = _sum_group_rows(old_target_groups.values())
 
+    transaction = _Stage00Transaction(config.output_dir)
     builder = _Stage00Builder(
         config,
         existing_state=state,
         preserve_existing_topology=True,
+        transaction=transaction,
     )
     builder.remove_input_shards(target_shards, state)
-    processed_input_shards, input_files = _process_input_shards(
-        builder,
-        selected_input_shards,
-        batch_size=config.batch_size,
-    )
-    builder.finish(compact_shard_ids=target_shards)
-    report = builder.report(
-        processed_input_shards=processed_input_shards,
-        input_files=input_files,
-    )
-    report["replacement_mode"] = True
+    try:
+        processed_input_shards, input_files = _process_input_shards(
+            builder,
+            selected_input_shards,
+            batch_size=config.batch_size,
+        )
+        builder.finish(compact_shard_ids=target_shards)
+    except Exception:
+        builder._close_all_writers()
+        raise
 
+    candidate_groups = _replacement_group_reports(
+        config,
+        builder=builder,
+        published_groups=state.get("stage00_groups", []),
+        target_shards=target_shards,
+    )
     new_target_groups = {
         group["key"]: group
-        for group in report["groups"]
+        for group in candidate_groups
         if group["input_shard_id"] in target_shards
     }
-    _validate_stage00_replacement_row_counts(
-        report,
-        old_total_rows=old_total_rows,
-        old_target_rows=old_target_rows,
-        new_target_rows=_sum_group_rows(new_target_groups.values()),
-    )
     changed_group_keys = [
         key
         for key, group in sorted(new_target_groups.items())
@@ -1052,6 +1101,31 @@ def _run_stage00_replacement(
         == group["content_checksum"]
     ]
     deleted_group_keys = sorted(set(old_target_groups) - set(new_target_groups))
+
+    for key in unchanged_group_keys:
+        builder.reuse_existing_group(
+            candidate=new_target_groups[key],
+            existing=old_target_groups[key],
+        )
+    unchanged_group_key_set = set(unchanged_group_keys)
+    groups = [
+        _report_group(old_target_groups[group["key"]])
+        if group["key"] in unchanged_group_key_set
+        else group
+        for group in candidate_groups
+    ]
+    report = builder.report(
+        processed_input_shards=processed_input_shards,
+        input_files=input_files,
+        groups=groups,
+    )
+    report["replacement_mode"] = True
+    _validate_stage00_replacement_row_counts(
+        report,
+        old_total_rows=old_total_rows,
+        old_target_rows=old_target_rows,
+        new_target_rows=_sum_group_rows(new_target_groups.values()),
+    )
     report["changed_group_count"] = len(changed_group_keys)
     report["unchanged_group_count"] = len(unchanged_group_keys)
     report["deleted_group_count"] = len(deleted_group_keys)
@@ -1113,7 +1187,7 @@ def _run_stage00_replacement(
         )
         build_state["progress"] = progress
         next_state["stage00_build"] = build_state
-    _atomic_write_json(state_path, next_state)
+    transaction.commit_state(state_path, next_state)
     _atomic_write_json(config.output_dir / REPORT_NAME, report)
     return config.output_dir / REPORT_NAME
 
@@ -1138,6 +1212,45 @@ def _process_input_shards(
                 table = pa.Table.from_batches([batch])
                 builder.process_table(table, input_shard_id=input_shard.shard_id)
     return processed_input_shards, input_files
+
+
+def _replacement_group_reports(
+    config: Stage00Config,
+    *,
+    builder: _Stage00Builder,
+    published_groups: list[dict[str, Any]],
+    target_shards: set[str],
+) -> list[dict[str, Any]]:
+    """Checksum replacement candidates while trusting untouched published groups."""
+    published_by_key = {str(group["key"]): group for group in published_groups}
+    reports: list[dict[str, Any]] = []
+    for group in builder._group_reports(checksums=False):
+        if group["input_shard_id"] not in target_shards:
+            published = published_by_key.get(str(group["key"]))
+            if published is None:
+                raise ValueError(
+                    "Stage 00 replacement unexpectedly created a group for an "
+                    f"untargeted shard: {group['key']}"
+                )
+            if group["files"] != published.get("files") or int(
+                group["row_count"]
+            ) != int(published.get("row_count", -1)):
+                raise ValueError(
+                    f"Stage 00 replacement modified an untargeted group: {group['key']}"
+                )
+            reports.append(_report_group(published))
+            continue
+
+        paths = [config.output_dir / str(value) for value in group.get("files", [])]
+        checksum, row_count = _stage00_group_checksum(paths)
+        _ensure_equal_row_count(
+            before=int(group["row_count"]),
+            after=row_count,
+            context=f"checksumming replacement group {group['key']}",
+        )
+        group["content_checksum"] = checksum
+        reports.append(group)
+    return reports
 
 
 def _tree_manifest(config: Stage00Config) -> dict[str, Any]:

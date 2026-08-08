@@ -47,6 +47,7 @@ from .stage00 import (
 STAGE01_FORMAT = "foundinspace.octree.stage01/v0"
 STAGE01_GROUP_CHECKSUM_ALGORITHM = SEMANTIC_CHECKSUM_ALGORITHM
 STAGE01_SORT_KEY = "level,final_node_id,mag_abs,source,source_id"
+STAGE01_SORT_TIE_BREAKER = "remaining_columns_in_schema_order"
 TREE_DIR_NAME = "tree"
 REPORT_NAME = "stage01-report.json"
 STAGE01_IN_MEMORY_MAX_ROWS = 1_000_000
@@ -181,8 +182,6 @@ def run_stage01(config: Stage01Config) -> Path:
         prepared = _prepare_sorted_group(config, stage00_group)
         checksum = prepared.checksum
         new_files = list(prepared.files)
-        if old_group is not None:
-            _delete_stage01_group_files(config.output_dir, old_group)
         _publish_group_files(new_files)
         if prepared.external_sort:
             external_sort_groups += 1
@@ -212,6 +211,12 @@ def run_stage01(config: Stage01Config) -> Path:
             group=existing_stage01_groups[key],
             changed=group_changed,
         )
+        if old_group is not None:
+            _delete_stage01_group_files(
+                config.output_dir,
+                old_group,
+                keep=set(new_files),
+            )
         _delete_untracked_stage01_group_files(
             config,
             stage00_group,
@@ -247,6 +252,7 @@ def run_stage01(config: Stage01Config) -> Path:
         "batch_size": config.batch_size,
         "fragment_target_rows": config.fragment_target_rows,
         "sort_key": STAGE01_SORT_KEY,
+        "sort_tie_breaker": STAGE01_SORT_TIE_BREAKER,
         "group_checksum_algorithm": STAGE01_GROUP_CHECKSUM_ALGORITHM,
         "force": config.force,
         "resumed": resumed,
@@ -325,7 +331,9 @@ def _stage00_group_files(
     stage00_output_dir: Path,
     group: dict[str, Any],
 ) -> list[Path]:
-    files = [stage00_output_dir / rel_path for rel_path in group.get("files", [])]
+    files = [
+        stage00_output_dir / rel_path for rel_path in sorted(group.get("files", []))
+    ]
     if not files:
         return []
     for path in files:
@@ -359,8 +367,14 @@ def _sorted_stage00_group(
 def _sorted_stage00_group_files(files: list[Path]) -> pa.Table:
     if not files:
         return pa.table({})
-    tables = [pq.read_table(path) for path in files]
+    # ParquetFile reads the physical file schema without inferring Hive partition
+    # columns from the octree directory names.
+    tables = [pq.ParquetFile(path).read() for path in files]
     table = _align_tables_to_union_schema(tables)
+    return _sort_stage01_table(table)
+
+
+def _sort_stage01_table(table: pa.Table) -> pa.Table:
     if len(table) == 0:
         return table
     final_node_ids = _final_node_id_array(table)
@@ -368,20 +382,44 @@ def _sorted_stage00_group_files(files: list[Path]) -> pa.Table:
         "_stage01_final_node_id",
         pa.array(final_node_ids, type=pa.uint64()),
     )
+    primary_columns = {
+        "level",
+        "mag_abs",
+        "source",
+        "source_id",
+    }
+    sort_keys = [
+        ("level", "ascending"),
+        ("_stage01_final_node_id", "ascending"),
+        ("mag_abs", "ascending"),
+        ("source", "ascending"),
+        ("source_id", "ascending"),
+    ]
+    sort_keys.extend(
+        (name, "ascending")
+        for name in table.column_names
+        if name not in primary_columns
+    )
     sorted_with_helper = sort_table.take(
         pc.sort_indices(
             sort_table,
-            sort_keys=[
-                ("level", "ascending"),
-                ("_stage01_final_node_id", "ascending"),
-                ("mag_abs", "ascending"),
-                ("source", "ascending"),
-                ("source_id", "ascending"),
-            ],
+            sort_keys=sort_keys,
             null_placement="at_end",
         )
     )
     return sorted_with_helper.drop(["_stage01_final_node_id"])
+
+
+def _canonicalize_stage01_arrow_buffers(table: pa.Table) -> pa.Table:
+    """Normalize DuckDB validity padding and hidden null values for hashing.
+
+    Arrow IPC includes bytes outside the logical value (validity padding and
+    values beneath null bits). An identity take uses Arrow's kernels to rebuild
+    those buffers exactly as the in-memory sort does, keeping checksums
+    engine-independent while retaining bounded batch memory.
+    """
+    indices = pa.array(np.arange(len(table), dtype=np.uint64))
+    return table.take(indices)
 
 
 def _ensure_stage01_group_row_count(
@@ -455,7 +493,7 @@ def _externally_sort_stage00_group(
             con.execute("SET memory_limit = ?", [STAGE01_EXTERNAL_SORT_MEMORY_LIMIT])
         if PRESERVE_INSERTION_ORDER is None:
             con.execute("SET preserve_insertion_order = false")
-        con.execute(_external_sort_query(files))
+        con.execute(_external_sort_query(files, schema=stats.schema))
         reader = con.to_arrow_reader(batch_size=config.batch_size)
         return _write_externally_sorted_batches(
             config,
@@ -469,8 +507,14 @@ def _externally_sort_stage00_group(
             shutil.rmtree(local_spill_dir, ignore_errors=True)
 
 
-def _external_sort_query(files: list[Path]) -> str:
+def _external_sort_query(files: list[Path], *, schema: pa.Schema) -> str:
     source = _duckdb_read_parquet_source(files)
+    primary_columns = {"level", "mag_abs", "source", "source_id"}
+    tie_breakers = "".join(
+        f",\n            {_quoted_identifier(name)} ASC NULLS LAST"
+        for name in schema.names
+        if name not in primary_columns
+    )
     return f"""
         WITH staged AS (
             SELECT
@@ -492,8 +536,12 @@ def _external_sort_query(files: list[Path]) -> str:
             _stage01_final_node_id ASC NULLS LAST,
             mag_abs ASC NULLS LAST,
             source ASC NULLS LAST,
-            source_id ASC NULLS LAST
+            source_id ASC NULLS LAST{tie_breakers}
     """
+
+
+def _quoted_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
 
 
 def _duckdb_read_parquet_source(files: list[Path]) -> str:
@@ -534,6 +582,7 @@ def _write_externally_sorted_batches(
             if not table.schema.equals(expected_schema, check_metadata=False):
                 table = table.cast(expected_schema)
             table = table.replace_schema_metadata(None)
+            table = _canonicalize_stage01_arrow_buffers(table)
             checksum.update(table)
             batch_max_level = _natural_max_level(table)
             if batch_max_level is not None:
@@ -625,7 +674,25 @@ def _sorted_fragment_path(
     kind = str(group["kind"])
     if kind not in {"pack", "lim"}:
         raise ValueError(f"Unsupported Stage 00 group kind: {kind!r}")
-    return directory / f"shard-{shard_id}-{kind}-sorted-{sequence:06d}.parquet"
+    version = _stage01_group_version(config, group)
+    return directory / (
+        f"shard-{shard_id}-{kind}-sorted-{version}-{sequence:06d}.parquet"
+    )
+
+
+def _stage01_group_version(config: Stage01Config, group: dict[str, Any]) -> str:
+    identity = json.dumps(
+        {
+            "format": STAGE01_FORMAT,
+            "fragment_target_rows": config.fragment_target_rows,
+            "input_checksum": group.get("content_checksum"),
+            "sort_key": STAGE01_SORT_KEY,
+            "sort_tie_breaker": STAGE01_SORT_TIE_BREAKER,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
 
 
 def _tmp_fragment_path(final_path: Path) -> Path:
@@ -635,13 +702,22 @@ def _tmp_fragment_path(final_path: Path) -> Path:
 def _publish_group_files(final_paths: list[Path]) -> None:
     for final_path in final_paths:
         tmp_path = _tmp_fragment_path(final_path)
-        os.replace(tmp_path, final_path)
+        if final_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        else:
+            os.replace(tmp_path, final_path)
 
 
-def _delete_stage01_group_files(output_dir: Path, group: dict[str, Any]) -> None:
+def _delete_stage01_group_files(
+    output_dir: Path,
+    group: dict[str, Any],
+    *,
+    keep: set[Path] | None = None,
+) -> None:
+    keep = keep or set()
     for rel_file in group.get("files", []):
         path = output_dir / rel_file
-        if path.exists():
+        if path not in keep and path.exists():
             path.unlink()
 
 
@@ -785,6 +861,9 @@ def _delete_stale_stage01_temp_files(output_dir: Path) -> None:
     for path in output_dir.rglob(".*.tmp"):
         if path.is_file():
             path.unlink()
+    for path in output_dir.glob(".stage01-sort-*.tmp"):
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def _delete_untracked_stage01_group_files(

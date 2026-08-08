@@ -309,12 +309,26 @@ def stage_01(
     default=None,
     help="Maximum stars in a packed v2 terminal subtree.",
 )
+@click.option(
+    "--intermediates-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Optional isolated directory for published Stage 02 intermediates.",
+)
+@click.option(
+    "--work-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Optional isolated directory for resumable Stage 02 work state.",
+)
 def stage_02(
     project_path: Path,
     retain_relocation_files: bool,
     max_level: int | None,
     star_format_version: str | None,
     terminal_waterline: int | None,
+    intermediates_dir: Path | None,
+    work_dir: Path | None,
 ) -> None:
     """Build the classic stars.octree from sorted Stage 01 groups."""
     from foundinspace.octree.classic import (
@@ -351,6 +365,8 @@ def stage_02(
             retain_relocation_files=retain_relocation_files,
             star_format_version=resolved_format_version,
             terminal_waterline=resolved_terminal_waterline,
+            intermediates_dir=intermediates_dir,
+            work_dir=work_dir,
         )
     )
     click.echo(

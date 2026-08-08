@@ -3,12 +3,14 @@ from __future__ import annotations
 import gzip
 import shutil
 import struct
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 from uuid import UUID
 
 from .assembly.formats import INDEX_FILE_HDR, INDEX_RECORD
-from .assembly.identity_encoder import decode_identity_rows
+from .assembly.identity_encoder import iter_identity_rows
 from .combine.lookup import FixedRecordFile
 from .combine.manifest import read_combine_manifest
 
@@ -18,6 +20,7 @@ HEADER_VERSION = 1
 HEADER_SIZE = HEADER_FMT.size
 DIRECTORY_RECORD_FMT = struct.Struct("<H2xQIQQ")
 DIRECTORY_RECORD_SIZE = DIRECTORY_RECORD_FMT.size
+IDENTITY_COMPRESSED_READ_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,10 +107,12 @@ class IdentifiersOrderReader:
     def __init__(self, path: Path):
         self._path = Path(path)
         self.header = read_header(self._path)
-        self._fp = open(self._path, "rb")  # noqa: SIM115
+        self._directory_fp = open(self._path, "rb")  # noqa: SIM115
+        self._payload_fp = open(self._path, "rb")  # noqa: SIM115
 
     def close(self) -> None:
-        self._fp.close()
+        self._directory_fp.close()
+        self._payload_fp.close()
 
     def __enter__(self) -> IdentifiersOrderReader:
         return self
@@ -115,37 +120,95 @@ class IdentifiersOrderReader:
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
-    def iter_cells(self):
-        self._fp.seek(self.header.directory_offset)
-        for idx in range(self.header.record_count):
-            raw = self._fp.read(DIRECTORY_RECORD_SIZE)
+    def iter_cell_identities(
+        self,
+    ) -> Iterator[tuple[IdentifiersOrderRecord, Iterator[tuple[str, str]]]]:
+        """Yield each cell with a bounded, single-use identity iterator.
+
+        The identity iterator must be consumed before requesting the next cell.
+        Any unconsumed identities are drained when iteration advances so the
+        next payload always starts at a validated cell boundary.
+        """
+        self._directory_fp.seek(self.header.directory_offset)
+        for _idx in range(self.header.record_count):
+            raw = self._directory_fp.read(DIRECTORY_RECORD_SIZE)
             if len(raw) != DIRECTORY_RECORD_SIZE:
                 raise ValueError("Identifiers/order directory truncated")
             level, node_id, star_count, payload_offset, payload_length = (
                 DIRECTORY_RECORD_FMT.unpack(raw)
             )
-            payload_abs = self.header.payload_offset + payload_offset
-            self._fp.seek(payload_abs)
-            compressed = self._fp.read(payload_length)
-            if len(compressed) != payload_length:
-                raise ValueError("Identifiers/order payload truncated")
-            identities = decode_identity_rows(
-                gzip.decompress(compressed), star_count=star_count
+            record = IdentifiersOrderRecord(
+                level=level,
+                node_id=node_id,
+                star_count=star_count,
+                payload_offset=payload_offset,
+                payload_length=payload_length,
             )
-            yield (
-                IdentifiersOrderRecord(
-                    level=level,
-                    node_id=node_id,
-                    star_count=star_count,
-                    payload_offset=payload_offset,
-                    payload_length=payload_length,
-                ),
-                identities,
+            identities = self._iter_record_identities(record)
+            yield record, identities
+            # Keep advancing safe even if a caller deliberately stops reading
+            # the current cell early.
+            for _identity in identities:
+                pass
+
+    def iter_cells(
+        self,
+    ) -> Iterator[tuple[IdentifiersOrderRecord, list[tuple[str, str]]]]:
+        """Compatibility API that materializes each cell's identity list."""
+        for record, identities in self.iter_cell_identities():
+            yield record, list(identities)
+
+    def _iter_record_identities(
+        self,
+        record: IdentifiersOrderRecord,
+    ) -> Iterator[tuple[str, str]]:
+        payload_abs = self.header.payload_offset + record.payload_offset
+        self._payload_fp.seek(payload_abs)
+        compressed = _BoundedFileSlice(
+            self._payload_fp,
+            length=record.payload_length,
+            max_read_bytes=IDENTITY_COMPRESSED_READ_BYTES,
+        )
+        with gzip.GzipFile(
+            filename="",
+            fileobj=compressed,
+            mode="rb",
+        ) as decompressed:
+            yield from iter_identity_rows(
+                decompressed,
+                star_count=record.star_count,
             )
-            next_dir_offset = (
-                self.header.directory_offset + (idx + 1) * DIRECTORY_RECORD_SIZE
-            )
-            self._fp.seek(next_dir_offset)
+        if compressed.remaining:
+            raise ValueError("Identifiers/order payload has trailing compressed bytes")
+
+
+class _BoundedFileSlice:
+    """Sequential read-only view over one compressed payload range."""
+
+    def __init__(
+        self,
+        source: BinaryIO,
+        *,
+        length: int,
+        max_read_bytes: int,
+    ) -> None:
+        if length < 0:
+            raise ValueError("Identifiers/order payload length must be >= 0")
+        if max_read_bytes <= 0:
+            raise ValueError("Identifiers/order read bound must be > 0")
+        self._source = source
+        self.remaining = length
+        self._max_read_bytes = max_read_bytes
+
+    def read(self, size: int = -1) -> bytes:
+        if self.remaining == 0:
+            return b""
+        if size is None or size < 0:
+            size = self._max_read_bytes
+        take = min(size, self.remaining, self._max_read_bytes)
+        data = self._source.read(take)
+        self.remaining -= len(data)
+        return data
 
 
 def combine_identifiers_order(

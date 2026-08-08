@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import struct
+from dataclasses import replace
 from pathlib import Path
 from uuid import UUID
 
@@ -991,6 +992,58 @@ def test_classic_build_reuses_completed_sorted_materialization(tmp_path: Path) -
     } == mtimes
 
 
+def test_classic_build_supports_isolated_intermediates_and_work_dirs(
+    tmp_path: Path,
+) -> None:
+    rows = [
+        {
+            "source_id": "a",
+            "morton_code": _morton_for_node(1, 0),
+            "level": 1,
+            "mag_abs": 7.0,
+            "x_icrs_pc": -100_000.0,
+            "y_icrs_pc": -100_000.0,
+            "z_icrs_pc": -100_000.0,
+        }
+    ]
+    _input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
+    v1_config = ClassicBuildConfig(
+        stage00_output_dir=stage00_dir,
+        stage01_output_dir=stage01_dir,
+        output_path=tmp_path / "stars-v1.octree",
+        identifiers_order_path=tmp_path / "identifiers-v1.order",
+        mag_limit=6.5,
+        max_level=1,
+        batch_size=10,
+        max_open_files=2,
+        star_format_version=1,
+    )
+    build_classic_artifacts(v1_config)
+    v1_intermediates = stage01_dir / "classic-intermediates"
+    assert (v1_intermediates / "render-manifest.json").is_file()
+
+    v2_intermediates = tmp_path / "v2-intermediates"
+    v2_work = tmp_path / "v2-work"
+    v2_config = replace(
+        v1_config,
+        output_path=tmp_path / "stars-v2.octree",
+        identifiers_order_path=tmp_path / "identifiers-v2.order",
+        star_format_version=2,
+        terminal_waterline=1,
+        intermediates_dir=v2_intermediates,
+        work_dir=v2_work,
+    )
+    build_classic_artifacts(v2_config)
+
+    assert (v1_intermediates / "render-manifest.json").is_file()
+    assert (v2_intermediates / "render-manifest.json").is_file()
+    assert v2_config.output_path.is_file()
+    assert v2_config.identifiers_order_path.is_file()
+    assert (v2_work / "classic-work-state.json").is_file()
+    assert (v2_work / "runs").is_dir()
+    assert (v2_work / "partition-cache").is_dir()
+
+
 @pytest.mark.parametrize("damage", ("missing-reference", "missing-level-file"))
 def test_classic_v2_rebuilds_damaged_published_terminal_map(
     tmp_path: Path,
@@ -1142,7 +1195,8 @@ def test_classic_build_resumes_completed_spatial_partitions(
         identifiers_uuid=_IDENTIFIERS_UUID,
     )
 
-    assert not work_dir.exists()
+    assert (work_dir / "classic-work-state.json").is_file()
+    assert (work_dir / "partition-cache").is_dir()
     manifest = json.loads(
         (stage01_dir / "classic-intermediates" / "render-manifest.json").read_text(
             encoding="utf-8"

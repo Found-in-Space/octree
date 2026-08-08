@@ -949,6 +949,148 @@ def test_stage00_replace_changed_shard_marks_changed_group(
     assert state["dirty"]["stage01_groups"] == ["|100|pack"]
 
 
+def test_stage00_replace_one_row_reuses_unchanged_groups_from_same_shard(
+    tmp_path: Path,
+) -> None:
+    input_root = tmp_path / "input"
+    original_rows = [
+        {
+            "source": "gaia",
+            "source_id": "changed-before",
+            "morton_code": _morton_for_node(1, 0),
+            "level": 1,
+            "mag_abs": 7.0,
+        },
+        {
+            "source": "gaia",
+            "source_id": "unchanged",
+            "morton_code": _morton_for_node(1, 1),
+            "level": 1,
+            "mag_abs": 7.1,
+        },
+    ]
+    _write_stage00_pixel(input_root, "100", original_rows)
+    out_dir = tmp_path / "stage00"
+    run_stage00(_stage00_config(input_root, out_dir, bucket_size=2))
+    _clear_stage01_dirty(out_dir)
+
+    before_state = json.loads(
+        (out_dir / "stage-state.json").read_text(encoding="utf-8")
+    )
+    before_groups = {group["key"]: group for group in before_state["stage00_groups"]}
+    unchanged_key = "o=1|100|pack"
+    changed_key = "o=0|100|pack"
+    assert set(before_groups) == {changed_key, unchanged_key}
+    unchanged_paths = [
+        out_dir / value for value in before_groups[unchanged_key]["files"]
+    ]
+    unchanged_stats = [
+        (path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes())
+        for path in unchanged_paths
+    ]
+    old_changed_paths = [
+        out_dir / value for value in before_groups[changed_key]["files"]
+    ]
+
+    replacement_rows = [dict(row) for row in original_rows]
+    replacement_rows[0]["source_id"] = "changed-after"
+    _write_stage00_pixel(input_root, "100", replacement_rows)
+    report_path = run_stage00(
+        _stage00_config(
+            input_root,
+            out_dir,
+            bucket_size=2,
+            shard_ids=("100",),
+            replace_shards=True,
+        )
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    after_state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
+    after_groups = {group["key"]: group for group in after_state["stage00_groups"]}
+    assert report["changed_group_count"] == 1
+    assert report["unchanged_group_count"] == 1
+    assert report["deleted_group_count"] == 0
+    assert after_state["dirty"]["stage01_groups"] == [changed_key]
+    assert after_state["dirty"]["deleted_stage00_groups"] == []
+
+    assert after_groups[unchanged_key] == before_groups[unchanged_key]
+    assert [
+        (path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes())
+        for path in unchanged_paths
+    ] == unchanged_stats
+    assert after_groups[changed_key]["files"] != before_groups[changed_key]["files"]
+    assert (
+        after_groups[changed_key]["content_checksum"]
+        != before_groups[changed_key]["content_checksum"]
+    )
+    assert all(not path.exists() for path in old_changed_paths)
+    assert not (out_dir / ".stage00-transaction.json").exists()
+
+
+def test_stage00_replace_recovers_uncommitted_candidates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_root = tmp_path / "input"
+    initial_row = {
+        "source": "gaia",
+        "source_id": "before",
+        "morton_code": _morton_for_node(1, 0),
+        "level": 1,
+        "mag_abs": 7.0,
+    }
+    _write_stage00_pixel(input_root, "100", [initial_row])
+    out_dir = tmp_path / "stage00"
+    run_stage00(_stage00_config(input_root, out_dir))
+    before_state = json.loads(
+        (out_dir / "stage-state.json").read_text(encoding="utf-8")
+    )
+    published_paths = [
+        out_dir / value for value in before_state["stage00_groups"][0]["files"]
+    ]
+
+    replacement_row = dict(initial_row)
+    replacement_row["source_id"] = "after"
+    _write_stage00_pixel(input_root, "100", [replacement_row])
+    original = stage00_module._replacement_group_reports
+
+    def interrupt_candidate_comparison(*args, **kwargs):
+        raise RuntimeError("candidate comparison interrupted")
+
+    monkeypatch.setattr(
+        stage00_module,
+        "_replacement_group_reports",
+        interrupt_candidate_comparison,
+    )
+    config = _stage00_config(
+        input_root,
+        out_dir,
+        shard_ids=("100",),
+        replace_shards=True,
+    )
+    with pytest.raises(RuntimeError, match="candidate comparison interrupted"):
+        run_stage00(config)
+
+    assert (
+        json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
+        == before_state
+    )
+    assert all(path.is_file() for path in published_paths)
+    assert (out_dir / ".stage00-transaction.json").is_file()
+
+    monkeypatch.setattr(stage00_module, "_replacement_group_reports", original)
+    run_stage00(config)
+
+    after_state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
+    assert (
+        after_state["stage00_groups"][0]["content_checksum"]
+        != before_state["stage00_groups"][0]["content_checksum"]
+    )
+    assert all(not path.exists() for path in published_paths)
+    assert not (out_dir / ".stage00-transaction.json").exists()
+
+
 def test_stage00_replace_records_deleted_group(tmp_path: Path) -> None:
     input_root = tmp_path / "input"
     root_row = {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -46,7 +47,7 @@ class _MetaBuilder:
 
     def write_payload(
         self,
-        identities: list[tuple[str, str]],
+        identities: Iterable[tuple[str, str]],
         target: BinaryIO,
     ) -> None:
         write_meta_payload(identities, self.ident_map, target)
@@ -110,7 +111,7 @@ def _build_family_intermediates(
         _family_builder(project, config) as builder,
         IdentifiersOrderReader(order_path) as reader,
     ):
-        iter_cells = reader.iter_cells()
+        iter_cells = reader.iter_cell_identities()
         current_level = -1
         shard_keys = ()
         shard_index = 0
