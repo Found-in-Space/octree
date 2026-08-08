@@ -1,6 +1,7 @@
 from .dfs import CellPayloadRef, iter_cells_dfs
 from .pipeline import (
     CombinePlan,
+    IndexEmissionStrategy,
     IndexPassResult,
     PayloadPassResult,
     combine_octree,
@@ -12,6 +13,7 @@ from .pipeline import (
 __all__ = [
     "CellPayloadRef",
     "CombinePlan",
+    "IndexEmissionStrategy",
     "IndexPassResult",
     "PayloadPassResult",
     "combine_octree",

@@ -10,7 +10,11 @@ from combine_helpers import (
     build_intermediates,
     build_sidecar_intermediates,
 )
-from foundinspace.octree.combine import CombinePlan, combine_octree
+from foundinspace.octree.combine import (
+    CombinePlan,
+    IndexEmissionStrategy,
+    combine_octree,
+)
 from foundinspace.octree.combine.records import (
     HEADER_FMT,
     HEADER_SIZE,
@@ -70,7 +74,16 @@ def test_combine_header_mag_limit_matches_manifest(tmp_path) -> None:
     assert hdr[11] == pytest.approx(4.25)
 
 
-def test_combine_v2_writes_v2_shard_and_node_star_count(tmp_path) -> None:
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        IndexEmissionStrategy.FORWARD,
+        IndexEmissionStrategy.TEMP_PWRITE_BATCHED,
+    ],
+)
+def test_combine_v2_writes_v2_shard_and_node_star_count(
+    tmp_path, strategy: IndexEmissionStrategy
+) -> None:
     manifest_path = build_intermediates(
         tmp_path / "intermediates",
         [PayloadNode(level=0, node_id=0, star_count=3, raw_payload=b"payload")],
@@ -80,7 +93,11 @@ def test_combine_v2_writes_v2_shard_and_node_star_count(tmp_path) -> None:
     combine_octree(
         manifest_path,
         out,
-        plan=CombinePlan(max_open_files=2, star_format_version=2),
+        plan=CombinePlan(
+            max_open_files=2,
+            star_format_version=2,
+            index_emission_strategy=strategy,
+        ),
         descriptor=PackedDescriptorFields(
             artifact_kind="render",
             dataset_uuid=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),

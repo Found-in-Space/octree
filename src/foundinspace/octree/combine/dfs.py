@@ -24,7 +24,7 @@ def iter_cells_dfs(
     *,
     max_open_files: int = 32,
 ) -> Iterator[CellPayloadRef]:
-    manifest = read_combine_manifest(manifest_path)
+    manifest = read_combine_manifest(manifest_path, deep_validation=False)
     lookup = IntermediateLookup(manifest, max_open_files=max_open_files)
     try:
         max_level = manifest.max_level

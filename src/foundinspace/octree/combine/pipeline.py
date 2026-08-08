@@ -34,6 +34,7 @@ from .records import (
     pack_top_level_header,
     validate_star_format_version,
 )
+from .streaming_index import IndexEmissionStrategy, write_streaming_index
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,12 +43,20 @@ class CombinePlan:
     lookup_cache_records: int = 65536
     retain_relocation_files: bool = False
     star_format_version: int = STAR_FORMAT_VERSION_V1
+    cache_dir: Path | None = None
+    skeleton_pack_count: int = 256
+    index_emission_strategy: IndexEmissionStrategy = (
+        IndexEmissionStrategy.TEMP_PWRITE_BATCHED
+    )
 
     def validate(self) -> None:
         if self.max_open_files <= 0:
             raise ValueError("max_open_files must be > 0")
         if self.lookup_cache_records <= 0:
             raise ValueError("lookup_cache_records must be > 0")
+        if self.skeleton_pack_count <= 0 or self.skeleton_pack_count > 4096:
+            raise ValueError("skeleton_pack_count must be in 1..4096")
+        IndexEmissionStrategy(self.index_emission_strategy)
         validate_star_format_version(self.star_format_version)
 
 
@@ -171,7 +180,7 @@ def combine_octree(
 ) -> None:
     t0 = time.perf_counter()
     plan.validate()
-    manifest = read_combine_manifest(manifest_path)
+    manifest = read_combine_manifest(manifest_path, deep_validation=False)
     if descriptor is None:
         descriptor = PackedDescriptorFields(artifact_kind=manifest.artifact_kind)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -265,7 +274,7 @@ def relocate_payloads_dfs(
     *,
     plan: CombinePlan,
 ) -> PayloadPassResult:
-    manifest = read_combine_manifest(manifest_path)
+    manifest = read_combine_manifest(manifest_path, deep_validation=False)
     shard_by_key = {
         (s.key.level, s.key.prefix_bits, s.key.prefix): s for s in manifest.shards
     }
@@ -504,6 +513,31 @@ def write_final_shard_index(
     *,
     plan: CombinePlan,
 ) -> IndexPassResult:
+    manifest = read_combine_manifest(manifest_path, deep_validation=False)
+    result = write_streaming_index(
+        manifest,
+        relocation_files,
+        output_fp,
+        max_open_files=plan.max_open_files,
+        star_format_version=plan.star_format_version,
+        skeleton_pack_count=plan.skeleton_pack_count,
+        emission_strategy=IndexEmissionStrategy(plan.index_emission_strategy),
+        cache_dir=plan.cache_dir or (manifest.root_dir / ".combine-index-cache"),
+    )
+    return IndexPassResult(
+        index_offset=result.index_offset,
+        index_length=result.index_length,
+    )
+
+
+def _write_final_shard_index_legacy(
+    manifest_path: Path,
+    relocation_files: tuple[Path, ...],
+    output_fp: BinaryIO,
+    *,
+    plan: CombinePlan,
+) -> IndexPassResult:
+    """Lookup-based writer retained only as a byte-compatibility test oracle."""
     manifest = read_combine_manifest(manifest_path)
     existence = IntermediateLookup(manifest, max_open_files=plan.max_open_files)
     relocation = RelocationLookup(relocation_files, max_open_files=plan.max_open_files)

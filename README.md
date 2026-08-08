@@ -19,7 +19,7 @@ At runtime, the viewer computes a visibility radius for each level. Bright-star 
 
 ## Build products
 
-The target architecture is a sequence of purpose-named, reusable products:
+The architecture is a sequence of purpose-named, reusable products:
 
 | Product/action | Input | Output |
 |---|---|---|
@@ -78,6 +78,20 @@ monolithic artifact may still need a complete sequential rewrite after a local
 change, but that rewrite reuses unchanged materialized partitions and does not
 repeat routing, sorting, topology planning, or encoding.
 
+Index packing is itself streaming. It compiles sorted node-ID streams into
+content-addressed five-level topology skeletons stored in a bounded number of
+spatial pack files. Payload offsets and lengths are deliberately excluded from
+that cache identity, so a payload-only change reuses the topology exactly. The
+default emitter writes one complete scratch index, patches each parent frontier
+table once at its recorded position, and copies the completed index sequentially
+into the final artifact. It performs no catalogue lookup to discover patch
+destinations and never seeks backwards in the final file. A prefix-sum emitter
+is available when scratch space is tighter; both emit byte-identical artifacts.
+
+An unchanged final render/identity pair is protected by a semantic checkpoint.
+When inputs and policy are unchanged, the build reuses the published files and
+their UUIDs without reopening catalogue-scale intermediates.
+
 Each render octree carries a `dataset_uuid`. Sidecars carry a `parent_dataset_uuid` so readers can validate the pairing before opening them.
 
 ## Installation
@@ -107,6 +121,19 @@ uv run fis-octree stage-01 --project project.toml
 uv run fis-octree stage-02 --project project.toml
 uv run fis-octree stage-03 --project project.toml
 ```
+
+`stage-02` defaults to the measured batched temporary-index emitter. The
+alternative below uses less scratch space while producing identical bytes:
+
+```bash
+uv run fis-octree stage-02 --project project.toml \
+  --index-emission-strategy forward
+```
+
+The default temporary-index strategy needs scratch capacity approximately equal
+to the final index section in addition to the atomic final-output temporary
+file. Its scratch files and topology cache live below the configured Stage 02
+work directory.
 
 These numeric names will remain usable during migration; they should not be
 copied into new product or manifest names.
@@ -168,7 +195,7 @@ src/foundinspace/octree/
   duckdb_util.py      # Shared DuckDB connection helper with env-variable tuning
   sources/            # Routed and sorted contribution preparation
   assembly/           # Shard assembly, manifests, build plan
-  combine/            # Final octree combine (DFS traversal, lookup, records)
+  combine/            # Payload relocation and streaming topology/index packing
   identifiers_order.py # identifiers.order artifact assembly
   stage3.py           # Current named sidecar family builder
   encoding/           # Morton code and Teff encoding utilities
@@ -198,6 +225,13 @@ uv run pytest
 ```
 
 Tests live under `tests/` and cover stage CLIs, assembly, combine phases, reader stats, and binary format encoding.
+
+The isolated index-emitter benchmark covers dense and sparse 2k/8k/16k
+fixtures, with an optional production-shaped 64k sparse case:
+
+```bash
+uv run python benchmarks/benchmark_combine_index.py --include-64k
+```
 
 ## Development
 

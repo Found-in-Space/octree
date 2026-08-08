@@ -310,6 +310,13 @@ def stage_01(
     help="Maximum stars in a packed v2 terminal subtree.",
 )
 @click.option(
+    "--index-emission-strategy",
+    type=click.Choice(("temp-pwrite-batched", "forward")),
+    default="temp-pwrite-batched",
+    show_default=True,
+    help=("Index emitter: batched temporary index, or lower-scratch forward output."),
+)
+@click.option(
     "--intermediates-dir",
     type=click.Path(path_type=Path),
     default=None,
@@ -327,6 +334,7 @@ def stage_02(
     max_level: int | None,
     star_format_version: str | None,
     terminal_waterline: int | None,
+    index_emission_strategy: str,
     intermediates_dir: Path | None,
     work_dir: Path | None,
 ) -> None:
@@ -335,6 +343,7 @@ def stage_02(
         ClassicBuildConfig,
         build_classic_artifacts,
     )
+    from foundinspace.octree.combine import IndexEmissionStrategy
 
     project = _load_project_or_die(project_path)
     resolved_max_level = (
@@ -365,6 +374,7 @@ def stage_02(
             retain_relocation_files=retain_relocation_files,
             star_format_version=resolved_format_version,
             terminal_waterline=resolved_terminal_waterline,
+            index_emission_strategy=IndexEmissionStrategy(index_emission_strategy),
             intermediates_dir=intermediates_dir,
             work_dir=work_dir,
         )
@@ -376,6 +386,7 @@ def stage_02(
         f"cells={result.cell_count:,}, "
         f"max_level={resolved_max_level}, "
         f"star_format_version={resolved_format_version}, "
+        f"index_emission_strategy={index_emission_strategy}, "
         "terminal_waterline="
         f"{resolved_terminal_waterline if resolved_format_version == 2 else 'disabled'}, "
         f"dataset_uuid={result.dataset_uuid}"

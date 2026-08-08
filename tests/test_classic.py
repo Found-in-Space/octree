@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import builtins
 import json
 import math
 import struct
+import threading
 from dataclasses import replace
 from pathlib import Path
 from uuid import UUID
@@ -12,13 +14,18 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+import foundinspace.octree.classic as classic
 import foundinspace.octree.classic_materialization as classic_materialization
 from foundinspace.octree.assembly import BuildPlan, build_intermediates
 from foundinspace.octree.classic import (
     ClassicBuildConfig,
     build_classic_artifacts,
 )
-from foundinspace.octree.combine import CombinePlan, combine_octree
+from foundinspace.octree.combine import (
+    CombinePlan,
+    IndexEmissionStrategy,
+    combine_octree,
+)
 from foundinspace.octree.combine.records import PackedDescriptorFields
 from foundinspace.octree.config import (
     MORTON_BITS,
@@ -41,6 +48,69 @@ from foundinspace.octree.sources.stage00 import (
     run_stage00,
 )
 from foundinspace.octree.sources.stage01 import Stage01Config, run_stage01
+
+
+def test_final_pair_lock_preserves_live_temp_across_work_dirs(tmp_path: Path) -> None:
+    output = tmp_path / "products" / "stars.octree"
+    identifiers = tmp_path / "products" / "identifiers.order"
+    base = ClassicBuildConfig(
+        stage00_output_dir=tmp_path / "stage00",
+        stage01_output_dir=tmp_path / "stage01",
+        output_path=output,
+        identifiers_order_path=identifiers,
+        mag_limit=6.5,
+        work_dir=tmp_path / "work-a",
+    )
+    competing = replace(base, work_dir=tmp_path / "work-b")
+    started = threading.Event()
+    finished = threading.Event()
+
+    def cleanup_from_competing_build() -> None:
+        started.set()
+        with classic._final_pair_locks(competing):
+            classic._clean_incomplete_final_products(output, identifiers)
+        finished.set()
+
+    with classic._final_pair_locks(base):
+        live = output.with_name(f".{output.name}.live.tmp")
+        live.write_bytes(b"still in use")
+        thread = threading.Thread(target=cleanup_from_competing_build)
+        thread.start()
+        assert started.wait(timeout=1)
+        assert not finished.wait(timeout=0.1)
+        assert live.is_file()
+
+    thread.join(timeout=2)
+    assert finished.is_set()
+    assert not live.exists()
+
+
+def test_emission_strategy_does_not_change_final_artifact_identity(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "stage00").mkdir()
+    (tmp_path / "stage01").mkdir()
+    base = ClassicBuildConfig(
+        stage00_output_dir=tmp_path / "stage00",
+        stage01_output_dir=tmp_path / "stage01",
+        output_path=tmp_path / "stars.octree",
+        identifiers_order_path=tmp_path / "identifiers.order",
+        mag_limit=6.5,
+    )
+    forward = replace(
+        base,
+        index_emission_strategy=IndexEmissionStrategy.FORWARD,
+    )
+
+    assert classic._final_base_identity(
+        base, input_identity="sha256:input"
+    ) == classic._final_base_identity(forward, input_identity="sha256:input")
+    with pytest.raises(ValueError, match="temp-pwrite-batched or forward"):
+        replace(
+            base,
+            index_emission_strategy=IndexEmissionStrategy.TEMP_PWRITE_PER_CHILD,
+        ).validate()
+
 
 _RENDER = struct.Struct("<fffhBB")
 _DATASET_UUID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
@@ -943,7 +1013,9 @@ def test_classic_build_externally_merges_folded_group_batches(
     ]
 
 
-def test_classic_build_reuses_completed_sorted_materialization(tmp_path: Path) -> None:
+def test_classic_build_reuses_completed_sorted_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     rows = [
         {
             "source_id": "a",
@@ -978,18 +1050,54 @@ def test_classic_build_reuses_completed_sorted_materialization(tmp_path: Path) -
         for path in intermediates_dir.iterdir()
         if path.is_file()
     }
+    final_before = {
+        path: (path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes())
+        for path in (config.output_path, config.identifiers_order_path)
+    }
+    stale_render = tmp_path / ".stars.octree.dead.tmp"
+    stale_identifiers = tmp_path / ".identifiers.order.dead.tmp"
+    stale_render.write_bytes(b"partial")
+    stale_identifiers.write_bytes(b"partial")
 
-    build_classic_artifacts(
-        config,
-        dataset_uuid=_DATASET_UUID,
-        identifiers_uuid=_IDENTIFIERS_UUID,
+    original_open = builtins.open
+
+    def reject_intermediate_open(path, *args, **kwargs):
+        name = str(path)
+        if name.endswith((".index", ".payload", ".ident-index", ".ident-payload")):
+            raise AssertionError(f"final no-op opened immutable intermediate: {path}")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", reject_intermediate_open)
+    monkeypatch.setattr(
+        classic,
+        "combine_octree",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("final no-op invoked render combine")
+        ),
     )
+    monkeypatch.setattr(
+        classic,
+        "combine_identifiers_order",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("final no-op invoked identifiers combine")
+        ),
+    )
+
+    reused = build_classic_artifacts(config)
 
     assert {
         path.name: path.stat().st_mtime_ns
         for path in intermediates_dir.iterdir()
         if path.is_file()
     } == mtimes
+    assert reused.dataset_uuid == _DATASET_UUID
+    assert reused.identifiers_uuid == _IDENTIFIERS_UUID
+    assert not stale_render.exists()
+    assert not stale_identifiers.exists()
+    assert {
+        path: (path.stat().st_ino, path.stat().st_mtime_ns, path.read_bytes())
+        for path in (config.output_path, config.identifiers_order_path)
+    } == final_before
 
 
 def test_classic_build_supports_isolated_intermediates_and_work_dirs(

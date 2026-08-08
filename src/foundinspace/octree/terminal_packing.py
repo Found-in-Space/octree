@@ -97,6 +97,14 @@ class TerminalMap:
         index = int(np.searchsorted(nodes, np.uint64(node_id)))
         return index < len(nodes) and int(nodes[index]) == int(node_id)
 
+    def iter_level(self, level: int) -> Iterator[int]:
+        """Iterate a terminal level in ascending order without random lookup."""
+        nodes = self._by_level.get(int(level))
+        if nodes is None:
+            return
+        for node_id in nodes:
+            yield int(node_id)
+
     def remap(
         self,
         levels: np.ndarray,

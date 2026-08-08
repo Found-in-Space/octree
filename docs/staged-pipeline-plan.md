@@ -45,12 +45,25 @@ Implemented or available on the current work branch:
   bounded fan-in merging, checkpointed group runs, and checkpointed spatial
   output partitions.
 - The compatibility `stage-02` path can materialize and pack the traditional
-  level-capped output as `stars.octree` plus `identifiers.order`.
+  level-capped or terminal-packed output as `stars.octree` plus
+  `identifiers.order`.
 - Materialization selects the final profile cell before encoding the
   node-relative render record. It preserves prepared order where possible and
   locally reorders only affected or overlapping cells.
 - Disjoint cells remain Arrow-streamed; oversized local sorting may use DuckDB
   when its native external sorter is the better execution engine.
+- Terminal topology is built from immutable per-group/per-level count runs,
+  bounded vectorized fan-in merges, and sequential bottom-up subtree counts.
+  Equal group or count identities reuse completed products without reopening
+  their source Parquet.
+- Final index topology is compiled from sorted node-ID streams into
+  content-addressed five-level skeleton packs. Its cache identity excludes
+  payload bytes, counts, lengths, and offsets.
+- The v1 packer is byte-equivalent to the legacy writer. Its default emitter
+  patches recorded parent frontier tables in a dedicated scratch index and then
+  copies forward; a prefix-sum emitter provides a lower-scratch alternative.
+- A semantic final-pair checkpoint reuses an unchanged `stars.octree` and
+  `identifiers.order` together with their UUIDs.
 - Render artifacts, identity order, and sidecars carry UUID-backed parent
   identities.
 
@@ -59,9 +72,9 @@ Compatibility limitations still to remove:
 - downstream preparation changes currently fall back to a shared
   `clean`/`all` invalidation marker;
 - per-cell count and content summaries are not yet a complete reusable product;
-- terminal-packed topology still needs the streamed count/topology design;
+- a genuine terminal-map change still has a global topology identity;
 - profile topology and materialized dependency manifests are not yet fully
-  partitioned;
+  partitioned or connected to field-specific identities;
 - the current monolithic packer rewrites complete artifacts; and
 - current numeric commands collapse several target products together.
 
@@ -255,9 +268,11 @@ Terminal-packed topology:
 4. selects shallowest eligible terminal roots; and
 5. publishes partitioned terminal mappings and ancestor summaries.
 
-One changed cell recomputes its containing topology partition and ancestor
-spine. If a terminal boundary moves, its covered subtree is invalidated. Other
-branches remain reusable.
+Steps 1 through 4 are implemented as immutable, checkpointed streaming
+products. Publication is currently one terminal-map identity; partitioned maps
+and ancestor summaries in step 5 remain. Until then, count-equivalent changes
+reuse topology exactly, while a genuine terminal-boundary change conservatively
+invalidates the global v2 mapping.
 
 ### Materialized buckets
 
@@ -306,6 +321,20 @@ Packing performs no source routing, Parquet sorting, topology aggregation, or
 row encoding. The current monolithic format may be rewritten sequentially from
 changed and reused materialized partitions. Partial publication is deferred to
 a separate sharded-container format decision.
+
+Index packing compiles ordered node-ID streams bottom-up through bounded fan-in
+merges. It caches logical five-level skeletons in a configured bounded number
+of immutable spatial pack files. Skeleton identity includes node presence,
+child/frontier shape, binary policy, and terminal decisions while excluding all
+payload and absolute-offset state.
+
+The default emitter writes a complete scratch index with zeroed child offsets,
+records each patch position as its parent is emitted, and writes each completed
+parent frontier table once. It performs neither catalogue lookup nor index
+search to discover a destination. It then copies the completed index
+sequentially to the final artifact. The alternative `forward` emitter derives
+child offsets by prefix sum and writes the same bytes directly with less
+scratch. Per-child positional writes are retained only as a benchmark control.
 
 ### Sidecars
 
@@ -419,36 +448,38 @@ Remaining work:
 
 ### C. Profile topology
 
-Status: classic level-cap policy exists in compatibility materialization.
+Status: classic level capping and streamed terminal count/selection are
+implemented. Count runs, aggregate levels, node levels, and terminal plans are
+immutable and restartable.
 
 Remaining work:
 
 - make classic mapping an explicit topology product;
-- replace catalogue-scale terminal count storage with sequential level files;
 - partition terminal topology and ancestor summaries;
 - validate subtree invalidation when terminal boundaries move.
 
 ### D. Shared materialization
 
-Status: bounded run-generation and fan-in merge helpers exist and classic
-materialization is moving onto them.
+Status: bounded run-generation, fan-in merge, encoding, and spatial partition
+checkpoints are shared by classic and terminal-packed materialization.
 
 Remaining work:
 
 - complete the output-neutral materialization API;
-- drive both profiles from explicit topology mappings;
+- drive both profiles from partitioned explicit topology mappings;
 - publish aligned render/identity partition manifests;
 - remove duplicated format-specific sorting and merging.
 
 ### E. Packing and sidecars
 
-Status: complete sequential packing, UUID identities, `identifiers.order`, and
+Status: complete sequential packing, topology-plan/skeleton reuse, byte-exact v1
+index output, UUID identities, `identifiers.order`, final-pair checkpoints, and
 schema-bearing sidecars exist.
 
 Remaining work:
 
-- constrain packing inputs to materialized products only;
-- reuse unchanged materialized partitions during complete repacks;
+- connect reused materialized partitions to exact dependency manifests;
+- production-accept the new index emitter on a controlled large build;
 - add sidecar partition reuse by sidecar identity;
 - evaluate a sharded final container separately from this migration.
 
@@ -463,22 +494,18 @@ Remaining work:
 - rename paths, config sections, and reports without mixing that migration into
   topology or materialization correctness work.
 
-## Suggested implementation order
+## Suggested remaining implementation order
 
 1. Freeze sorted cell-summary and dependency-record formats.
 2. Emit per-cell count and field-specific checksum runs during preparation.
-3. Make classic topology an explicit mapping and prove byte-equivalent v1
-   output through shared materialization.
-4. Implement sequential bottom-up terminal count aggregation.
-5. Implement partitioned terminal selection and changed-subtree invalidation.
-6. Move terminal-packed output onto shared materialization.
-7. Replace `clean`/`all` with partitioned dependency invalidation.
-8. Add one-star and one-HEALPix replacement integration tests.
-9. Restrict packing to materialized inputs and add reuse reporting.
-10. Introduce purpose-based CLI/config names and compatibility aliases.
-
-The v1 byte-equivalence milestone comes before reintroducing v2. It validates
-the shared streaming foundation against the trusted output.
+3. Partition terminal mappings and ancestor summaries.
+4. Connect profile materialization partitions to those exact identities.
+5. Replace `clean`/`all` with partitioned dependency invalidation.
+6. Add one-star and one-HEALPix replacement integration tests across both
+   profiles.
+7. Production-accept index packing and add reuse/I/O reporting.
+8. Evaluate a sharded final container independently.
+9. Introduce purpose-based CLI/config names and compatibility aliases.
 
 ## Validation plan
 

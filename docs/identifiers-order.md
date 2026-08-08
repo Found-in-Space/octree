@@ -6,16 +6,18 @@
 
 Its job is to preserve the canonical ordered star identities for one render octree dataset so later sidecar families can be rebuilt without reopening earlier pipeline stages.
 
-## Stage Placement
+## Product Placement
 
-The current pipeline is:
+`identifiers.order` is emitted beside `stars.octree` by packing. Both consume
+the same materialized cell stream, so cell membership and within-cell ordinal
+order cannot diverge. The current compatibility mapping is:
 
-- Stage 00: packed octree staging
-- Stage 01: in-place staging sort and compaction
-- Stage 02: optional payload re-encoding
-- Stage 03: canonical payload-order materialization
-- Stage 04: final `stars.octree` plus final `identifiers.order`
-- Stage 05: named sidecar families and derived indices
+- `stage-02`: topology planning, materialization, and packing of
+  `stars.octree` plus `identifiers.order`;
+- `stage-03`: named sidecars derived from that published pair.
+
+The durable architectural names are `materialize`, `pack`, and `sidecars`, not
+additional numbered stages.
 
 ## Primary Mapping
 
@@ -93,7 +95,8 @@ This artifact lets the base dataset package be archived as:
 - `stars.octree`
 - `identifiers.order`
 
-Stage 05 can then rebuild sidecars from that package plus fresh enrichment inputs, without depending on Stage 00 or Stage 01 outputs.
+The sidecar product can then rebuild enrichment artifacts from that package plus
+fresh enrichment inputs, without reopening routed or sorted catalogue products.
 
 ## Validation And Cache Identity
 

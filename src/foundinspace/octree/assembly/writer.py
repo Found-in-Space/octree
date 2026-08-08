@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import struct
 from collections.abc import Callable
 from pathlib import Path
 from typing import BinaryIO
@@ -67,6 +69,7 @@ class IntermediateShardWriter:
         self._shard = shard
         self._out_dir = out_dir
         self._record_count = 0
+        self._topology_digest = hashlib.sha256()
         self._last_node_id: int | None = None
         self._closed = False
         self._index_magic = index_magic if index_magic is not None else INDEX_MAGIC
@@ -180,6 +183,7 @@ class IntermediateShardWriter:
         payload_length: int,
         star_count: int,
     ) -> None:
+        self._topology_digest.update(struct.pack("<Q", int(key.node_id)))
         self._index_fp.write(
             INDEX_RECORD.pack(
                 key.node_id,
@@ -217,6 +221,7 @@ class IntermediateShardWriter:
             self._manifest_index_key: index_name,
             self._manifest_payload_key: payload_name,
             "record_count": self._record_count,
+            "topology_checksum": f"sha256:{self._topology_digest.hexdigest()}",
         }
 
     def abort(self) -> None:

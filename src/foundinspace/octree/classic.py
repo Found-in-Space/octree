@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import json
 import math
 import os
 import shutil
+from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -16,8 +20,13 @@ from .classic_materialization import (
     load_published_materialization,
     materialize_classic_groups,
 )
-from .combine import CombinePlan, combine_octree
-from .combine.records import PackedDescriptorFields
+from .combine import CombinePlan, IndexEmissionStrategy, combine_octree
+from .combine.records import (
+    DESCRIPTOR_SIZE,
+    HEADER_SIZE,
+    PackedDescriptorFields,
+    unpack_descriptor,
+)
 from .config import (
     DEFAULT_CLASSIC_MAX_LEVEL,
     DEFAULT_CLASSIC_PARTITION_FROM_LEVEL,
@@ -27,15 +36,20 @@ from .config import (
     MORTON_BITS,
 )
 from .identifiers_order import combine_identifiers_order
+from .identifiers_order import read_header as read_identifiers_header
 from .sources.stage00 import (
     STAGE_STATE_FORMAT,
     STAGE_STATE_NAME,
     TREE_MANIFEST_FORMAT,
     TREE_MANIFEST_NAME,
 )
+from .terminal_packing import TerminalMap
 
 CLASSIC_INTERMEDIATES_DIR_NAME = "classic-intermediates"
 CLASSIC_WORK_DIR_NAME = ".classic-intermediates.work"
+CLASSIC_FINAL_STATE_NAME = "classic-final-products.json"
+CLASSIC_FINAL_STATE_FORMAT = "foundinspace.octree.classic-final-products/v1"
+CLASSIC_COMBINE_ALGORITHM = "streaming-index-skeletons/v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +67,9 @@ class ClassicBuildConfig:
     retain_relocation_files: bool = False
     star_format_version: int = DEFAULT_STAR_FORMAT_VERSION
     terminal_waterline: int = DEFAULT_TERMINAL_WATERLINE
+    index_emission_strategy: IndexEmissionStrategy = (
+        IndexEmissionStrategy.TEMP_PWRITE_BATCHED
+    )
     intermediates_dir: Path | None = None
     work_dir: Path | None = None
 
@@ -77,6 +94,14 @@ class ClassicBuildConfig:
             raise ValueError("star_format_version must be 1 or 2")
         if self.terminal_waterline <= 0:
             raise ValueError("terminal_waterline must be > 0")
+        strategy = IndexEmissionStrategy(self.index_emission_strategy)
+        if strategy not in (
+            IndexEmissionStrategy.TEMP_PWRITE_BATCHED,
+            IndexEmissionStrategy.FORWARD,
+        ):
+            raise ValueError(
+                "index_emission_strategy must be temp-pwrite-batched or forward"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +118,175 @@ class ClassicBuildResult:
 
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _final_base_identity(config: ClassicBuildConfig, *, input_identity: str) -> str:
+    value = {
+        "format": CLASSIC_FINAL_STATE_FORMAT,
+        "algorithm": CLASSIC_COMBINE_ALGORITHM,
+        "input_identity": input_identity,
+        "star_format_version": config.star_format_version,
+        "terminal_waterline": (
+            config.terminal_waterline if config.star_format_version == 2 else None
+        ),
+        "output_path": str(config.output_path.resolve()),
+        "identifiers_order_path": str(config.identifiers_order_path.resolve()),
+    }
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _file_stat_record(path: Path) -> dict[str, int]:
+    stat = path.stat()
+    return {
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def _load_final_state(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = _read_json(path)
+        return raw if raw.get("format") == CLASSIC_FINAL_STATE_FORMAT else None
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _state_uuid(
+    state: dict[str, Any] | None, *, base_identity: str, key: str
+) -> UUID | None:
+    if state is None or state.get("base_identity") != base_identity:
+        return None
+    try:
+        return UUID(str(state[key]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _final_pair_is_valid(
+    state: dict[str, Any],
+    *,
+    config: ClassicBuildConfig,
+    base_identity: str,
+    dataset_uuid: UUID,
+    identifiers_uuid: UUID,
+) -> bool:
+    try:
+        if state.get("base_identity") != base_identity:
+            return False
+        if state.get("dataset_uuid") != str(dataset_uuid):
+            return False
+        if state.get("identifiers_uuid") != str(identifiers_uuid):
+            return False
+        for key in ("row_count", "folded_row_count", "cell_count"):
+            if int(state[key]) < 0:
+                return False
+        if _file_stat_record(config.output_path) != state.get("render_file"):
+            return False
+        if _file_stat_record(config.identifiers_order_path) != state.get(
+            "identifiers_file"
+        ):
+            return False
+        with open(config.output_path, "rb") as fp:
+            fp.seek(HEADER_SIZE)
+            descriptor = unpack_descriptor(fp.read(DESCRIPTOR_SIZE))
+        identifiers = read_identifiers_header(config.identifiers_order_path)
+        return (
+            descriptor.dataset_uuid == dataset_uuid
+            and identifiers.parent_dataset_uuid == dataset_uuid
+            and identifiers.artifact_uuid == identifiers_uuid
+        )
+    except (KeyError, OSError, TypeError, ValueError):
+        return False
+
+
+def _published_topology_is_valid(
+    intermediates_dir: Path, *, config: ClassicBuildConfig
+) -> bool:
+    try:
+        manifest = _read_json(intermediates_dir / "render-manifest.json")
+        terminal_path = manifest.get("terminal_map_path")
+        if config.star_format_version == 1:
+            return terminal_path is None
+        if not isinstance(terminal_path, str) or not terminal_path:
+            return False
+        terminal_map = TerminalMap(intermediates_dir / terminal_path)
+        return (
+            terminal_map.max_level == config.max_level
+            and terminal_map.waterline == config.terminal_waterline
+        )
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def _atomic_write_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    with open(temporary, "w", encoding="utf-8") as fp:
+        json.dump(value, fp, indent=2, sort_keys=True)
+        fp.write("\n")
+        fp.flush()
+        os.fsync(fp.fileno())
+    os.replace(temporary, path)
+
+
+def _clean_incomplete_final_products(*paths: Path) -> None:
+    for path in paths:
+        if not path.parent.is_dir():
+            continue
+        for temporary in path.parent.glob(f".{path.name}.*.tmp"):
+            if temporary.is_file():
+                temporary.unlink()
+
+
+@contextmanager
+def _final_pair_locks(config: ClassicBuildConfig):
+    work_dir = config.work_dir or (config.stage01_output_dir / CLASSIC_WORK_DIR_NAME)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    config.output_path.parent.mkdir(parents=True, exist_ok=True)
+    config.identifiers_order_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_paths = sorted(
+        {
+            work_dir / ".classic-build.lock",
+            config.output_path.parent
+            / f".{config.output_path.name}.classic-build.lock",
+            config.identifiers_order_path.parent
+            / f".{config.identifiers_order_path.name}.classic-build.lock",
+        },
+        key=lambda path: str(path.resolve()),
+    )
+    lock_files = []
+    try:
+        for path in lock_paths:
+            fp = open(path, "a+b")  # noqa: SIM115
+            lock_files.append(fp)
+            fcntl.flock(fp.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        while lock_files:
+            fp = lock_files.pop()
+            fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+            fp.close()
+
+
+def _serialize_final_pair_build(function):
+    @wraps(function)
+    def locked(
+        config: ClassicBuildConfig,
+        *,
+        dataset_uuid: UUID | None = None,
+        identifiers_uuid: UUID | None = None,
+    ) -> ClassicBuildResult:
+        with _final_pair_locks(config):
+            return function(
+                config,
+                dataset_uuid=dataset_uuid,
+                identifiers_uuid=identifiers_uuid,
+            )
+
+    return locked
 
 
 def _tracked_stage01_groups(
@@ -203,6 +397,7 @@ def _publish_intermediates(
         shutil.rmtree(temporary_dir, ignore_errors=True)
 
 
+@_serialize_final_pair_build
 def build_classic_artifacts(
     config: ClassicBuildConfig,
     *,
@@ -230,15 +425,51 @@ def build_classic_artifacts(
     intermediates_dir = config.intermediates_dir or (
         config.stage01_output_dir / CLASSIC_INTERMEDIATES_DIR_NAME
     )
+    work_dir = config.work_dir or (config.stage01_output_dir / CLASSIC_WORK_DIR_NAME)
+    final_state_path = work_dir / CLASSIC_FINAL_STATE_NAME
+    _clean_incomplete_final_products(
+        config.output_path,
+        config.identifiers_order_path,
+        final_state_path,
+    )
+    base_identity = _final_base_identity(config, input_identity=input_identity)
+    final_state = _load_final_state(final_state_path)
+    cached_dataset_uuid = _state_uuid(
+        final_state, base_identity=base_identity, key="dataset_uuid"
+    )
+    cached_identifiers_uuid = _state_uuid(
+        final_state, base_identity=base_identity, key="identifiers_uuid"
+    )
+    resolved_dataset_uuid = dataset_uuid or cached_dataset_uuid or uuid4()
+    resolved_identifiers_uuid = identifiers_uuid or cached_identifiers_uuid or uuid4()
+    if (
+        final_state is not None
+        and _published_topology_is_valid(intermediates_dir, config=config)
+        and _final_pair_is_valid(
+            final_state,
+            config=config,
+            base_identity=base_identity,
+            dataset_uuid=resolved_dataset_uuid,
+            identifiers_uuid=resolved_identifiers_uuid,
+        )
+    ):
+        return ClassicBuildResult(
+            output_path=config.output_path,
+            identifiers_order_path=config.identifiers_order_path,
+            intermediates_dir=intermediates_dir,
+            dataset_uuid=resolved_dataset_uuid,
+            identifiers_uuid=resolved_identifiers_uuid,
+            row_count=int(final_state["row_count"]),
+            folded_row_count=int(final_state["folded_row_count"]),
+            cell_count=int(final_state["cell_count"]),
+        )
+
     materialized = load_published_materialization(
         intermediates_dir,
         input_identity=input_identity,
         plan=materialization_plan,
     )
     if materialized is None:
-        work_dir = config.work_dir or (
-            config.stage01_output_dir / CLASSIC_WORK_DIR_NAME
-        )
         materialized = materialize_classic_groups(
             groups=stage01_groups,
             work_dir=work_dir,
@@ -258,13 +489,11 @@ def build_classic_artifacts(
         intermediates_dir / materialized.identifiers_manifest_path.name
     )
 
-    resolved_dataset_uuid = dataset_uuid or uuid4()
-    resolved_identifiers_uuid = identifiers_uuid or uuid4()
     output_tmp = config.output_path.with_name(
-        f".{config.output_path.name}.{os.getpid()}.tmp"
+        f".{config.output_path.name}.{os.getpid()}.{uuid4().hex}.tmp"
     )
     identifiers_tmp = config.identifiers_order_path.with_name(
-        f".{config.identifiers_order_path.name}.{os.getpid()}.tmp"
+        f".{config.identifiers_order_path.name}.{os.getpid()}.{uuid4().hex}.tmp"
     )
     output_tmp.unlink(missing_ok=True)
     identifiers_tmp.unlink(missing_ok=True)
@@ -276,6 +505,10 @@ def build_classic_artifacts(
                 max_open_files=config.max_open_files,
                 retain_relocation_files=config.retain_relocation_files,
                 star_format_version=config.star_format_version,
+                index_emission_strategy=IndexEmissionStrategy(
+                    config.index_emission_strategy
+                ),
+                cache_dir=work_dir / ".combine-index-cache",
             ),
             descriptor=PackedDescriptorFields(
                 artifact_kind="render",
@@ -292,6 +525,20 @@ def build_classic_artifacts(
         config.output_path.parent.mkdir(parents=True, exist_ok=True)
         os.replace(identifiers_tmp, config.identifiers_order_path)
         os.replace(output_tmp, config.output_path)
+        _atomic_write_json(
+            final_state_path,
+            {
+                "format": CLASSIC_FINAL_STATE_FORMAT,
+                "base_identity": base_identity,
+                "dataset_uuid": str(resolved_dataset_uuid),
+                "identifiers_uuid": str(resolved_identifiers_uuid),
+                "render_file": _file_stat_record(config.output_path),
+                "identifiers_file": _file_stat_record(config.identifiers_order_path),
+                "row_count": materialized.row_count,
+                "folded_row_count": materialized.folded_row_count,
+                "cell_count": materialized.cell_count,
+            },
+        )
     finally:
         output_tmp.unlink(missing_ok=True)
         identifiers_tmp.unlink(missing_ok=True)

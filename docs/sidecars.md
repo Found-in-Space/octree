@@ -13,18 +13,18 @@ embedded schema, and decode typed records. A separate "sidecar family" registry
 is not part of the artifact model; names such as `meta` are sidecar artifact
 names or definitions used for build/discovery.
 
-## Stage Placement
+## Product Placement
 
-The target staged pipeline is:
+Sidecars consume a published render octree and its matching
+`identifiers.order`; they do not participate in routing, topology planning, or
+base materialization. The current compatibility mapping is:
 
-- Stage 00: packed octree staging
-- Stage 01: in-place staging sort and compaction
-- Stage 03: output-profile assembly, including `stars.octree`,
-  `identifiers.order`, and sidecar artifacts
+- `stage-02` publishes `stars.octree` and `identifiers.order`;
+- `stage-03` builds the configured sidecar families from those artifacts.
 
-Stage 03 builds sidecars for one output profile at a time. The `classic` and
-`unbounded` profiles must get separate sidecar artifacts because their node sets
-and identity order can differ.
+Each output profile must get separate sidecar artifacts because its node set and
+identity order may differ. The purpose-based architectural action is
+`sidecars`; `stage-03` is its current compatibility command.
 
 ## Core Invariants
 
@@ -39,10 +39,11 @@ Each sidecar payload entry corresponds to exactly one render cell identified by:
 
 Within a cell, sidecar star order must match render star order exactly.
 
-The canonical ordering carried by the Stage 03 output profile is:
+The canonical ordering carried by the materialized output profile is:
 
 - `node_id`
 - `mag_abs`
+- `source`
 - `source_id`
 
 ### R3. UUID Compatibility First
@@ -138,10 +139,12 @@ These intermediates use the same shard structure as render intermediates, but wi
 
 ## Final Artifacts
 
-Each final sidecar is written to a profile-specific path. In the target profile
-layout:
+The current compatibility builder writes each selected family to:
 
-- `paths.stage03_output_dir/<profile>/sidecars/<sidecar-name>.octree`
+- `paths.stage03_output_dir/<sidecar-name>.octree`
+
+A future multi-profile directory layout must keep separate artifacts per
+profile; that path migration is independent of the artifact format.
 
 The final sidecar octree keeps the STAR top-level header and adds the mandatory descriptor block immediately after it.
 

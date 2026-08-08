@@ -25,6 +25,7 @@ def _validate_index_payload_pair(
     payload_rel: str,
     *,
     expected_magic: bytes,
+    deep: bool = True,
 ) -> None:
     index_path = out_dir / index_rel
     payload_path = out_dir / payload_rel
@@ -71,6 +72,9 @@ def _validate_index_payload_pair(
                 f"{actual_bytes // INDEX_RECORD.size}"
             )
 
+        if not deep:
+            return
+
         prev_node_id: int | None = None
         for i in range(record_count):
             rec_data = f.read(INDEX_RECORD.size)
@@ -95,16 +99,17 @@ def manifest_entries(manifest: dict) -> list[dict]:
     for level_entry in manifest.get("levels", []):
         level = int(level_entry["level"])
         for shard in level_entry.get("shards", []):
-            entries.append(
-                {
-                    "level": level,
-                    "prefix_bits": int(shard["prefix_bits"]),
-                    "prefix": int(shard["prefix"]),
-                    "index_path": str(shard["index_path"]),
-                    "payload_path": str(shard["payload_path"]),
-                    "record_count": int(shard["record_count"]),
-                }
-            )
+            entry = {
+                "level": level,
+                "prefix_bits": int(shard["prefix_bits"]),
+                "prefix": int(shard["prefix"]),
+                "index_path": str(shard["index_path"]),
+                "payload_path": str(shard["payload_path"]),
+                "record_count": int(shard["record_count"]),
+            }
+            if "topology_checksum" in shard:
+                entry["topology_checksum"] = str(shard["topology_checksum"])
+            entries.append(entry)
     return entries
 
 
@@ -125,6 +130,19 @@ def validate_shard(out_dir: Path, entry: dict, *, expected_magic: bytes) -> None
         str(entry["index_path"]),
         str(entry["payload_path"]),
         expected_magic=expected_magic,
+    )
+
+
+def validate_shard_structure(
+    out_dir: Path, entry: dict, *, expected_magic: bytes
+) -> None:
+    """Validate immutable shard headers and lengths without scanning records."""
+    _validate_index_payload_pair(
+        out_dir,
+        str(entry["index_path"]),
+        str(entry["payload_path"]),
+        expected_magic=expected_magic,
+        deep=False,
     )
 
 
@@ -151,15 +169,16 @@ def write_manifest(
         shards = sorted(levels_map[lvl], key=lambda e: e["prefix"])
         level_shards = []
         for s in shards:
-            level_shards.append(
-                {
-                    "prefix_bits": s["prefix_bits"],
-                    "prefix": s["prefix"],
-                    "index_path": s["index_path"],
-                    "payload_path": s["payload_path"],
-                    "record_count": s["record_count"],
-                }
-            )
+            level_shard = {
+                "prefix_bits": s["prefix_bits"],
+                "prefix": s["prefix"],
+                "index_path": s["index_path"],
+                "payload_path": s["payload_path"],
+                "record_count": s["record_count"],
+            }
+            if "topology_checksum" in s:
+                level_shard["topology_checksum"] = str(s["topology_checksum"])
+            level_shards.append(level_shard)
         levels.append(
             {
                 "level": lvl,

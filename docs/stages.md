@@ -159,10 +159,12 @@ render payloads.
 - The terminal-packed profile aggregates ordered cell-count runs bottom-up and
   selects the shallowest eligible terminal root.
 
-Terminal counts should be sequential level or spatial-partition products. A
-changed leaf updates its containing partition and the small ancestor spine. If
-a terminal decision changes, the covered subtree is the correct invalidation
-unit; unrelated branches remain reusable.
+Terminal counts are immutable sequential per-group and per-level products.
+Bounded fan-in merges and bottom-up aggregation reuse equal groups, aggregate
+levels, node levels, and completed terminal plans. The published terminal map
+still has one global identity when a terminal decision genuinely changes.
+Partitioned maps and a small ancestor spine remain the refinement needed to
+limit that case to the changed subtree.
 
 Topology policy is profile-specific. Count aggregation, partitioning,
 checkpointing, and sequential merge mechanics are shared.
@@ -193,6 +195,62 @@ verified immutable outputs.
 Packing consumes materialized byte ranges and manifests only. It must not read
 source Parquet, repeat routing, recalculate topology, or independently rebuild
 identity order.
+
+STAR index packing compiles the sorted cell indexes bottom-up into sorted
+logical topology runs. A bounded fan-in merge orders those nodes exactly as the
+five-level final shards are written. Each five-level logical skeleton is
+content-addressed, while the physical skeleton bytes are range-partitioned by
+their level-four spatial ancestor into a configured, bounded number of
+content-addressed pack files in the durable classic work directory. Skeletons
+record node presence, payload presence, child masks, frontier count and terminal
+policy, but deliberately exclude payload bytes, lengths, star counts and all
+absolute offsets. Payload relocation is then a sequential merge with the
+skeleton stream.
+
+The selected emitter writes complete shards with zeroed frontier tables to one
+dedicated scratch index. A bounded DFS stack records direct child offsets and
+patches each completed parent frontier table with one positional write. The
+completed index is copied to the final artifact in bounded sequential chunks;
+the final artifact itself is never sought backwards. The scratch index is the
+size of the final index section and is removed under the cache lock after copy
+or failure. A lower-scratch prefix-sum emitter remains available for comparison:
+it writes compact child-offset streams by five-level boundary and emits directly
+to the final artifact. Both consume the same immutable skeleton and relocation
+streams and produce byte-identical output.
+
+`stage-02 --index-emission-strategy temp-pwrite-batched` selects the default
+emitter. `--index-emission-strategy forward` selects the lower-scratch
+alternative. The per-child positional-write benchmark variant is intentionally
+not exposed as a production option. Because the two production emitters are
+byte-identical serialization mechanics, this operational choice is excluded
+from the final artifact's semantic identity.
+
+`benchmarks/benchmark_combine_index.py` compares both production emitters and a
+per-child control in isolated cold and warm processes. The acceptance matrix
+uses dense and sparse 2k/8k/16k fixtures plus an optional sparse 64k case with
+`node_id = i << 15`. In the reproduced sparse 64k run, batched emission took
+4.852 seconds cold and 2.475 seconds warm versus 5.056 and 2.616 seconds for
+forward emission. It reduced final-output writes from 64,003 to 14 and used
+three batched positional writes rather than 64,002 per-child writes. Dense 16k
+favored forward emission, so batched is selected for the production-shaped
+sparse topology, not as a universal winner. These fixture measurements do not
+replace acceptance on a controlled large build.
+
+Intermediate manifests carry a checksum of each shard's ordered node-ID
+stream. This lets payload-only changes reuse the topology plan without reading
+or compiling the topology again. Legacy manifests are scanned once and receive
+a local checksum checkpoint. Normal cache validation trusts immutable published
+files: it checks the compact plan checksum plus skeleton header, policy, size
+and pack existence metadata. Full pack hashes are verified at initial
+publication rather than reread on every restart. Cache compilation, publication,
+temporary cleanup and active-plan pruning share an exclusive cache lock, so one
+compiler cannot delete another compiler's live files.
+
+The classic final render/identifiers pair has a durable semantic checkpoint.
+An unchanged input/policy/descriptor identity reuses both artifacts and their
+UUIDs without opening the large intermediate files. The checkpoint is written
+only after both atomic file replacements. A crash between the two replacements
+leaves the old checkpoint invalid, so the next invocation rebuilds the pair.
 
 The current monolithic binary may require a full sequential rewrite after a
 local change because compressed payload offsets move. That is acceptable while

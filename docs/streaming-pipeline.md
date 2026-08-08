@@ -1,6 +1,6 @@
 # Streaming Octree Pipeline
 
-This document defines the target octree build architecture. Numeric stage names
+This document defines the octree build architecture. Numeric stage names
 are compatibility labels only; durable products and commands should be named by
 their purpose.
 
@@ -101,9 +101,12 @@ Topology maps natural cells to final profile cells without encoding rows.
   selects shallowest eligible terminal roots.
 
 Terminal counts are sequential per-level or spatial-partition files. A changed
-partition emits a root summary into a small ancestor spine. Only changed
-branches are reconsidered; if a terminal boundary moves, its covered subtree is
-the correct invalidation unit.
+group reuses every equal immutable count run. The current terminal planner
+merges those runs into checkpointed per-level products and derives subtree
+counts sequentially, without a catalogue-scale mutable database. Its published
+terminal-map identity is still global when a terminal decision genuinely
+changes; spatially partitioned terminal mappings and ancestor spines are the
+remaining refinement needed to constrain that invalidation to changed branches.
 
 ### Materialized buckets
 
@@ -124,9 +127,37 @@ terminal packing may place the same row in different cells.
 Packing consumes only materialized byte ranges and manifests. It must not read
 source parquet or repeat routing, topology planning, row sorting, or encoding.
 
+The render index is compiled from intermediate node-ID streams rather than
+discovered through random catalogue lookups. A bottom-up bounded fan-in merge
+produces five-level logical skeletons in final write order. Skeletons contain
+node presence, payload presence, child masks, terminal policy, and frontier
+shape, but not payload bytes, star counts, lengths, or absolute offsets. They
+are content-addressed and stored in a configured bounded number of spatial pack
+files, allowing payload-only rebuilds to reuse the topology plan and packs.
+
+The default emitter writes complete shards with zeroed frontier tables to a
+dedicated scratch index. A bounded DFS frontier records each patch destination
+when its parent is written, fills direct child offsets as children begin, and
+patches each complete parent table with one positional write. It never searches
+an input or index to discover that destination. The finished scratch index is
+copied sequentially into the final artifact, which is never sought backwards.
+The scratch index is removed after success or failure under the cache lock.
+
+The `forward` emitter is a lower-scratch alternative. It performs a prefix-sum
+prepass, writes compact child-offset streams, and emits directly to the final
+artifact. Both production emitters consume the same immutable topology and
+relocation streams and are byte-identical. The per-child positional-write
+variant exists only as a benchmark control because its write amplification is
+unbounded with the child count.
+
 The current monolithic artifact can be rewritten sequentially from reused
 materialized partitions after a local change. True in-place or partial
 publication requires a separate sharded-container format decision.
+
+The final render and `identifiers.order` pair has its own semantic checkpoint.
+An exact no-op build reuses both files and their UUIDs; a crash before both
+atomic publications complete leaves the checkpoint invalid and causes a safe
+rebuild.
 
 ## One-star replacement
 
@@ -139,11 +170,17 @@ For a single changed star in a HEALPix shard:
 5. Compare old and new per-cell summaries.
 6. Recompute only affected topology branches.
 7. Rematerialize only dependent profile partitions.
-8. Repack final artifacts from changed and reused materialized partitions.
+8. Repack final artifacts from changed and reused materialized partitions,
+   reusing the index topology cache whenever node presence is unchanged.
 
 A no-op replacement stops after comparison. A star whose changed fields do not
 affect ordering, topology, or encoded payload should stop at the first matching
 semantic checksum appropriate to those fields.
+
+The current compatibility state still propagates some downstream changes with
+a conservative `clean`/`all` marker, and a changed terminal-map identity can
+invalidate v2 materialization globally. Those are dependency-indexing gaps, not
+reasons to abandon immutable contribution or topology reuse.
 
 ## Identity layers
 

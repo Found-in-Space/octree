@@ -7,6 +7,7 @@ from uuid import UUID
 from click.testing import CliRunner
 
 from foundinspace.octree._cli import cli
+from foundinspace.octree.combine import IndexEmissionStrategy
 
 
 def _write_project(
@@ -63,6 +64,9 @@ def test_stage02_help() -> None:
     assert "--max-level" in result.output
     assert "--star-format-version" in result.output
     assert "--terminal-waterline" in result.output
+    assert "--index-emission-strategy" in result.output
+    assert "temp-pwrite-batched" in result.output
+    assert "forward" in result.output
     assert "--intermediates-dir" in result.output
     assert "--work-dir" in result.output
 
@@ -121,6 +125,8 @@ def test_stage02_builds_classic_output_from_project(
             "1",
             "--terminal-waterline",
             "250",
+            "--index-emission-strategy",
+            "forward",
             "--intermediates-dir",
             str(tmp_path / "v2-intermediates"),
             "--work-dir",
@@ -137,9 +143,49 @@ def test_stage02_builds_classic_output_from_project(
     assert calls[0].max_level == 13
     assert calls[0].star_format_version == 1
     assert calls[0].terminal_waterline == 250
+    assert calls[0].index_emission_strategy == IndexEmissionStrategy.FORWARD
     assert calls[0].intermediates_dir == tmp_path / "v2-intermediates"
     assert calls[0].work_dir == tmp_path / "v2-work"
     assert "rows=12" in result.output
     assert "folded_rows=3" in result.output
     assert "star_format_version=1" in result.output
     assert "terminal_waterline=disabled" in result.output
+    assert "index_emission_strategy=forward" in result.output
+
+
+def test_stage02_defaults_to_batched_temporary_index(
+    monkeypatch, tmp_path: Path
+) -> None:
+    stage01_dir = tmp_path / "stage01"
+    stage01_dir.mkdir()
+    project_path = tmp_path / "project.toml"
+    _write_project(
+        project_path,
+        stage01_dir=stage01_dir,
+        output=tmp_path / "stars.octree",
+        identifiers_output=tmp_path / "identifiers.order",
+    )
+    calls = []
+
+    def _fake_build(config):
+        calls.append(config)
+        return SimpleNamespace(
+            row_count=1,
+            folded_row_count=0,
+            cell_count=1,
+            dataset_uuid=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            output_path=config.output_path,
+            identifiers_order_path=config.identifiers_order_path,
+        )
+
+    monkeypatch.setattr(
+        "foundinspace.octree.classic.build_classic_artifacts",
+        _fake_build,
+    )
+    result = CliRunner().invoke(
+        cli,
+        ["stage-02", "--project", str(project_path)],
+    )
+
+    assert result.exit_code == 0
+    assert calls[0].index_emission_strategy == IndexEmissionStrategy.TEMP_PWRITE_BATCHED

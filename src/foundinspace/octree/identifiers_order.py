@@ -218,7 +218,7 @@ def combine_identifiers_order(
     parent_dataset_uuid: UUID,
     artifact_uuid: UUID,
 ) -> None:
-    manifest = read_combine_manifest(manifest_path)
+    manifest = read_combine_manifest(manifest_path, deep_validation=False)
     if manifest.artifact_kind != "identifiers":
         raise ValueError(
             f"Expected identifiers manifest, got {manifest.artifact_kind!r}"

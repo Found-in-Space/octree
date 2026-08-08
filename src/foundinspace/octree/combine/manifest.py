@@ -9,7 +9,11 @@ from ..assembly.formats import (
     MANIFEST_FORMAT,
     PAYLOAD_CODEC,
 )
-from ..assembly.manifest import read_manifest_file, validate_shard
+from ..assembly.manifest import (
+    read_manifest_file,
+    validate_shard,
+    validate_shard_structure,
+)
 from ..assembly.types import ShardKey
 
 
@@ -19,6 +23,7 @@ class ShardEntry:
     index_path: Path
     payload_path: Path
     record_count: int
+    topology_checksum: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,7 +47,9 @@ def _parse_world_center(raw: object) -> tuple[float, float, float]:
     return (float(raw[0]), float(raw[1]), float(raw[2]))
 
 
-def read_combine_manifest(manifest_path: Path) -> CombineManifest:
+def read_combine_manifest(
+    manifest_path: Path, *, deep_validation: bool = True
+) -> CombineManifest:
     raw = read_manifest_file(manifest_path)
     got_format = str(raw.get("format", ""))
     if got_format != MANIFEST_FORMAT:
@@ -101,7 +108,8 @@ def read_combine_manifest(manifest_path: Path) -> CombineManifest:
                 "payload_path": str(shard["payload_path"]),
                 "record_count": int(shard["record_count"]),
             }
-            validate_shard(root_dir, entry_dict, expected_magic=index_magic)
+            validator = validate_shard if deep_validation else validate_shard_structure
+            validator(root_dir, entry_dict, expected_magic=index_magic)
             key = ShardKey(
                 level=level,
                 prefix_bits=entry_dict["prefix_bits"],
@@ -113,6 +121,11 @@ def read_combine_manifest(manifest_path: Path) -> CombineManifest:
                     index_path=root_dir / entry_dict["index_path"],
                     payload_path=root_dir / entry_dict["payload_path"],
                     record_count=entry_dict["record_count"],
+                    topology_checksum=(
+                        str(shard["topology_checksum"])
+                        if "topology_checksum" in shard
+                        else None
+                    ),
                 )
             )
 

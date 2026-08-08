@@ -4,7 +4,7 @@ STAR v2 adds terminal subtree packing and serialized payload star counts while
 leaving the existing header, descriptor, shard header, payload codec, and star
 record unchanged.
 
-## Stage 02 policy
+## Compatibility build policy
 
 New project files default to:
 
@@ -60,6 +60,22 @@ cell topology and ordinal order.
 
 The waterline is build policy and is not serialized. `max_level` remains the
 configured classic level cap even when no emitted node reaches that level.
+
+## Shared index packing
+
+STAR v1 and v2 use the same streaming index compiler. Intermediate manifests
+carry a checksum of each ordered node-ID stream, and the topology-cache identity
+combines those checksums with skeleton and terminal policy. It excludes payload
+bytes, offsets, lengths, and star counts. Consequently, a v2 source change that
+preserves terminal decisions and node presence reuses the same topology plan and
+content-addressed skeleton packs even when payload counts or encoded bytes
+change.
+
+The default index emitter builds a dedicated scratch index and patches one
+recorded frontier table per parent before copying the completed index forward
+into the final artifact. The lower-scratch prefix-sum emitter writes the same
+bytes directly. Neither performs catalogue lookup during index emission, and
+the final artifact is never sought backwards.
 
 ## Binary layout
 
