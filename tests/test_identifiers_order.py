@@ -4,6 +4,8 @@ import gzip
 from itertools import islice
 from uuid import UUID
 
+import pytest
+
 import foundinspace.octree.identifiers_order as identifiers_order_module
 from combine_helpers import PayloadNode, build_identifiers_intermediates
 from foundinspace.octree.identifiers_order import (
@@ -116,3 +118,41 @@ def test_reader_streams_large_cell_identities_in_small_chunks(
 
     assert record.star_count == 37
     assert decoded == identities
+
+
+def test_reader_exposes_bounded_raw_identity_payloads(tmp_path) -> None:
+    identities = [("manual", "sun"), ("hip", "71683"), ("gaia", "123")]
+    manifest_path = build_identifiers_intermediates(
+        tmp_path / "intermediates",
+        [
+            PayloadNode(
+                level=0,
+                node_id=0,
+                star_count=len(identities),
+                raw_payload=b"",
+                identities=identities,
+            )
+        ],
+        max_level=0,
+    )
+    output_path = tmp_path / "identifiers.order"
+    combine_identifiers_order(
+        manifest_path,
+        output_path,
+        parent_dataset_uuid=DATASET_UUID,
+        artifact_uuid=ARTIFACT_UUID,
+    )
+
+    with IdentifiersOrderReader(output_path) as reader:
+        [(record, payload)] = list(
+            reader.iter_cell_identity_payloads(max_uncompressed_bytes=1024)
+        )
+    assert record.star_count == len(identities)
+    assert b"manual" in payload
+    assert b"71683" in payload
+
+    with (
+        IdentifiersOrderReader(output_path) as reader,
+        pytest.raises(ValueError, match="memory bound"),
+    ):
+        list(reader.iter_cell_identity_payloads(max_uncompressed_bytes=4))

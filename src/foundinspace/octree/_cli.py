@@ -51,6 +51,134 @@ def _load_project_or_die(project_path: Path):
         raise click.ClickException(str(exc)) from exc
 
 
+@cli.group("sidecars")
+def sidecars_group() -> None:
+    """Build optional enrichment artifacts for a published render octree."""
+
+
+@sidecars_group.command("visual-duplicates")
+@click.option(
+    "--project",
+    "project_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Project supplying the render octree and identifiers/order paths.",
+)
+@click.option(
+    "--evidence",
+    "evidence_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="One-to-one visual-duplicate evidence Parquet.",
+)
+@click.option(
+    "--output",
+    "output_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "Output sidecar path. Defaults beside the render octree as "
+        "<render>.visual-duplicates.octree."
+    ),
+)
+@click.option(
+    "--report",
+    "report_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Coverage report path. Defaults beside the sidecar.",
+)
+@click.option(
+    "--work-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Sparse intermediate directory. Defaults beside the sidecar.",
+)
+@click.option(
+    "--max-pairs",
+    type=click.IntRange(min=1),
+    default=1_000_000,
+    show_default=True,
+    help="Explicit memory bound for evidence pairs.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Replace an existing visual-duplicates sidecar, report, and work data.",
+)
+def visual_duplicates_sidecar(
+    project_path: Path,
+    evidence_path: Path,
+    output_path: Path | None,
+    report_path: Path | None,
+    work_dir: Path | None,
+    max_pairs: int,
+    force: bool,
+) -> None:
+    """Build the optional sparse Gaia-Hipparcos review sidecar."""
+    from foundinspace.octree.sidecars.visual_duplicates import (
+        VisualDuplicatesBuildConfig,
+        VisualDuplicatesScanProgress,
+        build_visual_duplicates_sidecar,
+    )
+
+    project = _load_project_or_die(project_path)
+    render_path = project.paths.stage02_output_path
+    resolved_output = output_path or render_path.with_name(
+        f"{render_path.stem}.visual-duplicates.octree"
+    )
+    resolved_report = report_path or resolved_output.with_name(
+        f"{resolved_output.stem}.report.json"
+    )
+    resolved_work_dir = work_dir or resolved_output.with_name(
+        f".{resolved_output.stem}.work"
+    )
+
+    last_reported_cells = -1
+
+    def report_progress(progress: VisualDuplicatesScanProgress) -> None:
+        nonlocal last_reported_cells
+        if progress.scanned_cells == last_reported_cells:
+            return
+        last_reported_cells = progress.scanned_cells
+        click.echo(
+            "Visual-duplicates scan: "
+            f"cells={progress.scanned_cells:,}/{progress.total_cells:,}, "
+            f"stars={progress.scanned_stars:,}, "
+            f"endpoints={progress.found_endpoints:,}/{progress.expected_endpoints:,}"
+        )
+
+    try:
+        result = build_visual_duplicates_sidecar(
+            VisualDuplicatesBuildConfig(
+                render_octree_path=render_path,
+                identifiers_order_path=project.paths.identifiers_order_output_path,
+                evidence_path=evidence_path,
+                output_path=resolved_output,
+                work_dir=resolved_work_dir,
+                report_path=resolved_report,
+                deep_shard_from_level=project.stage01.deep_shard_from_level,
+                deep_prefix_bits=project.stage01.deep_prefix_bits,
+                max_open_files=project.stage02.max_open_files,
+                max_evidence_pairs=max_pairs,
+                force=force,
+                progress=report_progress,
+            )
+        )
+    except (FileExistsError, FileNotFoundError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(
+        "Visual-duplicates sidecar: "
+        f"pairs={result.evidence_pair_count:,}, "
+        f"rendered_endpoints={result.rendered_endpoint_count:,}, "
+        f"payload_cells={result.payload_cell_count:,}, "
+        f"sidecar_uuid={result.sidecar_uuid}"
+    )
+    click.echo(f"Wrote {result.output_path}")
+    click.echo(f"Wrote {result.report_path}")
+
+
 @cli.command("stage-00")
 @click.option(
     "--project",

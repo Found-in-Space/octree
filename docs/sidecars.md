@@ -35,9 +35,11 @@ Each sidecar payload entry corresponds to exactly one render cell identified by:
 - `level`
 - `node_id`
 
-### R2. Same Star Order
+### R2. Stable Render Ordinals
 
-Within a cell, sidecar star order must match render star order exactly.
+Sidecar records identify stars by their ordinal in render order. Dense sidecars
+may encode one entry per render star in exactly that order. Sparse sidecars may
+encode only annotated ordinals, sorted in ascending order.
 
 The canonical ordering carried by the materialized output profile is:
 
@@ -45,6 +47,10 @@ The canonical ordering carried by the materialized output profile is:
 - `mag_abs`
 - `source`
 - `source_id`
+
+A sparse sidecar does not publish empty payloads. Its index contains payload
+nodes only for annotated cells, payload-free ancestors needed to route to those
+cells, and no node for an entirely empty branch.
 
 ### R3. UUID Compatibility First
 
@@ -123,6 +129,63 @@ path and measurements show that building the disk primary-key index dominates.
 
 Both backends preserve input request order, duplicate-map last-row-wins behavior,
 field normalization, and byte-identical gzip JSON payloads.
+
+## Optional `visual-duplicates` Sidecar
+
+The visual-duplicate sidecar is a diagnostic overlay for the collected
+one-to-one Gaia-Hipparcos supplemental display evidence. It is not an ordinary
+build product and does not change merge composition or the render octree.
+
+It is built only through the purpose-named command:
+
+```bash
+uv run fis-octree sidecars visual-duplicates \
+  --project project.toml \
+  --evidence path/to/fis_gaia_hip_supplemental_display_map.parquet
+```
+
+The evidence input must contain:
+
+- `gaia_source_id`
+- `hip_source_id`
+- `mapping_source`
+- `number_of_neighbours`
+- `angular_distance`
+
+Both endpoint columns must be one-to-one. The builder rejects evidence where an
+endpoint participates in more than one pair.
+
+### Sparse payload contract
+
+Only cells containing a rendered evidence endpoint carry a payload. Each
+payload is a gzip-compressed JSON array sorted by render `ordinal`. Every record
+contains:
+
+- `ordinal`: the endpoint's ordinal in the render cell;
+- `pair_id`: stable `gaia:<id>|hip:<id>` pair identity;
+- `role`: `gaia` or `hip`;
+- `identity`: the endpoint's stable catalog identity;
+- `counterpart_identity`: the rebuild-stable identity of the other endpoint;
+- `counterpart_ref`: the other endpoint's `{level, mortonCode, ordinal}` when
+  it is rendered, otherwise `null`;
+- `mapping_source`, `number_of_neighbours`, and
+  `angular_distance_arcsec`: source-evidence context.
+
+`counterpart_ref` omits `datasetId`: the sidecar descriptor's
+`parent_dataset_uuid` supplies it. A consumer constructs a full SkyKit
+`StarObjectRef` from that parent UUID and the stored cell/ordinal fields.
+
+The adjacent report records the evidence SHA-256, identity-order artifact UUID,
+parent dataset UUID, sidecar UUID, output SHA-256, payload cell count, and pair
+coverage for both, one, or neither rendered endpoint.
+
+### Bounded scan
+
+The builder scans `identifiers.order` once. It decompresses at most one bounded
+cell at a time, groups cells into a bounded byte batch, and uses vectorized
+identity matching rather than constructing a Python tuple for every rendered
+star. Only evidence endpoints and their resolved render references remain in
+memory. The evidence row count also has an explicit configurable bound.
 
 ## Intermediate Files
 

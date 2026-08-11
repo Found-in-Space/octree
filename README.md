@@ -122,6 +122,20 @@ uv run fis-octree stage-02 --project project.toml
 uv run fis-octree stage-03 --project project.toml
 ```
 
+Optional sidecars are not part of the ordinary base build. The visual-duplicate
+review artifact is built only when explicitly requested from a published render
+octree, its matching identity order, and the collected one-to-one evidence:
+
+```bash
+uv run fis-octree sidecars visual-duplicates \
+  --project project.toml \
+  --evidence ../catalogs/publications/20260515.1/catalog/fis_gaia_hip_supplemental_display_map.parquet
+```
+
+This purpose-named command defaults to
+`<render-name>.visual-duplicates.octree` beside the render artifact. It is not
+registered in `stage-03`, added to the starter project, or run by default.
+
 `stage-02` defaults to the measured batched temporary-index emitter. The
 alternative below uses less scratch space while producing identical bytes:
 
@@ -197,6 +211,7 @@ src/foundinspace/octree/
   assembly/           # Shard assembly, manifests, build plan
   combine/            # Payload relocation and streaming topology/index packing
   identifiers_order.py # identifiers.order artifact assembly
+  sidecars/            # Optional purpose-named sidecar builders
   stage3.py           # Current named sidecar family builder
   encoding/           # Morton code and Teff encoding utilities
   reader/             # Binary octree reader (header, index, payload, stats)

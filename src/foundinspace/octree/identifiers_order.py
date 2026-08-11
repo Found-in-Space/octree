@@ -21,6 +21,7 @@ HEADER_SIZE = HEADER_FMT.size
 DIRECTORY_RECORD_FMT = struct.Struct("<H2xQIQQ")
 DIRECTORY_RECORD_SIZE = DIRECTORY_RECORD_FMT.size
 IDENTITY_COMPRESSED_READ_BYTES = 64 * 1024
+IDENTITY_UNCOMPRESSED_CELL_LIMIT_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,21 +130,7 @@ class IdentifiersOrderReader:
         Any unconsumed identities are drained when iteration advances so the
         next payload always starts at a validated cell boundary.
         """
-        self._directory_fp.seek(self.header.directory_offset)
-        for _idx in range(self.header.record_count):
-            raw = self._directory_fp.read(DIRECTORY_RECORD_SIZE)
-            if len(raw) != DIRECTORY_RECORD_SIZE:
-                raise ValueError("Identifiers/order directory truncated")
-            level, node_id, star_count, payload_offset, payload_length = (
-                DIRECTORY_RECORD_FMT.unpack(raw)
-            )
-            record = IdentifiersOrderRecord(
-                level=level,
-                node_id=node_id,
-                star_count=star_count,
-                payload_offset=payload_offset,
-                payload_length=payload_length,
-            )
+        for record in self._iter_directory_records():
             identities = self._iter_record_identities(record)
             yield record, identities
             # Keep advancing safe even if a caller deliberately stops reading
@@ -157,6 +144,77 @@ class IdentifiersOrderReader:
         """Compatibility API that materializes each cell's identity list."""
         for record, identities in self.iter_cell_identities():
             yield record, list(identities)
+
+    def iter_cell_identity_payloads(
+        self,
+        *,
+        max_uncompressed_bytes: int = IDENTITY_UNCOMPRESSED_CELL_LIMIT_BYTES,
+    ) -> Iterator[tuple[IdentifiersOrderRecord, bytes]]:
+        """Yield bounded uncompressed identity payloads without decoding rows.
+
+        This is intended for vectorized or compiled scanners that can avoid
+        constructing one Python tuple per rendered star. The limit is applied
+        independently to every cell and protects callers from malformed or
+        unexpectedly large gzip members.
+        """
+        if max_uncompressed_bytes <= 0:
+            raise ValueError("Identity payload memory bound must be > 0")
+        for record in self._iter_directory_records():
+            yield (
+                record,
+                self._read_record_payload(
+                    record,
+                    max_uncompressed_bytes=max_uncompressed_bytes,
+                ),
+            )
+
+    def _iter_directory_records(self) -> Iterator[IdentifiersOrderRecord]:
+        self._directory_fp.seek(self.header.directory_offset)
+        for _idx in range(self.header.record_count):
+            raw = self._directory_fp.read(DIRECTORY_RECORD_SIZE)
+            if len(raw) != DIRECTORY_RECORD_SIZE:
+                raise ValueError("Identifiers/order directory truncated")
+            level, node_id, star_count, payload_offset, payload_length = (
+                DIRECTORY_RECORD_FMT.unpack(raw)
+            )
+            yield IdentifiersOrderRecord(
+                level=level,
+                node_id=node_id,
+                star_count=star_count,
+                payload_offset=payload_offset,
+                payload_length=payload_length,
+            )
+
+    def _read_record_payload(
+        self,
+        record: IdentifiersOrderRecord,
+        *,
+        max_uncompressed_bytes: int,
+    ) -> bytes:
+        payload_abs = self.header.payload_offset + record.payload_offset
+        self._payload_fp.seek(payload_abs)
+        compressed = _BoundedFileSlice(
+            self._payload_fp,
+            length=record.payload_length,
+            max_read_bytes=IDENTITY_COMPRESSED_READ_BYTES,
+        )
+        raw = bytearray()
+        with gzip.GzipFile(
+            filename="",
+            fileobj=compressed,
+            mode="rb",
+        ) as decompressed:
+            while chunk := decompressed.read(IDENTITY_COMPRESSED_READ_BYTES):
+                if len(raw) + len(chunk) > max_uncompressed_bytes:
+                    raise ValueError(
+                        "Identifiers/order cell exceeds the uncompressed "
+                        f"memory bound of {max_uncompressed_bytes} bytes: "
+                        f"({record.level}, {record.node_id})"
+                    )
+                raw.extend(chunk)
+        if compressed.remaining:
+            raise ValueError("Identifiers/order payload has trailing compressed bytes")
+        return bytes(raw)
 
     def _iter_record_identities(
         self,
