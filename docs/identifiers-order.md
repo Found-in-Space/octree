@@ -32,6 +32,11 @@ Each star identity is the canonical pair:
 
 This is a forward mapping optimized for sidecar generation rather than reverse lookup.
 
+The proposed range-addressable reverse mapping is specified separately in
+[`identity-lookup-index.md`](identity-lookup-index.md). It maps exact canonical
+identities back to cell records and render ordinals without requiring a client
+to download or scan this complete artifact.
+
 ## Binary Layout
 
 `identifiers.order` uses a compact binary layout:
@@ -121,4 +126,5 @@ The first implemented sidecar family is `meta`, but the same artifact can suppor
 
 - `docs/stages.md`
 - `docs/sidecars.md`
+- `docs/identity-lookup-index.md`
 - `docs/roadmap.md`

@@ -120,4 +120,5 @@ These remain part of every profile:
 - [`staged-pipeline-plan.md`](staged-pipeline-plan.md)
 - [`stages.md`](stages.md)
 - [`identifiers-order.md`](identifiers-order.md)
+- [`identity-lookup-index.md`](identity-lookup-index.md)
 - [`sidecars.md`](sidecars.md)

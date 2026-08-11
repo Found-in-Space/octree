@@ -227,6 +227,7 @@ Pipeline architecture and supporting notes:
 - [`docs/stages.md`](docs/stages.md)
 - [`docs/sidecars.md`](docs/sidecars.md)
 - [`docs/identifiers-order.md`](docs/identifiers-order.md)
+- [`docs/identity-lookup-index.md`](docs/identity-lookup-index.md)
 - [`docs/reader.md`](docs/reader.md)
 - [`docs/star-v2.md`](docs/star-v2.md)
 - [`docs/terminal-memory-testbed.md`](docs/terminal-memory-testbed.md)

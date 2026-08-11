@@ -187,6 +187,10 @@ identity matching rather than constructing a Python tuple for every rendered
 star. Only evidence endpoints and their resolved render references remain in
 memory. The evidence row count also has an explicit configurable bound.
 
+The proposed [`identity-lookup-index.md`](identity-lookup-index.md) locator
+would replace that full identity scan with bounded exact lookups. The locator
+is a reusable dataset companion rather than part of this optional sidecar.
+
 ## Intermediate Files
 
 The current implementation builds per-sidecar intermediate shard files under:
