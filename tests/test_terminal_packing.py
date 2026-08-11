@@ -50,7 +50,7 @@ def _build_map(
     )
     work_dir = tmp_path / "work"
     artifacts_dir = work_dir / "artifacts"
-    artifacts_dir.mkdir(parents=True)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
     manifest = build_terminal_map(
         groups=(group,),
         work_dir=work_dir,
@@ -119,6 +119,22 @@ def _build_groups(
     )
 
 
+def _topology_rows(terminal_map: TerminalMap, level: int) -> list[tuple[int, ...]]:
+    path = terminal_map.topology_path(level)
+    if path is None:
+        return []
+    return [
+        (
+            int(record["node_id"]),
+            int(record["child_mask"]),
+            int(record["flags"]),
+            int(record["brightest_level"]),
+        )
+        for records in terminal_packing._iter_logical_topology_chunks(path)
+        for record in records
+    ]
+
+
 def test_terminal_map_selects_shallowest_complete_subtrees(tmp_path: Path) -> None:
     terminal_map = _build_map(
         tmp_path,
@@ -133,6 +149,10 @@ def test_terminal_map_selects_shallowest_complete_subtrees(tmp_path: Path) -> No
     assert terminal_map.contains(1, 0) is True
     assert terminal_map.contains(1, 7) is True
     assert terminal_map.terminal_count == 2
+    assert _topology_rows(terminal_map, 1) == [
+        (0, 0, 3, 2),
+        (7, 0, 3, 2),
+    ]
 
     levels, nodes = terminal_map.remap(
         np.asarray([2, 2, 2], dtype=np.int16),
@@ -153,6 +173,30 @@ def test_terminal_map_includes_existing_root_payload(tmp_path: Path) -> None:
     )
 
     assert terminal_map.contains(0, 0) is True
+    assert _topology_rows(terminal_map, 0) == [(0, 0, 3, 0)]
+
+
+def test_terminal_map_preserves_uncapped_natural_level(tmp_path: Path) -> None:
+    terminal_map = _build_map(
+        tmp_path,
+        [(MORTON_BITS, 0, 1)],
+        waterline=1,
+        max_level=14,
+    )
+
+    assert _topology_rows(terminal_map, 0) == [(0, 0, 3, MORTON_BITS)]
+
+
+def test_terminal_map_streams_exact_folded_max_level_brightness(tmp_path: Path) -> None:
+    terminal_map = _build_map(
+        tmp_path,
+        [(MORTON_BITS, 0, 2)],
+        waterline=1,
+        max_level=14,
+    )
+
+    assert terminal_map.terminal_count == 0
+    assert _topology_rows(terminal_map, 14) == [(0, 0, 1, MORTON_BITS)]
 
 
 def test_terminal_map_does_not_mark_natural_leaf(tmp_path: Path) -> None:
@@ -212,6 +256,31 @@ def test_terminal_map_rejects_non_ascending_level_file(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="Non-ascending terminal node IDs"):
         TerminalMap(manifest_path)
+
+
+def test_terminal_map_rejects_same_size_topology_corruption(tmp_path: Path) -> None:
+    terminal_map = _build_map(
+        tmp_path,
+        [(2, 0, 1)],
+        waterline=1,
+    )
+    manifest_path = terminal_map.manifest_path
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    topology_path = manifest_path.parent / manifest["topology_levels"][0]["path"]
+    del terminal_map
+    corrupted = bytearray(topology_path.read_bytes())
+    corrupted[terminal_packing.LOGICAL_TOPOLOGY_HEADER.size + 10] ^= 1
+    topology_path.write_bytes(corrupted)
+
+    with pytest.raises(ValueError, match="Checksum mismatch"):
+        TerminalMap(manifest_path)
+
+    rebuilt = _build_map(
+        tmp_path,
+        [(2, 0, 1)],
+        waterline=1,
+    )
+    assert _topology_rows(rebuilt, 0) == [(0, 0, 3, 2)]
 
 
 def test_terminal_map_matches_reference_selection(tmp_path: Path) -> None:
@@ -375,11 +444,13 @@ def test_count_merge_combines_duplicate_at_chunk_watermark(tmp_path: Path) -> No
         tmp_path / "left.counts",
         left_nodes,
         np.ones(len(left_nodes), dtype=np.uint64),
+        brightest_levels=np.full(len(left_nodes), 10, dtype=np.uint8),
     )
     right = terminal_packing._write_count_arrays(
         tmp_path / "right.counts",
         np.asarray([1_023, 2_048], dtype=np.uint64),
         np.asarray([2, 1], dtype=np.uint64),
+        brightest_levels=np.asarray([8, 8], dtype=np.uint8),
     )
 
     merged = terminal_packing._merge_count_run_batch(
@@ -388,8 +459,8 @@ def test_count_merge_combines_duplicate_at_chunk_watermark(tmp_path: Path) -> No
     records = np.fromfile(merged.path, dtype=terminal_packing._COUNT_DTYPE)
 
     assert merged.record_count == 1_025
-    assert records[1_023].tolist() == (1_023, 3)
-    assert records[-1].tolist() == (2_048, 1)
+    assert records[1_023].tolist() == (1_023, 3, 8)
+    assert records[-1].tolist() == (2_048, 1, 8)
 
 
 def test_parent_count_combines_children_split_across_chunks(
@@ -399,16 +470,28 @@ def test_parent_count_combines_children_split_across_chunks(
     records = np.empty(9, dtype=terminal_packing._NODE_DTYPE)
     records["node_id"] = np.arange(9, dtype=np.uint64)
     records["subtree_count"] = np.ones(9, dtype=np.uint64)
-    records["has_descendants"] = 0
+    records["summary"] = terminal_packing._pack_node_summaries(
+        np.zeros(9, dtype=np.uint8),
+        np.arange(9, dtype=np.uint8),
+        np.ones(9, dtype=np.uint8),
+    )
     path = tmp_path / "nodes.bin"
     path.write_bytes(records.tobytes())
 
     chunks = list(terminal_packing._iter_parent_subtree_chunks(path))
-    nodes = np.concatenate([nodes for nodes, _counts in chunks])
-    counts = np.concatenate([counts for _nodes, counts in chunks])
+    nodes = np.concatenate([nodes for nodes, _counts, _brightest in chunks])
+    counts = np.concatenate([counts for _nodes, counts, _brightest in chunks])
+    brightest = np.concatenate([brightest for _nodes, _counts, brightest in chunks])
 
     assert nodes.tolist() == [0, 1]
     assert counts.tolist() == [8, 1]
+    assert brightest.tolist() == [0, 8]
+
+
+def test_packed_node_summary_does_not_widen_node_runs() -> None:
+    assert terminal_packing._NODE_DTYPE.itemsize == 17
+    assert terminal_packing._COUNT_DTYPE.itemsize == 17
+    assert terminal_packing.LOGICAL_TOPOLOGY_RECORD.size == 16
 
 
 def test_count_merge_rejects_uint64_total_overflow(tmp_path: Path) -> None:
@@ -416,11 +499,13 @@ def test_count_merge_rejects_uint64_total_overflow(tmp_path: Path) -> None:
         tmp_path / "left.counts",
         np.asarray([0], dtype=np.uint64),
         np.asarray([terminal_packing._MAX_U64], dtype=np.uint64),
+        brightest_levels=np.asarray([0], dtype=np.uint8),
     )
     right = terminal_packing._write_count_arrays(
         tmp_path / "right.counts",
         np.asarray([0], dtype=np.uint64),
         np.asarray([1], dtype=np.uint64),
+        brightest_levels=np.asarray([0], dtype=np.uint8),
     )
 
     with pytest.raises(OverflowError, match="exceeds uint64"):

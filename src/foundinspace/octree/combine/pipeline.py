@@ -538,6 +538,8 @@ def _write_final_shard_index_legacy(
     plan: CombinePlan,
 ) -> IndexPassResult:
     """Lookup-based writer retained only as a byte-compatibility test oracle."""
+    if plan.star_format_version != STAR_FORMAT_VERSION_V1:
+        raise ValueError("The legacy index test oracle only supports STAR v1")
     manifest = read_combine_manifest(manifest_path)
     existence = IntermediateLookup(manifest, max_open_files=plan.max_open_files)
     relocation = RelocationLookup(relocation_files, max_open_files=plan.max_open_files)

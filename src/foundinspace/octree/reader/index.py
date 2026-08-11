@@ -16,6 +16,7 @@ from ..combine.records import (
     SUPPORTED_STAR_FORMAT_VERSIONS,
     shard_node_format,
 )
+from ..config import MORTON_BITS
 from .header import OctreeHeader
 from .source import OctreeSource, SeekableBinaryReader, open_octree_source
 
@@ -56,6 +57,7 @@ class NodeEntry:
     _local_depth: int
     _local_path: int
     star_count: int | None = None
+    brightest_level: int | None = None
 
     @property
     def is_leaf(self) -> bool:
@@ -246,13 +248,22 @@ class IndexNavigator:
             child_mask,
             local_depth,
             flags,
-            _reserved,
+            reserved,
             payload_offset,
             payload_length,
         ) = fields[:8]
         star_count = int(fields[8]) if len(fields) == 9 else None
 
         global_level = shard.parent_global_depth + int(local_depth)
+        if self._header.version == 2:
+            brightest_level = int(reserved)
+            if brightest_level < global_level or brightest_level > MORTON_BITS:
+                raise ValueError(
+                    "Node brightest level is outside its representable subtree: "
+                    f"node_level={global_level}, brightest_level={brightest_level}"
+                )
+        else:
+            brightest_level = None
         grid = self._decode_local_grid(
             shard.parent_grid,
             local_depth=int(local_depth),
@@ -274,6 +285,7 @@ class IndexNavigator:
             _local_depth=int(local_depth),
             _local_path=int(local_path),
             star_count=star_count,
+            brightest_level=brightest_level,
         )
 
     def _node_geometry(self, grid: GridCoord, level: int) -> tuple[Point, float]:

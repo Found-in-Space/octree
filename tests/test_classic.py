@@ -16,6 +16,7 @@ import pytest
 
 import foundinspace.octree.classic as classic
 import foundinspace.octree.classic_materialization as classic_materialization
+import foundinspace.octree.combine.streaming_index as streaming_index
 from foundinspace.octree.assembly import BuildPlan, build_intermediates
 from foundinspace.octree.classic import (
     ClassicBuildConfig,
@@ -26,7 +27,11 @@ from foundinspace.octree.combine import (
     IndexEmissionStrategy,
     combine_octree,
 )
-from foundinspace.octree.combine.records import PackedDescriptorFields
+from foundinspace.octree.combine.records import (
+    SHARD_HDR_FMT,
+    SHARD_NODE_V2_FMT,
+    PackedDescriptorFields,
+)
 from foundinspace.octree.config import (
     MORTON_BITS,
     WORLD_CENTER,
@@ -593,6 +598,7 @@ def test_classic_v2_packs_terminal_and_preserves_order_and_positions(
     assert root.star_count == 2
     assert root.is_terminal is True
     assert root.is_leaf is True
+    assert root.brightest_level == 0
 
     with IdentifiersOrderReader(identifiers_path) as reader:
         [(record, identities)] = list(reader.iter_cells())
@@ -662,10 +668,80 @@ def test_classic_v2_counts_index_only_and_nested_terminal_nodes(
         ]
     assert root.star_count == 0
     assert root.is_terminal is False
+    assert root.brightest_level == 2
     assert len(children) == 2
     assert all(child is not None for child in children)
     assert all(child.star_count == 1 for child in children if child is not None)
     assert all(child.is_terminal for child in children if child is not None)
+    assert all(child.brightest_level == 2 for child in children if child is not None)
+
+
+def test_classic_v2_preserves_exact_level_for_nonterminal_folded_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    natural_level = MORTON_BITS
+    center = _node_center(natural_level, 0)
+    rows = [
+        {
+            "source_id": source_id,
+            "morton_code": _morton_for_node(natural_level, 0),
+            "level": natural_level,
+            "mag_abs": magnitude,
+            "x_icrs_pc": center[0],
+            "y_icrs_pc": center[1],
+            "z_icrs_pc": center[2],
+        }
+        for source_id, magnitude in (("a", 7.0), ("b", 8.0))
+    ]
+    _input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
+    output_path = tmp_path / "stars.octree"
+
+    monkeypatch.setattr(
+        streaming_index,
+        "_iter_parent_masks",
+        lambda _path: (_ for _ in ()).throw(
+            AssertionError("v2 packer recomputed authoritative topology")
+        ),
+    )
+
+    build_classic_artifacts(
+        ClassicBuildConfig(
+            stage00_output_dir=stage00_dir,
+            stage01_output_dir=stage01_dir,
+            output_path=output_path,
+            identifiers_order_path=tmp_path / "identifiers.order",
+            mag_limit=6.5,
+            max_level=2,
+            batch_size=1,
+            max_open_files=2,
+            star_format_version=2,
+            terminal_waterline=1,
+        )
+    )
+
+    header = read_header(output_path)
+    with open(output_path, "rb") as fp:
+        fp.seek(header.index_offset)
+        shard = SHARD_HDR_FMT.unpack(fp.read(SHARD_HDR_FMT.size))
+        fp.seek(shard[22])
+        root_record = SHARD_NODE_V2_FMT.unpack(fp.read(SHARD_NODE_V2_FMT.size))
+    assert root_record[4] & 0xF0 == 0
+    assert root_record[5] == natural_level
+    with IndexNavigator(output_path, header) as navigator:
+        [root] = list(navigator.root_entries())
+        level_one = navigator.get_child(root, 0)
+        assert level_one is not None
+        folded = navigator.get_child(level_one, 0)
+    assert root.brightest_level == natural_level
+    assert root.flags & 0xF0 == 0
+    assert level_one.brightest_level == natural_level
+    assert folded is not None
+    assert folded.level == 2
+    assert folded.star_count == 2
+    assert folded.is_terminal is False
+    assert folded.brightest_level == natural_level
+    assert folded.flags & 0xF0 == 0
 
 
 def test_classic_build_merges_sorted_stage01_groups_in_canonical_order(

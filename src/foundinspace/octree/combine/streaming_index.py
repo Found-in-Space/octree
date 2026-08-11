@@ -16,7 +16,14 @@ from typing import BinaryIO
 from uuid import uuid4
 
 from ..assembly.formats import INDEX_FILE_HDR, INDEX_RECORD
-from ..terminal_packing import TerminalMap
+from ..terminal_packing import (
+    LOGICAL_HAS_PAYLOAD,
+    LOGICAL_IS_TERMINAL,
+    LOGICAL_TOPOLOGY_HEADER,
+    LOGICAL_TOPOLOGY_MAGIC,
+    LOGICAL_TOPOLOGY_RECORD,
+    TerminalMap,
+)
 from .lookup import FileHandleCache, FixedRecordFile
 from .manifest import CombineManifest
 from .records import (
@@ -34,28 +41,24 @@ from .records import (
     SHARD_NODE_FMT,
     SHARD_NODE_V2_FMT,
     STAR_FORMAT_VERSION_V1,
+    pack_brightest_level,
     pack_shard_header,
 )
 
-SKELETON_CACHE_FORMAT = "foundinspace.octree.index-skeleton-cache/v2"
-SKELETON_COMPILER_VERSION = "sorted-topology-stream/v2"
+SKELETON_CACHE_FORMAT = "foundinspace.octree.index-skeleton-cache/v5"
+SKELETON_COMPILER_VERSION = "authoritative-logical-topology/v5"
 
-_TOPOLOGY_MAGIC = b"OTOP"
-_TOPOLOGY_HEADER = struct.Struct("<4sHHBQ7x")
-_TOPOLOGY_RECORD = struct.Struct("<QBB6x")
-_LAYOUT_RECORD = struct.Struct("<QHBB4x")
+_LAYOUT_RECORD = struct.Struct("<QHBBB3x")
 _RELOCATION_LAYOUT_RECORD = struct.Struct("<QQIIH6x")
 _SKELETON_MAGIC = b"OSKL"
 _SKELETON_HEADER = struct.Struct("<4sHHhHQI32s")
-_SKELETON_RECORD = struct.Struct("<QHHBBB1x")
+_SKELETON_RECORD = struct.Struct("<QHHBBBB")
 _PACK_MAGIC = b"OSKP"
 _PACK_HEADER = struct.Struct("<4sHHH2x32sQ")
 _RAW_PLAN_RECORD = struct.Struct("<hHQIHHQI32s")
 _PLAN_RECORD = struct.Struct("<hHQIHHQI32s32s")
 _CHILD_OFFSET_RECORD = struct.Struct("<QQ")
 
-_LOGICAL_PAYLOAD = 0x01
-_LOGICAL_TERMINAL = 0x02
 _END_LINEAGE = -1
 
 
@@ -253,42 +256,38 @@ def _topology_identity(
     star_format_version: int,
     skeleton_pack_count: int,
 ) -> str:
-    shards = []
-    for entry in manifest.shards:
-        checksum = entry.topology_checksum or _legacy_topology_checksum(
-            entry.index_path,
-            magic=manifest.index_magic,
-            cache_dir=cache_dir,
-        )
-        shards.append(
-            {
-                "level": entry.key.level,
-                "prefix_bits": entry.key.prefix_bits,
-                "prefix": entry.key.prefix,
-                "record_count": entry.record_count,
-                "topology_checksum": checksum,
-            }
-        )
+    shards: list[dict[str, object]] = []
     terminal_policy: object = None
-    if star_format_version != STAR_FORMAT_VERSION_V1:
-        if manifest.terminal_map_path is None:
-            terminal_policy = {"levels": []}
-        else:
-            raw = json.loads(manifest.terminal_map_path.read_text(encoding="utf-8"))
-            terminal_policy = {
-                "format": raw.get("format"),
-                "plan_identity": raw.get("plan_identity"),
-                "max_level": raw.get("max_level"),
-                "waterline": raw.get("waterline"),
-                "levels": [
-                    {
-                        "level": row.get("level"),
-                        "count": row.get("count"),
-                        "checksum": row.get("checksum"),
-                    }
-                    for row in raw.get("levels", [])
-                ],
-            }
+    if star_format_version != STAR_FORMAT_VERSION_V1 and manifest.terminal_map_path:
+        raw = json.loads(manifest.terminal_map_path.read_text(encoding="utf-8"))
+        terminal_policy = {
+            "format": raw.get("format"),
+            "topology_identity": raw.get("topology_identity"),
+            "topology_levels": [
+                {
+                    "level": entry.get("level"),
+                    "count": entry.get("count"),
+                    "checksum": entry.get("checksum"),
+                }
+                for entry in raw.get("topology_levels", [])
+            ],
+        }
+    else:
+        for entry in manifest.shards:
+            checksum = entry.topology_checksum or _legacy_topology_checksum(
+                entry.index_path,
+                magic=manifest.index_magic,
+                cache_dir=cache_dir,
+            )
+            shards.append(
+                {
+                    "level": entry.key.level,
+                    "prefix_bits": entry.key.prefix_bits,
+                    "prefix": entry.key.prefix,
+                    "record_count": entry.record_count,
+                    "topology_checksum": checksum,
+                }
+            )
     policy, _digest = _skeleton_policy(
         max_level=manifest.max_level,
         star_format_version=star_format_version,
@@ -383,25 +382,23 @@ def _spatial_shard_range(key) -> tuple[int, int]:
     return lower, upper
 
 
-def _terminal_nodes(manifest: CombineManifest) -> dict[int, Iterator[int]]:
-    if manifest.terminal_map_path is None:
-        return {}
-    # TerminalMap performs the complete file and ordering validation once.
-    terminal_map = TerminalMap(manifest.terminal_map_path)
-    return {level: terminal_map.iter_level(level) for level in terminal_map.levels}
-
-
 def _build_topology_runs(
     manifest: CombineManifest,
     *,
     scratch: Path,
     star_format_version: int,
 ) -> dict[int, Path]:
-    terminal_by_level = (
-        _terminal_nodes(manifest)
-        if star_format_version != STAR_FORMAT_VERSION_V1
-        else {}
-    )
+    if (
+        star_format_version != STAR_FORMAT_VERSION_V1
+        and manifest.terminal_map_path is not None
+    ):
+        terminal_map = TerminalMap(manifest.terminal_map_path)
+        return {
+            level: path
+            for level in terminal_map.topology_levels
+            if (path := terminal_map.topology_path(level)) is not None
+        }
+
     child_path: Path | None = None
     result: dict[int, Path] = {}
     for level in range(manifest.max_level, -1, -1):
@@ -409,13 +406,16 @@ def _build_topology_runs(
         parents = _peekable(
             _iter_parent_masks(child_path) if child_path is not None else iter(())
         )
-        terminals = _peekable(terminal_by_level.get(level, iter(())))
         output = scratch / f"topology-{level:02d}.bin"
         count = 0
         with open(output, "wb") as fp:
             fp.write(
-                _TOPOLOGY_HEADER.pack(
-                    _TOPOLOGY_MAGIC, 1, _TOPOLOGY_HEADER.size, level, 0
+                LOGICAL_TOPOLOGY_HEADER.pack(
+                    LOGICAL_TOPOLOGY_MAGIC,
+                    1,
+                    LOGICAL_TOPOLOGY_HEADER.size,
+                    level,
+                    0,
                 )
             )
             buffer = bytearray()
@@ -428,34 +428,43 @@ def _build_topology_runs(
                 node_id = min(candidates)
                 flags = 0
                 child_mask = 0
+                brightest_level: int | None = None
                 if own.value == node_id:
-                    flags |= _LOGICAL_PAYLOAD
+                    flags |= LOGICAL_HAS_PAYLOAD
+                    brightest_level = level
                     own.advance()
                 if parents.value is not None and int(parents.value[0]) == node_id:
                     child_mask = int(parents.value[1])
-                    parents.advance()
-                while terminals.value is not None and int(terminals.value) < node_id:
-                    raise ValueError(
-                        f"Terminal node is absent from topology: {level}:{terminals.value}"
+                    child_brightest_level = int(parents.value[2])
+                    brightest_level = (
+                        child_brightest_level
+                        if brightest_level is None
+                        else min(brightest_level, child_brightest_level)
                     )
-                if terminals.value == node_id:
-                    flags |= _LOGICAL_TERMINAL
-                    terminals.advance()
-                buffer.extend(_TOPOLOGY_RECORD.pack(node_id, child_mask, flags))
+                    parents.advance()
+                if brightest_level is None:
+                    raise ValueError(
+                        f"Topology node has no represented stars: ({level}, {node_id})"
+                    )
+                buffer.extend(
+                    LOGICAL_TOPOLOGY_RECORD.pack(
+                        node_id, child_mask, flags, brightest_level
+                    )
+                )
                 if len(buffer) >= 1 << 20:
                     fp.write(buffer)
                     buffer.clear()
                 count += 1
-            if terminals.value is not None:
-                raise ValueError(
-                    f"Terminal node is absent from topology: {level}:{terminals.value}"
-                )
             if buffer:
                 fp.write(buffer)
             fp.seek(0)
             fp.write(
-                _TOPOLOGY_HEADER.pack(
-                    _TOPOLOGY_MAGIC, 1, _TOPOLOGY_HEADER.size, level, count
+                LOGICAL_TOPOLOGY_HEADER.pack(
+                    LOGICAL_TOPOLOGY_MAGIC,
+                    1,
+                    LOGICAL_TOPOLOGY_HEADER.size,
+                    level,
+                    count,
                 )
             )
             fp.flush()
@@ -482,40 +491,45 @@ def _peekable(values: Iterator) -> _Peekable:
     return _Peekable(values)
 
 
-def _iter_topology(path: Path) -> Iterator[tuple[int, int, int]]:
+def _iter_topology(path: Path) -> Iterator[tuple[int, int, int, int]]:
     with open(path, "rb") as fp:
-        raw = fp.read(_TOPOLOGY_HEADER.size)
-        if len(raw) != _TOPOLOGY_HEADER.size:
+        raw = fp.read(LOGICAL_TOPOLOGY_HEADER.size)
+        if len(raw) != LOGICAL_TOPOLOGY_HEADER.size:
             raise ValueError(f"Truncated topology run: {path}")
-        magic, version, header_size, _level, count = _TOPOLOGY_HEADER.unpack(raw)
-        if magic != _TOPOLOGY_MAGIC or version != 1 or header_size != len(raw):
+        magic, version, header_size, _level, count = LOGICAL_TOPOLOGY_HEADER.unpack(raw)
+        if magic != LOGICAL_TOPOLOGY_MAGIC or version != 1 or header_size != len(raw):
             raise ValueError(f"Invalid topology run: {path}")
         previous: int | None = None
         for _ in range(count):
-            raw = fp.read(_TOPOLOGY_RECORD.size)
-            if len(raw) != _TOPOLOGY_RECORD.size:
+            raw = fp.read(LOGICAL_TOPOLOGY_RECORD.size)
+            if len(raw) != LOGICAL_TOPOLOGY_RECORD.size:
                 raise ValueError(f"Truncated topology run: {path}")
-            node_id, child_mask, flags = _TOPOLOGY_RECORD.unpack(raw)
+            node_id, child_mask, flags, brightest_level = (
+                LOGICAL_TOPOLOGY_RECORD.unpack(raw)
+            )
             if previous is not None and node_id <= previous:
                 raise ValueError(f"Non-ascending topology run: {path}")
             previous = int(node_id)
-            yield int(node_id), int(child_mask), int(flags)
+            yield int(node_id), int(child_mask), int(flags), int(brightest_level)
         if fp.read(1):
             raise ValueError(f"Trailing bytes in topology run: {path}")
 
 
-def _iter_parent_masks(path: Path) -> Iterator[tuple[int, int]]:
+def _iter_parent_masks(path: Path) -> Iterator[tuple[int, int, int]]:
     pending_parent: int | None = None
     child_mask = 0
-    for node_id, _children, _flags in _iter_topology(path):
+    brightest_level = 0xFF
+    for node_id, _children, _flags, child_brightest in _iter_topology(path):
         parent = node_id >> 3
         if pending_parent is not None and parent != pending_parent:
-            yield pending_parent, child_mask
+            yield pending_parent, child_mask, brightest_level
             child_mask = 0
+            brightest_level = 0xFF
         pending_parent = parent
         child_mask |= 1 << (node_id & 0x7)
+        brightest_level = min(brightest_level, child_brightest)
     if pending_parent is not None:
-        yield pending_parent, child_mask
+        yield pending_parent, child_mask, brightest_level
 
 
 def _parent_key(level: int, node_id: int) -> tuple[int, int]:
@@ -541,18 +555,28 @@ def _layout_key(level: int, node_id: int) -> tuple[int, ...]:
     return (*lineage, _END_LINEAGE, local_depth, local_path)
 
 
-def _iter_level_layout(level: int, path: Path) -> Iterator[tuple[int, int, int, int]]:
-    for node_id, child_mask, flags in _iter_topology(path):
-        yield node_id, level, child_mask, flags
+def _iter_level_layout(
+    level: int, path: Path
+) -> Iterator[tuple[int, int, int, int, int]]:
+    for node_id, child_mask, flags, brightest_level in _iter_topology(path):
+        yield node_id, level, child_mask, flags, brightest_level
 
 
-def _iter_layout_file(path: Path) -> Iterator[tuple[int, int, int, int]]:
+def _iter_layout_file(path: Path) -> Iterator[tuple[int, int, int, int, int]]:
     with open(path, "rb") as fp:
         while raw := fp.read(_LAYOUT_RECORD.size):
             if len(raw) != _LAYOUT_RECORD.size:
                 raise ValueError(f"Truncated layout run: {path}")
-            node_id, level, child_mask, flags = _LAYOUT_RECORD.unpack(raw)
-            yield int(node_id), int(level), int(child_mask), int(flags)
+            node_id, level, child_mask, flags, brightest_level = _LAYOUT_RECORD.unpack(
+                raw
+            )
+            yield (
+                int(node_id),
+                int(level),
+                int(child_mask),
+                int(flags),
+                int(brightest_level),
+            )
 
 
 def _merge_sorted_sources(
@@ -654,7 +678,9 @@ def _merge_topology_layout(
 
 
 def _skeleton_policy(
-    *, max_level: int, star_format_version: int
+    *,
+    max_level: int,
+    star_format_version: int,
 ) -> tuple[dict[str, object], bytes]:
     policy = {
         "format": SKELETON_CACHE_FORMAT,
@@ -679,7 +705,8 @@ def _compile_skeletons(
     max_open_files: int,
 ) -> tuple[Path, int]:
     _policy, policy_digest = _skeleton_policy(
-        max_level=max_level, star_format_version=star_format_version
+        max_level=max_level,
+        star_format_version=star_format_version,
     )
     pack_root = cache_dir / "packs"
     pack_root.mkdir(parents=True, exist_ok=True)
@@ -692,7 +719,7 @@ def _compile_skeletons(
     bucket_offsets: dict[int, int] = {}
     pack_files = FileHandleCache(max(1, max_open_files))
     current_key: tuple[int, int] | None = None
-    records: list[tuple[int, int, int, int, int, int]] = []
+    records: list[tuple[int, int, int, int, int, int, int]] = []
 
     def flush(plan_fp: BinaryIO) -> None:
         nonlocal records, current_key, skeleton_count
@@ -752,16 +779,20 @@ def _compile_skeletons(
 
     try:
         with open(raw_plan_path, "wb") as plan_fp:
-            for node_id, level, child_mask, logical_flags in _iter_layout_file(
-                layout_path
-            ):
+            for (
+                node_id,
+                level,
+                child_mask,
+                logical_flags,
+                brightest_level,
+            ) in _iter_layout_file(layout_path):
                 key = _parent_key(level, node_id)
                 if current_key != key:
                     flush(plan_fp)
                     current_key = key
                 local_depth, local_path = _local_key(level, node_id)
                 flags = 0
-                if logical_flags & _LOGICAL_PAYLOAD:
+                if logical_flags & LOGICAL_HAS_PAYLOAD:
                     flags |= HAS_PAYLOAD
                 if child_mask:
                     flags |= HAS_CHILDREN
@@ -769,9 +800,9 @@ def _compile_skeletons(
                     flags |= IS_FRONTIER
                 if (
                     star_format_version != STAR_FORMAT_VERSION_V1
-                    and logical_flags & _LOGICAL_TERMINAL
+                    and logical_flags & LOGICAL_IS_TERMINAL
                 ):
-                    if not logical_flags & _LOGICAL_PAYLOAD:
+                    if not logical_flags & LOGICAL_HAS_PAYLOAD:
                         raise ValueError(
                             f"Terminal node has no payload: ({level}, {node_id})"
                         )
@@ -780,8 +811,22 @@ def _compile_skeletons(
                             f"Terminal node retains descendants: ({level}, {node_id})"
                         )
                     flags |= IS_TERMINAL
+                packed_brightest_level = 0
+                if star_format_version != STAR_FORMAT_VERSION_V1:
+                    packed_brightest_level = pack_brightest_level(
+                        level=level,
+                        brightest_level=brightest_level,
+                    )
                 records.append(
-                    (node_id, local_path, level, local_depth, child_mask, flags)
+                    (
+                        node_id,
+                        local_path,
+                        level,
+                        local_depth,
+                        child_mask,
+                        flags,
+                        packed_brightest_level,
+                    )
                 )
             flush(plan_fp)
             plan_fp.flush()
@@ -1202,7 +1247,7 @@ class _ChildOffsetStreams:
 
 def _read_skeleton(
     fp: BinaryIO, path: Path, expected: _SkeletonPlanEntry
-) -> list[tuple[int, int, int, int, int, int]]:
+) -> list[tuple[int, int, int, int, int, int, int]]:
     fp.seek(expected.pack_offset)
     data = fp.read(expected.pack_length)
     if len(data) != expected.pack_length:
@@ -1241,7 +1286,7 @@ def _read_skeleton(
 
 def _prepare_shard(
     entry: _SkeletonPlanEntry,
-    nodes: list[tuple[int, int, int, int, int, int]],
+    nodes: list[tuple[int, int, int, int, int, int, int]],
     relocations: _Peekable,
     *,
     star_format_version: int,
@@ -1266,6 +1311,7 @@ def _prepare_shard(
             local_depth,
             _mask,
             _flags,
+            _brightest_level,
         ) in enumerate(nodes, 1)
     }
     entry_nodes = [0] * 8
@@ -1278,6 +1324,7 @@ def _prepare_shard(
         local_depth,
         child_mask,
         flags,
+        brightest_level,
     ) in enumerate(nodes, 1):
         if local_depth == 1:
             entry_nodes[local_path & 0x7] = node_index
@@ -1316,7 +1363,7 @@ def _prepare_shard(
             child_mask,
             local_depth,
             flags,
-            0,
+            brightest_level,
             payload_offset,
             payload_length,
         )

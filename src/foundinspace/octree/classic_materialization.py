@@ -1242,6 +1242,15 @@ def _assemble_publication_artifacts(
             cached_terminal_map_path.parent / relative,
             artifacts_dir / relative,
         )
+    topology_entries = raw.get("topology_levels")
+    if not isinstance(topology_entries, list) or not topology_entries:
+        raise ValueError("Cached terminal map is missing logical topology")
+    for entry in topology_entries:
+        relative = Path(str(entry["path"]))
+        _link_or_copy_cached_file(
+            cached_terminal_map_path.parent / relative,
+            artifacts_dir / relative,
+        )
     published_manifest = artifacts_dir / cached_terminal_map_path.name
     _link_or_copy_cached_file(cached_terminal_map_path, published_manifest)
     return published_manifest

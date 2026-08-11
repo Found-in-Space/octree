@@ -106,6 +106,7 @@ def test_combine_v2_writes_v2_shard_and_node_star_count(
 
     header = read_header(out)
     assert header.version == 2
+    assert HEADER_FMT.unpack(out.read_bytes()[:HEADER_SIZE])[2] == 0
     with open(out, "rb") as fp:
         fp.seek(header.index_offset)
         shard = SHARD_HDR_FMT.unpack(fp.read(SHARD_HDR_FMT.size))
@@ -114,6 +115,7 @@ def test_combine_v2_writes_v2_shard_and_node_star_count(
         [root] = list(navigator.root_entries())
     assert root.star_count == 3
     assert root.is_terminal is False
+    assert root.brightest_level == 0
 
 
 def test_v1_reader_reports_unavailable_node_star_count(tmp_path) -> None:
@@ -131,6 +133,7 @@ def test_v1_reader_reports_unavailable_node_star_count(tmp_path) -> None:
         [root] = list(navigator.root_entries())
     assert root.star_count is None
     assert root.is_terminal is False
+    assert root.brightest_level is None
 
 
 def test_manifest_identifier_mismatch_fails_fast(tmp_path) -> None:

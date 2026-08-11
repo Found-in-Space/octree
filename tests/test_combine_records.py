@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from uuid import UUID
 
+import pytest
+
 from foundinspace.octree.combine.records import (
     DESCRIPTOR_SIZE,
     FRONTIER_REF_SIZE,
@@ -15,6 +17,7 @@ from foundinspace.octree.combine.records import (
     SHARD_NODE_V2_SIZE,
     PackedDescriptorFields,
     PackedHeaderFields,
+    pack_brightest_level,
     pack_descriptor,
     pack_top_level_header,
     unpack_descriptor,
@@ -72,6 +75,24 @@ def test_pack_v2_top_level_header() -> None:
     )
 
     assert unpack_top_level_header(packed)[1] == 2
+    assert unpack_top_level_header(packed)[2] == 0
+
+
+def test_brightest_level_uses_reserved_byte_exactly() -> None:
+    packed = pack_brightest_level(
+        level=8,
+        brightest_level=21,
+    )
+
+    assert packed == 21
+
+
+def test_brightest_level_rejects_a_shallower_level() -> None:
+    with pytest.raises(ValueError, match="cannot be shallower"):
+        pack_brightest_level(level=8, brightest_level=7)
+
+    with pytest.raises(ValueError, match="outside the Morton address space"):
+        pack_brightest_level(level=0, brightest_level=22)
 
 
 def test_pack_unpack_descriptor_round_trip() -> None:

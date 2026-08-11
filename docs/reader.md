@@ -255,10 +255,16 @@ The navigator must implement:
      - `child_mask: u8`
      - `local_depth: u8`
      - `flags: u8`
-     - `reserved: u8`
+     - `brightest_level: u8` (zero/reserved in v1; absolute level in v2)
      - `payload_offset: u64`
      - `payload_length: u32`
      - `star_count: u32` (v2 only)
+
+   In v2, the byte after `flags` is unconditionally the exact absolute
+   subtree-brightest natural magnitude level. Readers return it directly and
+   validate `node_level <= brightest_level <= 21`. Header flags remain zero;
+   there is no capability or legacy delta encoding. The structural flags remain
+   unchanged.
 
    The reader rejects a shard whose version does not match the STAR header.
    See [`star-v2.md`](star-v2.md) for count and terminal semantics.

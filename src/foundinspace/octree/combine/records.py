@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from uuid import UUID
 
 from ..assembly.formats import INDEX_FILE_HDR, INDEX_HEADER_SIZE, INDEX_RECORD
+from ..config import MORTON_BITS
 
 HEADER_FMT = struct.Struct("<4sHHQQ3ffHHf16s")
 HEADER_SIZE = 64
@@ -116,6 +117,21 @@ def pack_top_level_header(
         float(fields.mag_limit),
         HEADER_RESERVED,
     )
+
+
+def pack_brightest_level(*, level: int, brightest_level: int) -> int:
+    """Validate and return STAR v2's absolute subtree-brightest level."""
+    if level < 0 or level > MORTON_BITS:
+        raise ValueError(f"node level is outside the Morton address space: {level}")
+    if brightest_level > MORTON_BITS:
+        raise ValueError(
+            f"brightest level is outside the Morton address space: {brightest_level}"
+        )
+    if brightest_level < level:
+        raise ValueError(
+            f"brightest level {brightest_level} cannot be shallower than node level {level}"
+        )
+    return int(brightest_level)
 
 
 def unpack_top_level_header(buf: bytes) -> tuple:
