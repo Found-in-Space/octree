@@ -649,7 +649,11 @@ def validate_identity_locator(
         }
         for namespace, keys in sample_values.items():
             for key in dict.fromkeys(keys):
-                reader.verify_lookup(namespace, key)
+                if reader.verify_lookup(namespace, key) is None:
+                    raise ValueError(
+                        "Identity locator present-key sample is absent: "
+                        f"{namespace}:{key}"
+                    )
                 checked_present += 1
             descriptor = reader.namespaces[namespace]
             absent = []

@@ -415,6 +415,18 @@ def test_reader_rejects_truncated_locator_object(tmp_path: Path) -> None:
         IdentityLocatorReader(result.output_path, order_path)
 
 
+def test_validator_rejects_absent_present_key_sample(tmp_path: Path) -> None:
+    render_path, order_path = _build_dataset(tmp_path, [[("gaia", "1")]])
+    result = build_identity_locator(_config(tmp_path, render_path, order_path))
+
+    with pytest.raises(ValueError, match="present-key sample is absent"):
+        validate_identity_locator(
+            result.output_path,
+            order_path,
+            samples={"gaia": [2]},
+        )
+
+
 class _FakeHttpResponse:
     def __init__(self, raw: bytes, *, status: int, headers: dict[str, str]) -> None:
         self._raw = raw
