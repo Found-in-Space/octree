@@ -51,6 +51,371 @@ def _load_project_or_die(project_path: Path):
         raise click.ClickException(str(exc)) from exc
 
 
+@cli.group("identity-locator")
+def identity_locator_group() -> None:
+    """Build and query the optional exact Gaia/HIP identity index."""
+
+
+def _identity_locator_paths(
+    render_path: Path,
+    output_path: Path | None,
+    report_path: Path | None,
+    work_dir: Path | None,
+) -> tuple[Path, Path, Path]:
+    output = output_path or render_path.with_name(
+        f"{render_path.stem}.identity-locator.idx"
+    )
+    report = report_path or output.with_name(f"{output.stem}.report.json")
+    work = work_dir or output.with_name(f".{output.stem}.work")
+    return output, report, work
+
+
+def _identity_locator_progress_reporter():
+    last_value: tuple[str, int, int] | None = None
+
+    def report(progress) -> None:
+        nonlocal last_value
+        value = (progress.phase, progress.completed, progress.total)
+        if value == last_value:
+            return
+        last_value = value
+        total = f"/{progress.total:,}" if progress.total else ""
+        detail = f" ({progress.detail})" if progress.detail else ""
+        click.echo(
+            f"Identity locator {progress.phase}: {progress.completed:,}{total}{detail}"
+        )
+
+    return report
+
+
+@identity_locator_group.command("build")
+@click.option(
+    "--project",
+    "project_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Project supplying the render octree and identifiers/order artifact.",
+)
+@click.option(
+    "--output",
+    "output_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Output index path. Defaults to <render-stem>.identity-locator.idx.",
+)
+@click.option(
+    "--report",
+    "report_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Build report path. Defaults beside the index.",
+)
+@click.option(
+    "--work-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Restartable scratch directory. Defaults beside the index.",
+)
+@click.option(
+    "--page-size",
+    type=click.Choice(("32768", "65536")),
+    default="32768",
+    show_default=True,
+    help="Decoded leaf and navigation page size in bytes.",
+)
+@click.option(
+    "--compression",
+    type=click.Choice(("none", "gzip")),
+    default="none",
+    show_default=True,
+    help="Leaf-page codec.",
+)
+@click.option(
+    "--scan-batch-mib",
+    type=click.FloatRange(min=0.001),
+    default=32.0,
+    show_default=True,
+    help="Maximum decoded identity payload buffered per scan batch.",
+)
+@click.option(
+    "--merge-fan-in",
+    type=click.IntRange(min=2),
+    default=32,
+    show_default=True,
+)
+@click.option(
+    "--merge-batch-rows",
+    type=click.IntRange(min=1),
+    default=262_144,
+    show_default=True,
+)
+@click.option(
+    "--external-sort-memory-limit",
+    default="2GB",
+    show_default=True,
+)
+@click.option("--retain-work", is_flag=True, help="Keep restart/checkpoint data.")
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Replace incompatible output, report, and work state.",
+)
+def identity_locator_build(
+    project_path: Path,
+    output_path: Path | None,
+    report_path: Path | None,
+    work_dir: Path | None,
+    page_size: str,
+    compression: str,
+    scan_batch_mib: float,
+    merge_fan_in: int,
+    merge_batch_rows: int,
+    external_sort_memory_limit: str,
+    retain_work: bool,
+    force: bool,
+) -> None:
+    """Build or resume an exact dataset-scoped identity locator."""
+    from foundinspace.octree.identity_locator import (
+        IdentityLocatorBuildConfig,
+        build_identity_locator,
+    )
+
+    project = _load_project_or_die(project_path)
+    output, report, work = _identity_locator_paths(
+        project.paths.stage02_output_path,
+        output_path,
+        report_path,
+        work_dir,
+    )
+    try:
+        result = build_identity_locator(
+            IdentityLocatorBuildConfig(
+                render_octree_path=project.paths.stage02_output_path,
+                identifiers_order_path=project.paths.identifiers_order_output_path,
+                output_path=output,
+                report_path=report,
+                work_dir=work,
+                decoded_page_size=int(page_size),
+                leaf_codec=compression,
+                scan_batch_bytes=max(1, round(scan_batch_mib * 1024 * 1024)),
+                merge_fan_in=merge_fan_in,
+                merge_batch_rows=merge_batch_rows,
+                external_sort_memory_limit=external_sort_memory_limit,
+                retain_work=retain_work,
+                force=force,
+                progress=_identity_locator_progress_reporter(),
+            )
+        )
+    except (FileExistsError, FileNotFoundError, OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    counts = ", ".join(
+        f"{name}={count:,}" for name, count in result.namespace_counts.items()
+    )
+    click.echo(
+        f"Identity locator: {counts}, uuid={result.locator_uuid}, "
+        f"sha256={result.output_sha256}"
+    )
+    click.echo(f"Wrote {result.output_path}")
+    click.echo(f"Wrote {result.report_path}")
+
+
+@identity_locator_group.command("benchmark")
+@click.option(
+    "--project",
+    "project_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Project supplying the render octree and identifiers/order artifact.",
+)
+@click.option(
+    "--report",
+    "report_path",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Benchmark report path. Defaults beside the render octree.",
+)
+@click.option(
+    "--work-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Shared restartable scan/sort and candidate directory.",
+)
+@click.option(
+    "--scan-batch-mib",
+    type=click.FloatRange(min=0.001),
+    default=32.0,
+    show_default=True,
+)
+@click.option(
+    "--merge-fan-in",
+    type=click.IntRange(min=2),
+    default=32,
+    show_default=True,
+)
+@click.option(
+    "--merge-batch-rows",
+    type=click.IntRange(min=1),
+    default=262_144,
+    show_default=True,
+)
+@click.option(
+    "--external-sort-memory-limit",
+    default="2GB",
+    show_default=True,
+)
+@click.option(
+    "--repetitions",
+    type=click.IntRange(min=1),
+    default=3,
+    show_default=True,
+)
+@click.option("--retain-candidates", is_flag=True)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Replace existing benchmark work and report.",
+)
+def identity_locator_benchmark(
+    project_path: Path,
+    report_path: Path | None,
+    work_dir: Path | None,
+    scan_batch_mib: float,
+    merge_fan_in: int,
+    merge_batch_rows: int,
+    external_sort_memory_limit: str,
+    repetitions: int,
+    retain_candidates: bool,
+    force: bool,
+) -> None:
+    """Build and benchmark the 32/64 KiB by raw/gzip candidate matrix."""
+    from foundinspace.octree.identity_locator import (
+        IdentityLocatorBenchmarkConfig,
+        benchmark_identity_locator,
+    )
+
+    project = _load_project_or_die(project_path)
+    render_path = project.paths.stage02_output_path
+    report = report_path or render_path.with_name(
+        f"{render_path.stem}.identity-locator.benchmark.json"
+    )
+    work = work_dir or render_path.with_name(
+        f".{render_path.stem}.identity-locator-benchmark.work"
+    )
+    try:
+        result = benchmark_identity_locator(
+            IdentityLocatorBenchmarkConfig(
+                render_octree_path=render_path,
+                identifiers_order_path=project.paths.identifiers_order_output_path,
+                work_dir=work,
+                report_path=report,
+                scan_batch_bytes=max(1, round(scan_batch_mib * 1024 * 1024)),
+                merge_fan_in=merge_fan_in,
+                merge_batch_rows=merge_batch_rows,
+                external_sort_memory_limit=external_sort_memory_limit,
+                repetitions=repetitions,
+                force=force,
+                retain_candidates=retain_candidates,
+                progress=_identity_locator_progress_reporter(),
+            )
+        )
+    except (FileExistsError, FileNotFoundError, OSError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        "Identity locator benchmark winner: "
+        f"page_size={result.winning_page_size}, "
+        f"compression={result.winning_leaf_codec}"
+    )
+    click.echo(f"Winner candidate {result.winner_candidate_path}")
+    click.echo(f"Wrote {result.report_path}")
+
+
+@identity_locator_group.command("lookup")
+@click.argument("locator_source", type=str)
+@click.argument("identifiers_order_source", type=str)
+@click.argument("source", type=str)
+@click.argument("source_id", type=str)
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
+def identity_locator_lookup(
+    locator_source: str,
+    identifiers_order_source: str,
+    source: str,
+    source_id: str,
+    as_json: bool,
+) -> None:
+    """Resolve SOURCE and SOURCE_ID to a dataset-scoped render location."""
+    from foundinspace.octree.identity_locator import IdentityLocatorReader
+
+    try:
+        with IdentityLocatorReader(locator_source, identifiers_order_source) as reader:
+            ref = reader.lookup(source, source_id)
+    except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    if as_json:
+        click.echo(
+            json.dumps(
+                None
+                if ref is None
+                else {
+                    "dataset_uuid": str(ref.dataset_uuid),
+                    "level": ref.level,
+                    "morton_code": ref.morton_code,
+                    "ordinal": ref.ordinal,
+                },
+                sort_keys=True,
+            )
+        )
+    elif ref is None:
+        click.echo("Not found")
+    else:
+        click.echo(
+            f"dataset_uuid={ref.dataset_uuid} level={ref.level} "
+            f"morton_code={ref.morton_code} ordinal={ref.ordinal}"
+        )
+
+
+@identity_locator_group.command("validate")
+@click.argument("locator_source", type=str)
+@click.argument("identifiers_order_source", type=str)
+@click.option(
+    "--report",
+    "report_path",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Build report supplying deterministic present-key samples.",
+)
+@click.option(
+    "--skip-full-checksum",
+    is_flag=True,
+    help="Skip the complete locator prefix SHA-256 pass.",
+)
+def identity_locator_validate(
+    locator_source: str,
+    identifiers_order_source: str,
+    report_path: Path | None,
+    skip_full_checksum: bool,
+) -> None:
+    """Validate structure, compatibility, checksums, and sampled round trips."""
+    from foundinspace.octree.identity_locator import validate_identity_locator
+
+    try:
+        samples = None
+        if report_path is not None:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            samples = {
+                str(namespace): [int(value) for value in values]
+                for namespace, values in report.get("validation_samples", {}).items()
+            }
+        validation = validate_identity_locator(
+            locator_source,
+            identifiers_order_source,
+            samples=samples,
+            full_checksum=not skip_full_checksum,
+        )
+    except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(validation, indent=2, sort_keys=True))
+
+
 @cli.group("sidecars")
 def sidecars_group() -> None:
     """Build optional enrichment artifacts for a published render octree."""

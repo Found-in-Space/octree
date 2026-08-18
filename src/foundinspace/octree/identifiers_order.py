@@ -69,9 +69,7 @@ def _pack_header(
     )
 
 
-def read_header(path: Path) -> IdentifiersOrderHeader:
-    with open(path, "rb") as fp:
-        raw = fp.read(HEADER_SIZE)
+def unpack_header(raw: bytes) -> IdentifiersOrderHeader:
     if len(raw) != HEADER_SIZE:
         raise ValueError("Identifiers/order file too small for header")
     (
@@ -102,6 +100,12 @@ def read_header(path: Path) -> IdentifiersOrderHeader:
         payload_length=payload_length,
         record_count=record_count,
     )
+
+
+def read_header(path: Path) -> IdentifiersOrderHeader:
+    with open(path, "rb") as fp:
+        raw = fp.read(HEADER_SIZE)
+    return unpack_header(raw)
 
 
 class IdentifiersOrderReader:
@@ -149,6 +153,7 @@ class IdentifiersOrderReader:
         self,
         *,
         max_uncompressed_bytes: int = IDENTITY_UNCOMPRESSED_CELL_LIMIT_BYTES,
+        start_record: int = 0,
     ) -> Iterator[tuple[IdentifiersOrderRecord, bytes]]:
         """Yield bounded uncompressed identity payloads without decoding rows.
 
@@ -159,7 +164,7 @@ class IdentifiersOrderReader:
         """
         if max_uncompressed_bytes <= 0:
             raise ValueError("Identity payload memory bound must be > 0")
-        for record in self._iter_directory_records():
+        for record in self._iter_directory_records(start_record=start_record):
             yield (
                 record,
                 self._read_record_payload(
@@ -168,9 +173,60 @@ class IdentifiersOrderReader:
                 ),
             )
 
-    def _iter_directory_records(self) -> Iterator[IdentifiersOrderRecord]:
-        self._directory_fp.seek(self.header.directory_offset)
-        for _idx in range(self.header.record_count):
+    def iter_indexed_cell_identity_payloads(
+        self,
+        *,
+        max_uncompressed_bytes: int = IDENTITY_UNCOMPRESSED_CELL_LIMIT_BYTES,
+        start_record: int = 0,
+    ) -> Iterator[tuple[int, IdentifiersOrderRecord, bytes]]:
+        """Yield directory record indexes with bounded uncompressed payloads."""
+        if max_uncompressed_bytes <= 0:
+            raise ValueError("Identity payload memory bound must be > 0")
+        for record_index, record in enumerate(
+            self._iter_directory_records(start_record=start_record),
+            start=start_record,
+        ):
+            yield (
+                record_index,
+                record,
+                self._read_record_payload(
+                    record,
+                    max_uncompressed_bytes=max_uncompressed_bytes,
+                ),
+            )
+
+    def read_directory_record(self, record_index: int) -> IdentifiersOrderRecord:
+        """Read one fixed-width directory record by zero-based index."""
+        if record_index < 0 or record_index >= self.header.record_count:
+            raise IndexError(record_index)
+        self._directory_fp.seek(
+            self.header.directory_offset + record_index * DIRECTORY_RECORD_SIZE
+        )
+        raw = self._directory_fp.read(DIRECTORY_RECORD_SIZE)
+        if len(raw) != DIRECTORY_RECORD_SIZE:
+            raise ValueError("Identifiers/order directory truncated")
+        level, node_id, star_count, payload_offset, payload_length = (
+            DIRECTORY_RECORD_FMT.unpack(raw)
+        )
+        return IdentifiersOrderRecord(
+            level=level,
+            node_id=node_id,
+            star_count=star_count,
+            payload_offset=payload_offset,
+            payload_length=payload_length,
+        )
+
+    def _iter_directory_records(
+        self,
+        *,
+        start_record: int = 0,
+    ) -> Iterator[IdentifiersOrderRecord]:
+        if start_record < 0 or start_record > self.header.record_count:
+            raise ValueError("Identifiers/order start record is out of range")
+        self._directory_fp.seek(
+            self.header.directory_offset + start_record * DIRECTORY_RECORD_SIZE
+        )
+        for _idx in range(start_record, self.header.record_count):
             raw = self._directory_fp.read(DIRECTORY_RECORD_SIZE)
             if len(raw) != DIRECTORY_RECORD_SIZE:
                 raise ValueError("Identifiers/order directory truncated")

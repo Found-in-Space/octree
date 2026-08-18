@@ -28,6 +28,7 @@ The architecture is a sequence of purpose-named, reusable products:
 | **Plan topology** | Cell summaries plus a profile policy | Natural-cell to profile-cell mapping |
 | **Materialize** | Sorted contributions plus topology | Canonical render and identity ranges per profile bucket |
 | **Pack** | Materialized ranges and manifests | `stars.octree` and `identifiers.order` |
+| **Build identity locator** | Published render plus exact identity order | Optional `identity-locator.idx` alternative index |
 | **Build sidecars** | Profile identity order plus enrichment | Named sidecar artifacts such as `meta.octree` |
 
 The numeric `stage-00` through `stage-03` commands are current compatibility
@@ -136,6 +137,27 @@ This purpose-named command defaults to
 `<render-name>.visual-duplicates.octree` beside the render artifact. It is not
 registered in `stage-03`, added to the starter project, or run by default.
 
+Exact Gaia/HIP lookup is a separate optional alternative index, likewise not a
+sidecar or numbered stage:
+
+```bash
+uv run fis-octree identity-locator benchmark --project project.toml
+uv run fis-octree identity-locator build --project project.toml
+uv run fis-octree identity-locator lookup \
+  stars.identity-locator.idx identifiers.order gaia 5853498713190525696 --json
+uv run fis-octree identity-locator validate \
+  stars.identity-locator.idx identifiers.order \
+  --report stars.identity-locator.report.json
+```
+
+The build defaults to `<render-stem>.identity-locator.idx`. It uses restartable
+bounded Parquet runs and DuckDB external merge sorts, while the local/HTTP
+reader performs exact finite range reads. No locator fields are added to the
+project TOML, and `stage-02` never runs it automatically. See
+[`docs/identity-lookup-index.md`](docs/identity-lookup-index.md). The measured
+production default is 32 KiB raw pages; page size and codec remain declared in
+every artifact.
+
 `stage-02` defaults to the measured batched temporary-index emitter. The
 alternative below uses less scratch space while producing identical bytes:
 
@@ -211,6 +233,7 @@ src/foundinspace/octree/
   assembly/           # Shard assembly, manifests, build plan
   combine/            # Payload relocation and streaming topology/index packing
   identifiers_order.py # identifiers.order artifact assembly
+  identity_locator/    # Exact Gaia/HIP locator format, builder, reader, benchmark
   sidecars/            # Optional purpose-named sidecar builders
   stage3.py           # Current named sidecar family builder
   encoding/           # Morton code and Teff encoding utilities

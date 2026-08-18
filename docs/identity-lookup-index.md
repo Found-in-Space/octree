@@ -2,13 +2,14 @@
 
 ## Status
 
-This document specifies the proposed dataset-scoped reverse identity lookup
-artifacts. The artifacts are not implemented yet. They are purpose-named
-products and do not introduce another numbered pipeline stage.
+Locator v1 is implemented as the optional, dataset-scoped
+`identity-locator.idx`. It is a purpose-named alternative index and does not
+introduce another numbered pipeline stage. The separately described alias
+index remains a future product.
 
-The baseline design is deliberately simple: sorted, independently readable
+The locator design is deliberately simple: sorted, independently readable
 binary pages with a small navigation tree. Page size and compression codec are
-declared by the artifact and remain benchmark choices; identity semantics,
+declared by the artifact and selected by benchmark; identity semantics,
 compatibility rules, and range-read behavior are part of the contract.
 
 ## Purpose
@@ -52,9 +53,9 @@ lookup axis is identity rather than space, and multiple sidecar families may
 reuse it. The alias artifact is separate so names and cross-catalogue mappings
 can be updated without republishing the catalogue-scale locator.
 
-Both artifacts are immutable publications. Their filenames above are the
-proposed conventional names; consumers must use publication descriptors rather
-than infer compatibility from a filename.
+Both artifacts are immutable publications. `identity-locator.idx` is the
+implemented conventional locator name; consumers must still validate UUIDs
+rather than infer compatibility from a filename.
 
 ## Identity And Location Model
 
@@ -139,10 +140,19 @@ without reading any leaf data:
 - supported page and key codecs;
 - build identity or content checksum.
 
-The concrete packed header struct and magic remain to be assigned when the
-reader and writer are implemented. The header must be small enough for a
-single initial range request and may reserve space for future compatible
-fields.
+Locator v1 uses a 160-byte header with the magic `OILR`. Its packed
+little-endian struct is:
+
+```text
+<4sHHIQ16s16s16sQQIIII32sQQ12x
+```
+
+It records format version, header and total lengths, locator UUID, parent
+render UUID, exact `identifiers.order` UUID, namespace-directory range and
+count, decoded page size, navigation and leaf codec masks, deterministic
+32-byte build identity, and integrity-footer range. The locator UUID is derived
+from the exact source SHA-256, parent UUIDs, format settings, and builder
+algorithm. Equal inputs and settings therefore produce byte-identical output.
 
 ### Namespace directory
 
@@ -157,6 +167,10 @@ Each namespace descriptor contains:
 - page compression codec;
 - namespace content checksum.
 
+Descriptors are fixed 128-byte records with packed struct
+`<16sHHHHQQQQQQQII32s8x`. Locator v1 publishes exactly the independently
+navigable `gaia` and `hip` descriptors, including when one is empty.
+
 Namespaces are independent trees. A numeric Gaia lookup never reads
 Hipparcos pages, and adding a future namespace does not change the encoding of
 existing namespace keys.
@@ -170,10 +184,11 @@ sorted separator keys and absolute child page ranges:
 (separator_key, child_offset, child_length)
 ```
 
-Each page declares its kind, entry count, encoded and decoded lengths, and a
-checksum of the encoded bytes. Root and internal pages should normally be
-stored without compression because they are small, frequently cached, and
-must be decoded before the next request can be issued.
+Every page starts with a 64-byte `OILP` envelope using
+`<4sHHBBHIIII32s4x`. It declares kind, codec, entry count, encoded and decoded
+lengths, and the SHA-256 of its encoded body. Navigation records use `<QQQ>`
+for upper-fence key, absolute child offset, and child length. Navigation pages
+are always raw in v1.
 
 A namespace-specific radix directory may replace the internal B+tree only when
 it preserves the same range-read and validation guarantees and benchmarks show
@@ -195,15 +210,25 @@ within one namespace are invalid if they resolve to different locations.
 Repeating the same key and location is also rejected so publication remains
 canonical.
 
-Leaf pages are independently encoded and checksummed. Compression must never
+Leaf records use little-endian `<QII>`. Leaf pages are independently encoded
+and checksummed. Compression must never
 span multiple pages. A reader fetches and decodes one candidate leaf, performs
 a binary search, and either returns the exact value or proves that the key is
 absent.
 
-The initial page-size candidates are 32 KiB and 64 KiB decoded. The chosen
-default must be based on build-time, encoded-size, CDN, and browser lookup
-benchmarks; the selected size is recorded in the artifact rather than assumed
-by readers.
+The supported production page-size candidates are 32 KiB and 64 KiB decoded;
+leaf codecs are raw and deterministic gzip (`compresslevel=1`, `mtime=0`). The
+selected size and codec are recorded in the artifact rather than assumed by
+readers.
+
+The v2 production benchmark selected 32 KiB raw as the committed default. Its
+141.1 microsecond reader-cold median was lowest. The 64 KiB raw result was
+within the 5% tie window, after which 32 KiB raw won on p95 transferred bytes
+(78,912 versus 135,008). See
+[`identity-locator-v2-benchmark.md`](identity-locator-v2-benchmark.md).
+
+The file ends with a 64-byte `OILF` footer using `<4sHHQ32s16x`. It records the
+hashed prefix length and SHA-256 of every preceding byte.
 
 ### Future string-key namespaces
 
@@ -244,6 +269,12 @@ cache key. Cached pages from different locator publications must never be mixed.
 
 Local readers use the identical traversal with positional file reads instead
 of HTTP ranges.
+
+The Python HTTP source is deliberately stricter than the general octree
+reader. Every request is finite and must return an exact `206` range with a
+matching `Content-Range`, identity transport encoding, stable object length,
+and a strong ETag or stable Last-Modified validator. Each reader owns a bounded
+page/range cache.
 
 ## Alias Index
 
@@ -326,7 +357,7 @@ and retrieval time.
 
 ## Bounded Build Plan
 
-The locator build is a bounded external-ordering job:
+The implemented locator build is a bounded external-ordering job:
 
 1. Stream the `identifiers.order` directory and cell payloads once.
 2. Emit fixed-width `(source_id, cell_record, ordinal)` runs partitioned by
@@ -337,13 +368,43 @@ The locator build is a bounded external-ordering job:
 6. Build internal pages bottom-up from leaf fence keys and byte ranges.
 7. Publish the immutable artifact and a build report atomically.
 
-The build must not accumulate catalogue identities in RAM or insert them one at
+The scan recognizes Gaia, HIP, and manual rows through a vectorized structural
+fast path and falls back to scalar decoding only for cells containing a future
+namespace. It parses numeric IDs directly as canonical ASCII unsigned 64-bit
+decimals. Runs and merge rounds are atomically checkpointed with fixed Arrow
+schemas and semantic checksums, and compatible work resumes automatically.
+
+The build does not accumulate catalogue identities in RAM or insert them one at
 a time into a general-purpose mutable database. Spill runs are restart-safe,
 checksum-tracked, and disposable after successful publication.
 
 When practical, locator run generation may share the canonical materialized
 identity stream used by packing. It remains an optional purpose-named product;
 ordinary render packing does not require it.
+
+## Public API And CLI
+
+The Python interfaces are:
+
+```python
+build_identity_locator(IdentityLocatorBuildConfig) -> IdentityLocatorBuildResult
+IdentityLocatorReader(locator_source, identifiers_order_source)
+IdentityLocatorReader.lookup(source, source_id) -> StarRef | None
+StarRef(dataset_uuid, level, morton_code, ordinal)
+```
+
+The purpose-named CLI is:
+
+```bash
+fis-octree identity-locator build --project project.toml
+fis-octree identity-locator benchmark --project project.toml
+fis-octree identity-locator lookup LOCATOR IDENTIFIERS SOURCE SOURCE_ID --json
+fis-octree identity-locator validate LOCATOR IDENTIFIERS --report BUILD_REPORT
+```
+
+Build defaults to `<render-stem>.identity-locator.idx` with an adjacent report.
+Benchmark produces an adjacent benchmark report. Neither command adds project
+TOML fields or runs from `stage-02`.
 
 Alias construction is a separate bounded ingestion of curated identifier maps
 and cross-catalogue evidence. It resolves every posting to an exact canonical
@@ -393,9 +454,11 @@ The initial performance targets are:
 - deterministic byte-identical output for identical inputs and build settings;
 - useful page caching for both local and HTTP readers.
 
-Benchmarks must compare 32 KiB and 64 KiB pages, uncompressed and independently
-compressed leaves, cold and warm HTTP caches, present and absent keys, and
-uniform versus clustered Gaia identifier samples. A minimal perfect hash or
+The benchmark command compares 32 KiB and 64 KiB pages, raw and independently
+gzip-compressed leaves, reader-cold and warm local exact-range lookups, present
+and absent keys, and uniform versus clustered Gaia/HIP samples. Selection uses
+lowest median cold latency; results within 5% are tied and ranked by p95
+transferred bytes, artifact size, then 64 KiB gzip. A minimal perfect hash or
 specialized radix directory is a future alternative only if it materially
 improves measured size or request latency without weakening exact membership
 validation or range-read behavior.
@@ -403,6 +466,7 @@ validation or range-read behavior.
 ## Related Documents
 
 - [`identifiers-order.md`](identifiers-order.md)
+- [`identity-locator-v2-benchmark.md`](identity-locator-v2-benchmark.md)
 - [`sidecars.md`](sidecars.md)
 - [`reader.md`](reader.md)
 - [`stages.md`](stages.md)
