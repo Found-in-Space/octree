@@ -42,13 +42,11 @@ from .format import (
     unpack_namespace,
     unpack_page,
 )
+from .leaf import decode_compact_leaf, lookup_compact_leaf
 
 _CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$")
 _MAX_U64 = 2**64 - 1
 _CHILD_DTYPE = np.dtype([("maximum", "<u8"), ("offset", "<u8"), ("length", "<u8")])
-_LEAF_DTYPE = np.dtype(
-    [("source_id", "<u8"), ("cell_record", "<u4"), ("ordinal", "<u4")]
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -384,7 +382,11 @@ class IdentityLocatorReader:
                 raise ValueError("Identity locator traversal reached an unknown page")
             if page.codec != descriptor.leaf_codec:
                 raise ValueError("Identity locator leaf codec differs from namespace")
-            location = self._find_leaf_record(page.decoded, key)
+            location = self._find_leaf_record(
+                page.decoded,
+                key,
+                entry_count=page.entry_count,
+            )
             if location is None:
                 return None
             cell_record, ordinal = location
@@ -411,17 +413,17 @@ class IdentityLocatorReader:
         return int(children["offset"][index]), int(children["length"][index])
 
     @staticmethod
-    def _find_leaf_record(decoded: bytes, key: int) -> tuple[int, int] | None:
-        records = np.frombuffer(decoded, dtype=_LEAF_DTYPE)
-        keys = records["source_id"]
-        if len(keys) > 1 and np.any(keys[1:] <= keys[:-1]):
-            raise ValueError("Identity locator leaf keys are not increasing")
-        index = int(np.searchsorted(keys, np.uint64(key), side="left"))
-        if index >= len(records):
-            return None
-        if int(records["source_id"][index]) != key:
-            return None
-        return int(records["cell_record"][index]), int(records["ordinal"][index])
+    def _find_leaf_record(
+        decoded: bytes,
+        key: int,
+        *,
+        entry_count: int,
+    ) -> tuple[int, int] | None:
+        return lookup_compact_leaf(
+            decoded,
+            entry_count=entry_count,
+            source_id=key,
+        )
 
     def _read_directory_record(self, record_index: int) -> IdentifiersOrderRecord:
         if record_index < 0 or record_index >= self.identifiers_header.record_count:
@@ -477,7 +479,11 @@ class IdentityLocatorReader:
             if page.kind == PAGE_KIND_INTERNAL:
                 offset, length = self._select_child(page.decoded, key)
                 continue
-            result = self._find_leaf_record(page.decoded, key)
+            result = self._find_leaf_record(
+                page.decoded,
+                key,
+                entry_count=page.entry_count,
+            )
             if result is None:
                 raise ValueError("Identity locator key disappeared during verification")
             return result
@@ -536,7 +542,10 @@ class IdentityLocatorReader:
                         raise ValueError(
                             "Identity locator leaf codec differs from namespace"
                         )
-                    records = np.frombuffer(page.decoded, dtype=_LEAF_DTYPE)
+                    records = decode_compact_leaf(
+                        page.decoded,
+                        entry_count=page.entry_count,
+                    )
                     if not len(records):
                         raise ValueError("Identity locator leaf page is empty")
                     keys = records["source_id"]
@@ -556,7 +565,7 @@ class IdentityLocatorReader:
                         raise ValueError("Identity locator cell record is out of range")
                     previous_key = last_key
                     leaf_pages += 1
-                    content_digest.update(page.decoded)
+                    content_digest.update(records.tobytes())
                     return first_key, last_key, len(records)
 
                 if page.codec != CODEC_NONE:

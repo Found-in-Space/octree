@@ -38,18 +38,17 @@ from ..identifiers_order import (
 from ..reader import read_header as read_octree_header
 from .format import (
     CHILD_RECORD_FMT,
-    CODEC_CODES,
+    CODEC_COMPACT,
     CODEC_NONE,
     FOOTER_SIZE,
-    GZIP_COMPRESSLEVEL,
     HEADER_SIZE,
-    KEY_CODEC_U64_DECIMAL,
+    KEY_CODEC_DELTA_U64_BLOCK32,
     LEAF_RECORD_FMT,
     NAMESPACE_SIZE,
     PAGE_HEADER_SIZE,
     PAGE_KIND_INTERNAL,
     PAGE_KIND_LEAF,
-    VALUE_CODEC_CELL_U32_ORDINAL_U32,
+    VALUE_CODEC_CELL_DICTIONARY_ORDINAL_BITS,
     IdentityLocatorHeader,
     NamespaceDescriptor,
     pack_footer,
@@ -57,10 +56,11 @@ from .format import (
     pack_namespace,
     pack_page,
 )
+from .leaf import KEY_BLOCK_SIZE, encode_compact_leaf
 
 NAMESPACES = ("gaia", "hip")
 DEFAULT_PAGE_SIZE = 32 * 1024
-DEFAULT_LEAF_CODEC = "none"
+DEFAULT_LEAF_CODEC = "delta-dict-b32"
 DEFAULT_SCAN_BATCH_BYTES = 32 * 1024 * 1024
 DEFAULT_MERGE_FAN_IN = 32
 DEFAULT_MERGE_BATCH_ROWS = 262_144
@@ -84,6 +84,19 @@ _SOURCE_PREFIXES = {
     "manual": b"\x06\x00manual",
 }
 _MAX_U64_DECIMAL = b"18446744073709551615"
+_NAMESPACE_KEY_SHIFTS = {"gaia": 7, "hip": 0}
+
+
+def _page_key_shift(records: np.ndarray, namespace: str) -> int:
+    """Use only low zero bits shared by every key in this leaf page."""
+    maximum_shift = _NAMESPACE_KEY_SHIFTS[namespace]
+    if maximum_shift == 0:
+        return 0
+    combined = int(np.bitwise_or.reduce(records["source_id"]))
+    if combined == 0:
+        return maximum_shift
+    trailing_zeroes = (combined & -combined).bit_length() - 1
+    return min(maximum_shift, trailing_zeroes)
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,8 +129,8 @@ class IdentityLocatorBuildConfig:
     def validate(self) -> None:
         if self.decoded_page_size < 128 or self.decoded_page_size > 64 * 1024:
             raise ValueError("decoded_page_size must be in 128..65536")
-        if self.leaf_codec not in CODEC_CODES:
-            raise ValueError("leaf_codec must be 'none' or 'gzip'")
+        if self.leaf_codec != DEFAULT_LEAF_CODEC:
+            raise ValueError(f"leaf_codec must be {DEFAULT_LEAF_CODEC!r}")
         if self.scan_batch_bytes <= 0:
             raise ValueError("scan_batch_bytes must be > 0")
         if self.max_cell_payload_bytes <= 0:
@@ -938,7 +951,7 @@ def _encode_leaf_product(
     catalog_path = product_dir / "leaves.catalog"
     spool_tmp = spool_path.with_name(f".{spool_path.name}.{os.getpid()}.tmp")
     catalog_tmp = catalog_path.with_name(f".{catalog_path.name}.{os.getpid()}.tmp")
-    codec = CODEC_CODES[config.leaf_codec]
+    codec = CODEC_COMPACT
     page_capacity = config.decoded_page_size // LEAF_RECORD_FMT.size
     if page_capacity <= 0:
         raise ValueError("Identity locator page cannot hold one leaf record")
@@ -980,11 +993,16 @@ def _encode_leaf_product(
             last_key = LEAF_RECORD_FMT.unpack_from(
                 page_buffer, len(page_buffer) - LEAF_RECORD_FMT.size
             )[0]
+            records = np.frombuffer(page_buffer, dtype=RUN_DTYPE)
+            compact = encode_compact_leaf(
+                records,
+                key_shift=_page_key_shift(records, namespace),
+            )
             encoded = pack_page(
                 kind=PAGE_KIND_LEAF,
                 codec=codec,
                 entry_count=entry_count,
-                decoded=bytes(page_buffer),
+                decoded=compact,
             )
             spool_offset = spool.tell()
             spool.write(encoded)
@@ -1181,10 +1199,8 @@ def _build_identity_digest(
         "identifiers_order_uuid": str(identifiers_order_uuid),
         "decoded_page_size": decoded_page_size,
         "leaf_codec": leaf_codec,
-        "gzip_mtime": 0 if leaf_codec == "gzip" else None,
+        "key_block_size": KEY_BLOCK_SIZE,
     }
-    if leaf_codec == "gzip":
-        value["gzip_compresslevel"] = GZIP_COMPRESSLEVEL
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).digest()
 
@@ -1259,15 +1275,15 @@ def _assemble_locator(
         leaf_codec=config.leaf_codec,
     )
     locator_uuid = _uuid_from_digest(build_identity)
-    codec = CODEC_CODES[config.leaf_codec]
+    codec = CODEC_COMPACT
     descriptors: list[NamespaceDescriptor] = []
     for tree in trees:
         root_offset, root_length = _root_range(tree)
         descriptors.append(
             NamespaceDescriptor(
                 name=tree.leaf.namespace,
-                key_codec=KEY_CODEC_U64_DECIMAL,
-                value_codec=VALUE_CODEC_CELL_U32_ORDINAL_U32,
+                key_codec=KEY_CODEC_DELTA_U64_BLOCK32,
+                value_codec=VALUE_CODEC_CELL_DICTIONARY_ORDINAL_BITS,
                 leaf_codec=codec,
                 flags=0,
                 record_count=tree.leaf.record_count,
@@ -1277,7 +1293,7 @@ def _assemble_locator(
                 maximum_key=tree.leaf.maximum_key,
                 leaf_page_count=tree.leaf.page_count,
                 navigation_page_count=tree.navigation_page_count,
-                decoded_record_size=LEAF_RECORD_FMT.size,
+                decoded_record_size=0,
                 content_checksum=tree.leaf.content_checksum,
             )
         )
@@ -1555,9 +1571,7 @@ def build_identity_locator(
         "identifiers_order_uuid": str(order_header.artifact_uuid),
         "decoded_page_size": config.decoded_page_size,
         "leaf_codec": config.leaf_codec,
-        "gzip_compresslevel": (
-            GZIP_COMPRESSLEVEL if config.leaf_codec == "gzip" else None
-        ),
+        "key_block_size": KEY_BLOCK_SIZE,
         "benchmark_choice": {
             "decoded_page_size": config.decoded_page_size,
             "leaf_codec": config.leaf_codec,

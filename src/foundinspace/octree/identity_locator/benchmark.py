@@ -15,6 +15,7 @@ from typing import Any
 
 from .builder import (
     DEFAULT_EXTERNAL_SORT_MEMORY_LIMIT,
+    DEFAULT_LEAF_CODEC,
     DEFAULT_MERGE_BATCH_ROWS,
     DEFAULT_MERGE_FAN_IN,
     DEFAULT_SCAN_BATCH_BYTES,
@@ -26,10 +27,8 @@ from .reader import IdentityLocatorReader
 
 BENCHMARK_FORMAT = "foundinspace.octree.identity-locator-benchmark/v1"
 CANDIDATES = (
-    (32 * 1024, "none"),
-    (32 * 1024, "gzip"),
-    (64 * 1024, "none"),
-    (64 * 1024, "gzip"),
+    (16 * 1024, DEFAULT_LEAF_CODEC),
+    (32 * 1024, DEFAULT_LEAF_CODEC),
 )
 
 
@@ -160,11 +159,7 @@ def _select_winner(results: list[dict[str, object]]) -> dict[str, object]:
     ]
 
     def rank(result: dict[str, object]) -> tuple[float, int, int]:
-        preference = (
-            0
-            if result["page_size"] == 64 * 1024 and result["leaf_codec"] == "gzip"
-            else 1
-        )
+        preference = 0 if result["page_size"] == 32 * 1024 else 1
         return (
             float(result["p95_transferred_bytes"]),
             int(result["output_size"]),
@@ -177,7 +172,7 @@ def _select_winner(results: list[dict[str, object]]) -> dict[str, object]:
 def benchmark_identity_locator(
     config: IdentityLocatorBenchmarkConfig,
 ) -> IdentityLocatorBenchmarkResult:
-    """Build the four production candidates and select the point-lookup winner."""
+    """Build the compact page-capacity candidates and select the lookup winner."""
     config.validate()
     work_dir = config.work_dir.expanduser().resolve()
     report_path = config.report_path.expanduser().resolve()
@@ -275,7 +270,7 @@ def benchmark_identity_locator(
         "format": BENCHMARK_FORMAT,
         "selection_policy": (
             "lowest cold median; within 5% prefer lower p95 transferred bytes, "
-            "then artifact size, then 64 KiB gzip"
+            "then artifact size, then the default 32 KiB logical page capacity"
         ),
         "identifiers_order_path": str(config.identifiers_order_path.resolve()),
         "results": results,

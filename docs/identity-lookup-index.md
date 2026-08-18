@@ -8,9 +8,9 @@ introduce another numbered pipeline stage. The separately described alias
 index remains a future product.
 
 The locator design is deliberately simple: sorted, independently readable
-binary pages with a small navigation tree. Page size and compression codec are
-declared by the artifact and selected by benchmark; identity semantics,
-compatibility rules, and range-read behavior are part of the contract.
+binary pages with a small navigation tree. Locator v1 uses compact block-32
+numeric leaves; identity semantics and range-read behavior are part of the
+contract.
 
 ## Purpose
 
@@ -159,12 +159,12 @@ algorithm. Equal inputs and settings therefore produce byte-identical output.
 Each namespace descriptor contains:
 
 - canonical namespace name;
-- key codec, initially `u64-decimal` for `gaia` and `hip`;
-- value codec, initially `cell-record-u32-ordinal-u32`;
+- compact block-32 delta key codec for `gaia` and `hip`;
+- page-local cell dictionary plus bit-packed ordinal value codec;
 - record count;
 - root page offset and encoded length;
 - minimum and maximum key, when applicable;
-- page compression codec;
+- leaf codec;
 - namespace content checksum.
 
 Descriptors are fixed 128-byte records with packed struct
@@ -196,8 +196,9 @@ a material improvement. It is not required for locator v1.
 
 ### Numeric leaf pages
 
-Gaia and Hipparcos leaves are sorted numerically by `source_id`. The baseline
-decoded record is fixed-width:
+Gaia and Hipparcos leaves are sorted numerically by `source_id`. During the
+external sort and for the semantic namespace checksum, each record is the
+fixed-width tuple:
 
 ```text
 source_id:   u64
@@ -205,26 +206,37 @@ cell_record: u32
 ordinal:     u32
 ```
 
-This is 16 bytes per rendered identity before page compression. Duplicate keys
+This is 16 bytes per rendered identity before leaf encoding. Duplicate keys
 within one namespace are invalid if they resolve to different locations.
 Repeating the same key and location is also rejected so publication remains
 canonical.
 
-Leaf records use little-endian `<QII>`. Leaf pages are independently encoded
-and checksummed. Compression must never
-span multiple pages. A reader fetches and decodes one candidate leaf, performs
-a binary search, and either returns the exact value or proves that the key is
-absent.
+On disk, a leaf begins with the 20-byte `OILD` header
+`<4sBBBBBBBHHI1x>`. It declares the v1 leaf layout, page-specific key shift
+and widths, fixed key block size 32, cell-dictionary count, key-block count,
+and delta-stream length. Its body is:
 
-The supported production page-size candidates are 32 KiB and 64 KiB decoded;
-leaf codecs are raw and deterministic gzip (`compresslevel=1`, `mtime=0`). The
-selected size and codec are recorded in the artifact rather than assumed by
-readers.
+```text
+block checkpoints
+sorted cell_record dictionary
+bit-packed dictionary indexes
+bit-packed ordinals
+positive uLEB128 key deltas
+```
 
-The v2 production benchmark selected 32 KiB raw as the committed default. Its
-141.1 microsecond reader-cold median was lowest. The 64 KiB raw result was
-within the 5% tie window, after which 32 KiB raw won on p95 transferred bytes
-(78,912 versus 135,008). See
+Each block checkpoint stores one absolute shifted key and a `u16` offset into
+the delta stream. Subsequent keys in that block store positive deltas, so a
+point lookup binary-searches the checkpoint table and decodes at most 31
+deltas. Gaia pages omit up to seven low zero bits when every key in the page
+shares them; other pages declare a smaller shift when necessary. Cell records
+use a sorted page-local dictionary with minimum-width entries and packed
+indexes. Ordinals use the minimum bit width required by the page.
+
+Leaf pages are independently encoded and SHA-256 checksummed. The default
+logical page budget is 32 KiB, or 2,048 semantic `<QII>` records; compact body
+sizes are variable. The benchmark command also supports a 16 KiB / 1,024-record
+candidate. The selected logical size and compact codec are recorded in the
+artifact rather than assumed by readers. See
 [`identity-locator-v2-benchmark.md`](identity-locator-v2-benchmark.md).
 
 The file ends with a 64-byte `OILF` footer using `<4sHHQ32s16x`. It records the
@@ -259,7 +271,7 @@ Remote publications must:
 - support HTTP byte ranges;
 - use stable immutable URLs or stable validators such as strong ETags;
 - serve the binary object with `Content-Encoding: identity`, because internal
-  pages already define their compression and offsets address the stored bytes;
+  pages already define their encoding and offsets address the stored bytes;
 - expose the required range and validator headers through CORS for browser
   clients;
 - retain a stable object length for the lifetime of a publication.
@@ -440,10 +452,10 @@ resolved ordinal.
 
 ## Sizing And Performance Targets
 
-At 1.47 billion rendered identities, the uncompressed numeric locator records
-alone are approximately 23.5 GB (`16 * record_count`). This is acceptable as an
-immutable optional artifact only because clients never download it wholesale
-for point lookup.
+At 1.47 billion rendered identities, fixed-width numeric locator records alone
+would occupy approximately 23.5 GB (`16 * record_count`). Compact block-32
+leaves reduce the production artifact to 7,825,090,541 bytes while retaining
+bounded point lookup.
 
 The initial performance targets are:
 
@@ -454,12 +466,12 @@ The initial performance targets are:
 - deterministic byte-identical output for identical inputs and build settings;
 - useful page caching for both local and HTTP readers.
 
-The benchmark command compares 32 KiB and 64 KiB pages, raw and independently
-gzip-compressed leaves, reader-cold and warm local exact-range lookups, present
-and absent keys, and uniform versus clustered Gaia/HIP samples. Selection uses
-lowest median cold latency; results within 5% are tied and ranked by p95
-transferred bytes, artifact size, then 64 KiB gzip. A minimal perfect hash or
-specialized radix directory is a future alternative only if it materially
+The benchmark command compares 1,024- and 2,048-record compact leaves,
+reader-cold and warm local exact-range lookups, present and absent keys, and
+uniform versus clustered Gaia/HIP samples. Selection uses lowest median cold
+latency; results within 5% are tied and ranked by p95 transferred bytes,
+artifact size, then the default 2,048-record capacity. A minimal perfect hash
+or specialized radix directory is a future alternative only if it materially
 improves measured size or request latency without weakening exact membership
 validation or range-read behavior.
 

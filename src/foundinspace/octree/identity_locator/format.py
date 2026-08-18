@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import gzip
 import hashlib
 import struct
 from dataclasses import dataclass
@@ -33,12 +32,11 @@ assert FOOTER_FMT.size == FOOTER_SIZE
 PAGE_KIND_LEAF = 1
 PAGE_KIND_INTERNAL = 2
 CODEC_NONE = 0
-CODEC_GZIP = 1
-GZIP_COMPRESSLEVEL = 1
-KEY_CODEC_U64_DECIMAL = 1
-VALUE_CODEC_CELL_U32_ORDINAL_U32 = 1
+CODEC_COMPACT = 1
+KEY_CODEC_DELTA_U64_BLOCK32 = 1
+VALUE_CODEC_CELL_DICTIONARY_ORDINAL_BITS = 1
 
-CODEC_NAMES = {CODEC_NONE: "none", CODEC_GZIP: "gzip"}
+CODEC_NAMES = {CODEC_NONE: "none", CODEC_COMPACT: "delta-dict-b32"}
 CODEC_CODES = {value: key for key, value in CODEC_NAMES.items()}
 
 
@@ -211,13 +209,13 @@ def unpack_namespace(raw: bytes) -> NamespaceDescriptor:
         raise ValueError("Identity namespace name is not ASCII") from exc
     if not name:
         raise ValueError("Identity namespace name is empty")
-    if key_codec != KEY_CODEC_U64_DECIMAL:
+    if key_codec != KEY_CODEC_DELTA_U64_BLOCK32:
         raise ValueError(f"Unsupported identity namespace key codec: {key_codec}")
-    if value_codec != VALUE_CODEC_CELL_U32_ORDINAL_U32:
+    if value_codec != VALUE_CODEC_CELL_DICTIONARY_ORDINAL_BITS:
         raise ValueError(f"Unsupported identity namespace value codec: {value_codec}")
-    if leaf_codec not in CODEC_NAMES:
+    if leaf_codec != CODEC_COMPACT:
         raise ValueError(f"Unsupported identity namespace leaf codec: {leaf_codec}")
-    if decoded_record_size != LEAF_RECORD_FMT.size:
+    if decoded_record_size != 0:
         raise ValueError(
             f"Unsupported identity namespace record size: {decoded_record_size}"
         )
@@ -242,16 +240,14 @@ def unpack_namespace(raw: bytes) -> NamespaceDescriptor:
 def pack_page(*, kind: int, codec: int, entry_count: int, decoded: bytes) -> bytes:
     if kind not in (PAGE_KIND_LEAF, PAGE_KIND_INTERNAL):
         raise ValueError(f"Unsupported identity locator page kind: {kind}")
-    if codec == CODEC_NONE:
+    if codec in (CODEC_NONE, CODEC_COMPACT):
         encoded = decoded
-    elif codec == CODEC_GZIP:
-        encoded = gzip.compress(
-            decoded,
-            compresslevel=GZIP_COMPRESSLEVEL,
-            mtime=0,
-        )
     else:
         raise ValueError(f"Unsupported identity locator page codec: {codec}")
+    if kind == PAGE_KIND_INTERNAL and codec != CODEC_NONE:
+        raise ValueError("Identity locator navigation pages must be raw")
+    if kind == PAGE_KIND_LEAF and codec != CODEC_COMPACT:
+        raise ValueError("Identity locator leaf pages must use the compact codec")
     checksum = hashlib.sha256(encoded).digest()
     header = PAGE_HEADER_FMT.pack(
         PAGE_MAGIC,
@@ -298,20 +294,16 @@ def unpack_page(raw: bytes) -> DecodedPage:
     encoded = raw[PAGE_HEADER_SIZE:]
     if hashlib.sha256(encoded).digest() != checksum:
         raise ValueError("Identity locator page checksum mismatch")
-    if codec == CODEC_NONE:
-        decoded = encoded
-    else:
-        try:
-            decoded = gzip.decompress(encoded)
-        except (EOFError, OSError) as exc:
-            raise ValueError("Identity locator gzip page is invalid") from exc
+    decoded = encoded
     if len(decoded) != decoded_length:
         raise ValueError("Identity locator page decoded length mismatch")
-    record_size = (
-        LEAF_RECORD_FMT.size if kind == PAGE_KIND_LEAF else CHILD_RECORD_FMT.size
-    )
-    if decoded_length != entry_count * record_size:
+    if (
+        kind == PAGE_KIND_INTERNAL
+        and decoded_length != entry_count * CHILD_RECORD_FMT.size
+    ):
         raise ValueError("Identity locator page entry count mismatch")
+    if kind == PAGE_KIND_LEAF and codec != CODEC_COMPACT:
+        raise ValueError("Identity locator leaf page is not compact")
     return DecodedPage(
         kind=int(kind),
         codec=int(codec),

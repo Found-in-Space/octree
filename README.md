@@ -155,8 +155,10 @@ bounded Parquet runs and DuckDB external merge sorts, while the local/HTTP
 reader performs exact finite range reads. No locator fields are added to the
 project TOML, and `stage-02` never runs it automatically. See
 [`docs/identity-lookup-index.md`](docs/identity-lookup-index.md). The measured
-production default is 32 KiB raw pages; page size and codec remain declared in
-every artifact.
+production default uses 2,048-record logical pages and compact block-32 leaves
+with delta-coded IDs plus page-local cell dictionaries. The leaf layout is
+self-describing in every page. On the dataset-v2 production build this reduced
+the locator from 23.55 GB to 7.83 GB without a measured lookup regression.
 
 `stage-02` defaults to the measured batched temporary-index emitter. The
 alternative below uses less scratch space while producing identical bytes:

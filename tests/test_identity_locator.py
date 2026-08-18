@@ -28,16 +28,20 @@ from foundinspace.octree.identity_locator import (
     validate_identity_locator,
 )
 from foundinspace.octree.identity_locator.format import (
-    CODEC_NONE,
+    CODEC_COMPACT,
     FOOTER_SIZE,
     HEADER_SIZE,
-    LEAF_RECORD_FMT,
     NAMESPACE_SIZE,
     PAGE_HEADER_SIZE,
     pack_page,
     unpack_header,
     unpack_namespace,
     unpack_page,
+)
+from foundinspace.octree.identity_locator.leaf import (
+    decode_compact_leaf,
+    encode_compact_leaf,
+    parse_compact_leaf,
 )
 
 DATASET_UUID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
@@ -96,7 +100,7 @@ def _config(
     order_path: Path,
     *,
     page_size: int = 128,
-    codec: str = "gzip",
+    codec: str = "delta-dict-b32",
     retain_work: bool = False,
 ) -> IdentityLocatorBuildConfig:
     return IdentityLocatorBuildConfig(
@@ -156,10 +160,8 @@ def test_format_sizes_are_fixed() -> None:
     assert FOOTER_SIZE == 64
 
 
-@pytest.mark.parametrize("codec", ["none", "gzip"])
 def test_builder_and_reader_round_trip_multiple_tree_levels(
     tmp_path: Path,
-    codec: str,
 ) -> None:
     cells = [
         [("gaia", str(value)) for value in range(index * 6 + 1, index * 6 + 7)]
@@ -169,7 +171,7 @@ def test_builder_and_reader_round_trip_multiple_tree_levels(
     cells[1].append(("hip", "71683"))
     render_path, order_path = _build_dataset(tmp_path, cells)
     result = build_identity_locator(
-        _config(tmp_path, render_path, order_path, codec=codec, retain_work=True)
+        _config(tmp_path, render_path, order_path, retain_work=True)
     )
 
     assert result.namespace_counts == {"gaia": 36, "hip": 1}
@@ -358,7 +360,7 @@ def test_reader_rejects_corrupt_page(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("cell_record", "ordinal", "message"),
     [
-        (2**32 - 1, 0, "cell record is out of range"),
+        (1, 0, "cell record is out of range"),
         (0, 2, "ordinal exceeds"),
     ],
 )
@@ -369,9 +371,7 @@ def test_reader_rejects_validly_checksummed_out_of_range_reference(
     message: str,
 ) -> None:
     render_path, order_path = _build_dataset(tmp_path, [[("gaia", "1")]])
-    result = build_identity_locator(
-        _config(tmp_path, render_path, order_path, codec="none")
-    )
+    result = build_identity_locator(_config(tmp_path, render_path, order_path))
     raw = bytearray(result.output_path.read_bytes())
     header = unpack_header(raw[:HEADER_SIZE])
     directory_start = header.namespace_directory_offset
@@ -381,13 +381,19 @@ def test_reader_rejects_validly_checksummed_out_of_range_reference(
     page_start = descriptor.root_offset
     page_end = page_start + descriptor.root_length
     page = unpack_page(raw[page_start:page_end])
-    decoded = bytearray(page.decoded)
-    LEAF_RECORD_FMT.pack_into(decoded, 0, 1, cell_record, ordinal)
+    records = decode_compact_leaf(page.decoded, entry_count=page.entry_count).copy()
+    records["cell_record"][0] = cell_record
+    records["ordinal"][0] = ordinal
+    key_shift = parse_compact_leaf(
+        page.decoded,
+        entry_count=page.entry_count,
+    ).key_shift
+    decoded = encode_compact_leaf(records, key_shift=key_shift)
     replacement = pack_page(
         kind=page.kind,
-        codec=CODEC_NONE,
+        codec=CODEC_COMPACT,
         entry_count=page.entry_count,
-        decoded=bytes(decoded),
+        decoded=decoded,
     )
     assert len(replacement) == descriptor.root_length
     raw[page_start:page_end] = replacement
@@ -528,7 +534,7 @@ def test_http_range_reader_rejects_invalid_responses(
         IdentityLocatorReader(locator_url, order_url)
 
 
-def test_benchmark_builds_full_candidate_matrix_from_shared_runs(
+def test_benchmark_builds_compact_page_size_candidates_from_shared_runs(
     tmp_path: Path,
 ) -> None:
     render_path, order_path = _build_dataset(
@@ -550,11 +556,14 @@ def test_benchmark_builds_full_candidate_matrix_from_shared_runs(
     )
     report = json.loads(result.report_path.read_text(encoding="utf-8"))
 
-    assert len(report["results"]) == 4
+    assert len(report["results"]) == 2
     assert result.winner_candidate_path.is_file()
     assert {candidate["leaf_codec"] for candidate in report["results"]} == {
-        "none",
-        "gzip",
+        "delta-dict-b32"
+    }
+    assert {candidate["page_size"] for candidate in report["results"]} == {
+        16 * 1024,
+        32 * 1024,
     }
     assert all("p95_transferred_bytes" in value for value in report["results"])
 

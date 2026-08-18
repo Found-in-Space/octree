@@ -118,17 +118,10 @@ def _identity_locator_progress_reporter():
 )
 @click.option(
     "--page-size",
-    type=click.Choice(("32768", "65536")),
+    type=click.Choice(("16384", "32768")),
     default="32768",
     show_default=True,
-    help="Decoded leaf and navigation page size in bytes.",
-)
-@click.option(
-    "--compression",
-    type=click.Choice(("none", "gzip")),
-    default="none",
-    show_default=True,
-    help="Leaf-page codec.",
+    help="Logical leaf record budget and navigation page size in bytes.",
 )
 @click.option(
     "--scan-batch-mib",
@@ -166,7 +159,6 @@ def identity_locator_build(
     report_path: Path | None,
     work_dir: Path | None,
     page_size: str,
-    compression: str,
     scan_batch_mib: float,
     merge_fan_in: int,
     merge_batch_rows: int,
@@ -196,7 +188,6 @@ def identity_locator_build(
                 report_path=report,
                 work_dir=work,
                 decoded_page_size=int(page_size),
-                leaf_codec=compression,
                 scan_batch_bytes=max(1, round(scan_batch_mib * 1024 * 1024)),
                 merge_fan_in=merge_fan_in,
                 merge_batch_rows=merge_batch_rows,
@@ -287,7 +278,7 @@ def identity_locator_benchmark(
     retain_candidates: bool,
     force: bool,
 ) -> None:
-    """Build and benchmark the 32/64 KiB by raw/gzip candidate matrix."""
+    """Benchmark compact leaves at the supported logical page capacities."""
     from foundinspace.octree.identity_locator import (
         IdentityLocatorBenchmarkConfig,
         benchmark_identity_locator,
@@ -323,7 +314,7 @@ def identity_locator_benchmark(
     click.echo(
         "Identity locator benchmark winner: "
         f"page_size={result.winning_page_size}, "
-        f"compression={result.winning_leaf_codec}"
+        f"leaf_codec={result.winning_leaf_codec}"
     )
     click.echo(f"Winner candidate {result.winner_candidate_path}")
     click.echo(f"Wrote {result.report_path}")
