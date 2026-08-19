@@ -478,14 +478,14 @@ def test_classic_build_folds_deep_rows_into_capped_node(tmp_path: Path) -> None:
             "x_icrs_pc": node_one_center[0],
             "y_icrs_pc": node_one_center[1],
             "z_icrs_pc": node_one_center[2],
-            "mag_abs": 8.0,
+            "mag_abs": 8.5,
         },
         {
             "source_id": "a",
             "x_icrs_pc": node_zero_center[0],
             "y_icrs_pc": node_zero_center[1],
             "z_icrs_pc": node_zero_center[2],
-            "mag_abs": 7.0,
+            "mag_abs": 8.0,
         },
     ]
     _input_root, stage00_dir, stage01_dir = _build_stages(

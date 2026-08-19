@@ -271,6 +271,7 @@ def test_stage00_explicit_raw_filter_preserves_row_count_and_records_filter(
         "level",
     }.issubset(table.schema.names)
     assert "render" not in table.schema.names
+    assert table.column("level").to_pylist() == [13, 13]
     assert table.select(
         ["x_icrs_pc", "y_icrs_pc", "z_icrs_pc", "mag_abs", "teff"]
     ).to_pylist() == [
