@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Add routing columns to HEALPix parquet in a streaming, non-destructive flow.
 
-Stage 00 processes one HEALPix pixel directory at a time:
+Routing processes one HEALPix pixel directory at a time:
 1. Stream source rows in batches.
 2. Compute morton_code and natural level columns while preserving raw fields.
 3. Sort each batch by morton_code/mag_abs and write temporary run files.

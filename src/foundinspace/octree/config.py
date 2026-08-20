@@ -9,6 +9,6 @@ DEFAULT_CLASSIC_PARTITION_FROM_LEVEL = 8
 DEFAULT_CLASSIC_PARTITION_PREFIX_BITS = 6
 DEFAULT_STAR_FORMAT_VERSION = 2
 DEFAULT_TERMINAL_WATERLINE = 1_000
-# Above practical staged depths so Stage 01 uses one shard per level unless overridden.
+# Above practical preparation depths so one shard is used per level unless overridden.
 DEFAULT_DEEP_SHARD_FROM_LEVEL = 99
 DEFAULT_MAG_VIS = 6.5

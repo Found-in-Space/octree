@@ -7,91 +7,63 @@ from uuid import UUID
 from click.testing import CliRunner
 
 from foundinspace.octree._cli import cli
-from foundinspace.octree.combine import IndexEmissionStrategy
+from foundinspace.octree.packing import IndexEmissionStrategy
+from project_helpers import project_text
 
 
 def _write_project(
     project_path: Path,
     *,
-    stage01_dir: Path,
+    preparation_dir: Path,
     output: Path,
     identifiers_output: Path,
     max_open_files: int = 32,
+    profile_name: str = "terminal-packed",
+    index_emission_strategy: str = "temp-pwrite-batched",
 ) -> None:
     project_path.write_text(
-        f"""
-format_version = 1
-
-[paths]
-merged_healpix_dir = "{(project_path.parent / "merged").as_posix()}"
-identifiers_map_path = "{(project_path.parent / "identifiers_map.parquet").as_posix()}"
-stage00_output_dir = "{(project_path.parent / "stage00").as_posix()}"
-stage01_output_dir = "{stage01_dir.as_posix()}"
-stage02_output_path = "{output.as_posix()}"
-identifiers_order_output_path = "{identifiers_output.as_posix()}"
-stage03_output_dir = "{(project_path.parent / "stage03").as_posix()}"
-
-[stage00]
-batch_size = 1000000
-v_mag = 6.5
-
-[stage01]
-input_glob = "{(project_path.parent / "stage00" / "**" / "*.parquet").as_posix()}"
-batch_size = 100000
-deep_shard_from_level = 99
-deep_prefix_bits = 3
-
-[stage02]
-max_open_files = {max_open_files}
-
-[stage03]
-
-[[stage03.sidecars]]
-name = "meta"
-fields = []
-""".strip()
-        + "\n",
+        project_text(
+            project_path.parent,
+            prepared_dir=preparation_dir,
+            render_output_path=output,
+            identifiers_order_output_path=identifiers_output,
+            max_open_files=max_open_files,
+            profile_name=profile_name,
+            index_emission_strategy=index_emission_strategy,
+        ),
         encoding="utf-8",
     )
 
 
-def test_stage02_help() -> None:
+def test_build_help() -> None:
     runner = CliRunner()
-    result = runner.invoke(cli, ["stage-02", "--help"])
+    result = runner.invoke(cli, ["build", "--help"])
     assert result.exit_code == 0
     assert "--project" in result.output
     assert "--retain-relocation-files" in result.output
-    assert "--max-level" in result.output
-    assert "--star-format-version" in result.output
-    assert "--terminal-waterline" in result.output
-    assert "--index-emission-strategy" in result.output
-    assert "temp-pwrite-batched" in result.output
-    assert "forward" in result.output
-    assert "--intermediates-dir" in result.output
-    assert "--work-dir" in result.output
 
 
-def test_stage02_requires_project() -> None:
+def test_build_requires_project() -> None:
     runner = CliRunner()
-    result = runner.invoke(cli, ["stage-02"])
+    result = runner.invoke(cli, ["build"])
     assert result.exit_code != 0
     assert "--project" in result.output
 
 
-def test_stage02_builds_classic_output_from_project(
-    monkeypatch, tmp_path: Path
-) -> None:
-    stage01_dir = tmp_path / "stage01"
-    stage01_dir.mkdir()
+def test_build_builds_classic_output_from_project(monkeypatch, tmp_path: Path) -> None:
+    preparation_dir = tmp_path / "preparation"
+    preparation_dir.mkdir()
     output = tmp_path / "stars.octree"
     identifiers_output = tmp_path / "identifiers.order"
     project_path = tmp_path / "project.toml"
     _write_project(
         project_path,
-        stage01_dir=stage01_dir,
+        preparation_dir=preparation_dir,
         output=output,
         identifiers_output=identifiers_output,
         max_open_files=7,
+        profile_name="classic",
+        index_emission_strategy="forward",
     )
     calls = []
 
@@ -107,7 +79,7 @@ def test_stage02_builds_classic_output_from_project(
         )
 
     monkeypatch.setattr(
-        "foundinspace.octree.classic.build_classic_artifacts",
+        "foundinspace.octree.base_build.build_base_artifacts",
         _fake_build,
     )
 
@@ -115,53 +87,39 @@ def test_stage02_builds_classic_output_from_project(
     result = runner.invoke(
         cli,
         [
-            "stage-02",
+            "build",
             "--project",
             str(project_path),
             "--retain-relocation-files",
-            "--max-level",
-            "13",
-            "--star-format-version",
-            "1",
-            "--terminal-waterline",
-            "250",
-            "--index-emission-strategy",
-            "forward",
-            "--intermediates-dir",
-            str(tmp_path / "v2-intermediates"),
-            "--work-dir",
-            str(tmp_path / "v2-work"),
         ],
     )
 
     assert result.exit_code == 0
-    assert calls[0].stage01_output_dir == stage01_dir
+    assert calls[0].prepared_dir == preparation_dir
     assert calls[0].output_path == output
     assert calls[0].identifiers_order_path == identifiers_output
     assert calls[0].max_open_files == 7
     assert calls[0].retain_relocation_files is True
-    assert calls[0].max_level == 13
+    assert calls[0].max_level == 14
     assert calls[0].star_format_version == 1
-    assert calls[0].terminal_waterline == 250
+    assert calls[0].terminal_waterline is None
     assert calls[0].index_emission_strategy == IndexEmissionStrategy.FORWARD
-    assert calls[0].intermediates_dir == tmp_path / "v2-intermediates"
-    assert calls[0].work_dir == tmp_path / "v2-work"
+    assert calls[0].materialized_dir == tmp_path / "materialized"
+    assert calls[0].build_work_dir == tmp_path / "work"
     assert "rows=12" in result.output
     assert "folded_rows=3" in result.output
-    assert "star_format_version=1" in result.output
+    assert "profile=classic" in result.output
     assert "terminal_waterline=disabled" in result.output
     assert "index_emission_strategy=forward" in result.output
 
 
-def test_stage02_defaults_to_batched_temporary_index(
-    monkeypatch, tmp_path: Path
-) -> None:
-    stage01_dir = tmp_path / "stage01"
-    stage01_dir.mkdir()
+def test_build_defaults_to_batched_temporary_index(monkeypatch, tmp_path: Path) -> None:
+    preparation_dir = tmp_path / "preparation"
+    preparation_dir.mkdir()
     project_path = tmp_path / "project.toml"
     _write_project(
         project_path,
-        stage01_dir=stage01_dir,
+        preparation_dir=preparation_dir,
         output=tmp_path / "stars.octree",
         identifiers_output=tmp_path / "identifiers.order",
     )
@@ -179,12 +137,12 @@ def test_stage02_defaults_to_batched_temporary_index(
         )
 
     monkeypatch.setattr(
-        "foundinspace.octree.classic.build_classic_artifacts",
+        "foundinspace.octree.base_build.build_base_artifacts",
         _fake_build,
     )
     result = CliRunner().invoke(
         cli,
-        ["stage-02", "--project", str(project_path)],
+        ["build", "--project", str(project_path)],
     )
 
     assert result.exit_code == 0

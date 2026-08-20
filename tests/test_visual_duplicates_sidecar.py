@@ -9,22 +9,22 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from combine_helpers import (
-    PayloadNode,
-    build_identifiers_intermediates,
-    build_intermediates,
-)
-from foundinspace.octree.combine import CombinePlan, combine_octree
-from foundinspace.octree.combine.dfs import iter_cells_dfs
-from foundinspace.octree.combine.manifest import read_combine_manifest
-from foundinspace.octree.combine.records import PackedDescriptorFields
-from foundinspace.octree.identifiers_order import combine_identifiers_order
+from foundinspace.octree.identifiers_order import pack_identifiers_order
+from foundinspace.octree.packing import PackingPlan, pack_octree
+from foundinspace.octree.packing.dfs import iter_cells_dfs
+from foundinspace.octree.packing.manifest import read_packing_manifest
+from foundinspace.octree.packing.records import PackedDescriptorFields
 from foundinspace.octree.reader import read_header
 from foundinspace.octree.sidecars.visual_duplicates import (
     PAYLOAD_ENCODING,
     SIDECAR_KIND,
     VisualDuplicatesBuildConfig,
     build_visual_duplicates_sidecar,
+)
+from packing_helpers import (
+    PayloadNode,
+    build_identifiers_intermediates,
+    build_intermediates,
 )
 
 DATASET_UUID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
@@ -66,17 +66,17 @@ def _write_render_and_order(tmp_path: Path) -> tuple[Path, Path]:
         max_level=1,
     )
     render_path = tmp_path / "stars.octree"
-    combine_octree(
+    pack_octree(
         render_manifest,
         render_path,
-        plan=CombinePlan(max_open_files=2),
+        plan=PackingPlan(max_open_files=2),
         descriptor=PackedDescriptorFields(
             artifact_kind="render",
             dataset_uuid=DATASET_UUID,
         ),
     )
     order_path = tmp_path / "identifiers.order"
-    combine_identifiers_order(
+    pack_identifiers_order(
         identifiers_manifest,
         order_path,
         parent_dataset_uuid=DATASET_UUID,
@@ -120,7 +120,7 @@ def _config(
 
 
 def _payloads_by_cell(manifest_path: Path) -> dict[tuple[int, int], list[dict]]:
-    manifest = read_combine_manifest(manifest_path)
+    manifest = read_packing_manifest(manifest_path)
     shards = {shard.key: shard for shard in manifest.shards}
     result: dict[tuple[int, int], list[dict]] = {}
     for ref in iter_cells_dfs(manifest_path):

@@ -8,26 +8,26 @@ from pathlib import Path
 from typing import BinaryIO
 from uuid import UUID, uuid4
 
-from .assembly.formats import (
+from ..assembly.formats import (
     SIDECAR_ARTIFACT_KIND,
     SIDECAR_INDEX_MAGIC,
     SIDECAR_MANIFEST_FORMAT,
 )
-from .assembly.manifest import write_manifest
-from .assembly.meta_encoder import IdentifiersMap, write_meta_payload
-from .assembly.plan import BuildPlan
-from .assembly.types import CellKey
-from .assembly.writer import (
+from ..assembly.manifest import write_manifest
+from ..assembly.meta_encoder import IdentifiersMap, write_meta_payload
+from ..assembly.plan import BuildPlan
+from ..assembly.types import CellKey
+from ..assembly.writer import (
     IntermediateShardWriter,
     belongs_to_shard,
     sidecar_shard_filenames,
 )
-from .combine import CombinePlan, combine_octree
-from .combine.records import PackedDescriptorFields
-from .identifiers_order import IdentifiersOrderReader
-from .identifiers_order import read_header as read_identifiers_order_header
-from .project import OctreeProject, SidecarProjectConfig
-from .reader import read_header
+from ..identifiers_order import IdentifiersOrderReader
+from ..identifiers_order import read_header as read_identifiers_order_header
+from ..packing import PackingPlan, pack_octree
+from ..packing.records import PackedDescriptorFields
+from ..project import OctreeProject, SidecarFamilyConfig
+from ..reader import read_header
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,7 +36,7 @@ class _MetaBuilder:
 
     @classmethod
     def from_project(
-        cls, project: OctreeProject, config: SidecarProjectConfig
+        cls, project: OctreeProject, config: SidecarFamilyConfig
     ) -> _MetaBuilder:
         return cls(
             ident_map=IdentifiersMap(
@@ -59,13 +59,13 @@ class _MetaBuilder:
         self.ident_map.close()
 
 
-def _family_builder(project: OctreeProject, config: SidecarProjectConfig):
+def _family_builder(project: OctreeProject, config: SidecarFamilyConfig):
     if config.name == "meta":
         return _MetaBuilder.from_project(project, config)
     raise ValueError(f"Unsupported sidecar family: {config.name}")
 
 
-def _write_stage03_manifest(
+def _write_sidecars_manifest(
     out_dir: Path,
     *,
     render_octree_path: Path,
@@ -93,17 +93,17 @@ def _write_stage03_manifest(
 def _build_family_intermediates(
     *,
     project: OctreeProject,
-    config: SidecarProjectConfig,
+    config: SidecarFamilyConfig,
     render_header,
     order_path: Path,
     out_dir: Path,
 ) -> Path:
     plan = BuildPlan(
         max_level=render_header.max_level,
-        deep_shard_from_level=project.stage01.deep_shard_from_level,
-        deep_prefix_bits=project.stage01.deep_prefix_bits,
-        batch_size=project.stage01.batch_size,
-        mag_limit=project.stage00.v_mag,
+        deep_shard_from_level=project.sidecars.shard_from_level,
+        deep_prefix_bits=project.sidecars.shard_prefix_bits,
+        batch_size=project.execution.batch_rows,
+        mag_limit=project.dataset.limiting_magnitude,
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     shard_entries: list[dict] = []
@@ -169,16 +169,16 @@ def _build_family_intermediates(
     )
 
 
-def build_stage03_sidecars(
+def build_configured_sidecars(
     project: OctreeProject,
     *,
     family_name: str | None = None,
 ) -> Path:
-    render_path = project.paths.stage02_output_path
+    render_path = project.paths.render_output_path
     identifiers_order_path = project.paths.identifiers_order_output_path
     render_header = read_header(render_path)
     if render_header.artifact_kind != "render" or render_header.dataset_uuid is None:
-        raise ValueError("Stage 03 requires a render octree with dataset_uuid metadata")
+        raise ValueError("Sidecars requires a render octree with dataset_uuid metadata")
 
     order_header = read_identifiers_order_header(identifiers_order_path)
     if order_header.parent_dataset_uuid != render_header.dataset_uuid:
@@ -186,17 +186,17 @@ def build_stage03_sidecars(
             "Identifiers/order artifact does not match render octree dataset_uuid"
         )
 
-    selected = list(project.stage03.sidecars)
+    selected = list(project.sidecars.families)
     if family_name is not None:
         selected = [cfg for cfg in selected if cfg.name == family_name]
         if not selected:
-            raise ValueError(f"No stage03 sidecar configured for family: {family_name}")
+            raise ValueError(f"No sidecar configured for family: {family_name}")
 
     sidecar_descriptors: list[dict[str, str]] = []
     for config in selected:
-        family_out = project.paths.stage03_output_dir / f"{config.name}.octree"
+        family_out = project.paths.sidecars_output_dir / f"{config.name}.octree"
         family_intermediate_dir = (
-            project.paths.stage03_output_dir / "intermediates" / config.name
+            project.paths.sidecars_work_dir / "intermediates" / config.name
         )
         family_manifest = _build_family_intermediates(
             project=project,
@@ -206,10 +206,10 @@ def build_stage03_sidecars(
             out_dir=family_intermediate_dir,
         )
         sidecar_uuid = uuid4()
-        combine_octree(
+        pack_octree(
             family_manifest,
             family_out,
-            plan=CombinePlan(max_open_files=project.stage02.max_open_files),
+            plan=PackingPlan(max_open_files=project.execution.max_open_files),
             descriptor=PackedDescriptorFields(
                 artifact_kind="sidecar",
                 parent_dataset_uuid=render_header.dataset_uuid,
@@ -226,8 +226,8 @@ def build_stage03_sidecars(
             }
         )
 
-    return _write_stage03_manifest(
-        project.paths.stage03_output_dir,
+    return _write_sidecars_manifest(
+        project.paths.sidecars_output_dir,
         render_octree_path=render_path,
         identifiers_order_path=identifiers_order_path,
         parent_dataset_uuid=render_header.dataset_uuid,

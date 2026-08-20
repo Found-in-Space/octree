@@ -13,20 +13,6 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from .classic_materialization import (
-    ClassicMaterializationPlan,
-    Stage01GroupInput,
-    classic_input_identity,
-    load_published_materialization,
-    materialize_classic_groups,
-)
-from .combine import CombinePlan, IndexEmissionStrategy, combine_octree
-from .combine.records import (
-    DESCRIPTOR_SIZE,
-    HEADER_SIZE,
-    PackedDescriptorFields,
-    unpack_descriptor,
-)
 from .config import (
     DEFAULT_CLASSIC_MAX_LEVEL,
     DEFAULT_CLASSIC_PARTITION_FROM_LEVEL,
@@ -35,64 +21,77 @@ from .config import (
     DEFAULT_TERMINAL_WATERLINE,
     MORTON_BITS,
 )
-from .identifiers_order import combine_identifiers_order
+from .identifiers_order import pack_identifiers_order
 from .identifiers_order import read_header as read_identifiers_header
-from .sources.stage00 import (
-    STAGE_STATE_FORMAT,
-    STAGE_STATE_NAME,
-    TREE_MANIFEST_FORMAT,
+from .materialization.pipeline import (
+    MaterializationPlan,
+    PreparationGroupInput,
+    load_published_materialization,
+    materialization_input_identity,
+    materialize_groups,
+)
+from .packing import IndexEmissionStrategy, PackingPlan, pack_octree
+from .packing.records import (
+    DESCRIPTOR_SIZE,
+    HEADER_SIZE,
+    PackedDescriptorFields,
+    unpack_descriptor,
+)
+from .sources.routing import (
+    PIPELINE_STATE_NAME,
     TREE_MANIFEST_NAME,
 )
 from .terminal_packing import TerminalMap
 
-CLASSIC_INTERMEDIATES_DIR_NAME = "classic-intermediates"
-CLASSIC_WORK_DIR_NAME = ".classic-intermediates.work"
-CLASSIC_FINAL_STATE_NAME = "classic-final-products.json"
-CLASSIC_FINAL_STATE_FORMAT = "foundinspace.octree.classic-final-products/v1"
-CLASSIC_COMBINE_ALGORITHM = "streaming-index-skeletons/v1"
+DEFAULT_MATERIALIZED_DIR_NAME = "materialized"
+DEFAULT_BUILD_WORK_DIR_NAME = ".build-work"
+BASE_FINAL_STATE_NAME = "build-state.json"
+BASE_PACKING_ALGORITHM = "streaming-index-skeletons/v1"
 
 
 @dataclass(frozen=True, slots=True)
-class ClassicBuildConfig:
-    stage00_output_dir: Path
-    stage01_output_dir: Path
+class BaseBuildConfig:
+    routed_dir: Path
+    prepared_dir: Path
     output_path: Path
     identifiers_order_path: Path
-    mag_limit: float
+    limiting_magnitude: float
     max_level: int = DEFAULT_CLASSIC_MAX_LEVEL
-    batch_size: int = 100_000
+    batch_rows: int = 100_000
     max_open_files: int = 32
     partition_from_level: int = DEFAULT_CLASSIC_PARTITION_FROM_LEVEL
     partition_prefix_bits: int = DEFAULT_CLASSIC_PARTITION_PREFIX_BITS
     retain_relocation_files: bool = False
     star_format_version: int = DEFAULT_STAR_FORMAT_VERSION
-    terminal_waterline: int = DEFAULT_TERMINAL_WATERLINE
+    terminal_waterline: int | None = DEFAULT_TERMINAL_WATERLINE
     index_emission_strategy: IndexEmissionStrategy = (
         IndexEmissionStrategy.TEMP_PWRITE_BATCHED
     )
-    intermediates_dir: Path | None = None
-    work_dir: Path | None = None
+    materialized_dir: Path | None = None
+    build_work_dir: Path | None = None
 
     def validate(self) -> None:
-        if not self.stage00_output_dir.is_dir():
-            raise NotADirectoryError(f"Not a directory: {self.stage00_output_dir}")
-        if not self.stage01_output_dir.is_dir():
-            raise NotADirectoryError(f"Not a directory: {self.stage01_output_dir}")
+        if not self.routed_dir.is_dir():
+            raise NotADirectoryError(f"Not a directory: {self.routed_dir}")
+        if not self.prepared_dir.is_dir():
+            raise NotADirectoryError(f"Not a directory: {self.prepared_dir}")
         if self.max_level < 0 or self.max_level > MORTON_BITS:
             raise ValueError(f"max_level must be in 0..{MORTON_BITS}")
-        if self.batch_size <= 0:
-            raise ValueError("batch_size must be > 0")
+        if self.batch_rows <= 0:
+            raise ValueError("batch_rows must be > 0")
         if self.max_open_files <= 0:
             raise ValueError("max_open_files must be > 0")
         if self.partition_from_level < 0:
             raise ValueError("partition_from_level must be >= 0")
         if self.partition_prefix_bits < 0:
             raise ValueError("partition_prefix_bits must be >= 0")
-        if not math.isfinite(self.mag_limit):
-            raise ValueError("mag_limit must be finite")
+        if not math.isfinite(self.limiting_magnitude):
+            raise ValueError("limiting_magnitude must be finite")
         if self.star_format_version not in (1, 2):
             raise ValueError("star_format_version must be 1 or 2")
-        if self.terminal_waterline <= 0:
+        if self.star_format_version == 2 and (
+            self.terminal_waterline is None or self.terminal_waterline <= 0
+        ):
             raise ValueError("terminal_waterline must be > 0")
         strategy = IndexEmissionStrategy(self.index_emission_strategy)
         if strategy not in (
@@ -105,10 +104,10 @@ class ClassicBuildConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class ClassicBuildResult:
+class BaseBuildResult:
     output_path: Path
     identifiers_order_path: Path
-    intermediates_dir: Path
+    materialized_dir: Path
     dataset_uuid: UUID
     identifiers_uuid: UUID
     row_count: int
@@ -120,10 +119,9 @@ def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _final_base_identity(config: ClassicBuildConfig, *, input_identity: str) -> str:
+def _final_base_identity(config: BaseBuildConfig, *, input_identity: str) -> str:
     value = {
-        "format": CLASSIC_FINAL_STATE_FORMAT,
-        "algorithm": CLASSIC_COMBINE_ALGORITHM,
+        "algorithm": BASE_PACKING_ALGORITHM,
         "input_identity": input_identity,
         "star_format_version": config.star_format_version,
         "terminal_waterline": (
@@ -148,8 +146,7 @@ def _file_stat_record(path: Path) -> dict[str, int]:
 
 def _load_final_state(path: Path) -> dict[str, Any] | None:
     try:
-        raw = _read_json(path)
-        return raw if raw.get("format") == CLASSIC_FINAL_STATE_FORMAT else None
+        return _read_json(path)
     except (OSError, TypeError, ValueError):
         return None
 
@@ -168,7 +165,7 @@ def _state_uuid(
 def _final_pair_is_valid(
     state: dict[str, Any],
     *,
-    config: ClassicBuildConfig,
+    config: BaseBuildConfig,
     base_identity: str,
     dataset_uuid: UUID,
     identifiers_uuid: UUID,
@@ -203,16 +200,16 @@ def _final_pair_is_valid(
 
 
 def _published_topology_is_valid(
-    intermediates_dir: Path, *, config: ClassicBuildConfig
+    materialized_dir: Path, *, config: BaseBuildConfig
 ) -> bool:
     try:
-        manifest = _read_json(intermediates_dir / "render-manifest.json")
+        manifest = _read_json(materialized_dir / "render-manifest.json")
         terminal_path = manifest.get("terminal_map_path")
         if config.star_format_version == 1:
             return terminal_path is None
         if not isinstance(terminal_path, str) or not terminal_path:
             return False
-        terminal_map = TerminalMap(intermediates_dir / terminal_path)
+        terminal_map = TerminalMap(materialized_dir / terminal_path)
         return (
             terminal_map.max_level == config.max_level
             and terminal_map.waterline == config.terminal_waterline
@@ -242,18 +239,19 @@ def _clean_incomplete_final_products(*paths: Path) -> None:
 
 
 @contextmanager
-def _final_pair_locks(config: ClassicBuildConfig):
-    work_dir = config.work_dir or (config.stage01_output_dir / CLASSIC_WORK_DIR_NAME)
-    work_dir.mkdir(parents=True, exist_ok=True)
+def _final_pair_locks(config: BaseBuildConfig):
+    build_work_dir = config.build_work_dir or (
+        config.prepared_dir / DEFAULT_BUILD_WORK_DIR_NAME
+    )
+    build_work_dir.mkdir(parents=True, exist_ok=True)
     config.output_path.parent.mkdir(parents=True, exist_ok=True)
     config.identifiers_order_path.parent.mkdir(parents=True, exist_ok=True)
     lock_paths = sorted(
         {
-            work_dir / ".classic-build.lock",
-            config.output_path.parent
-            / f".{config.output_path.name}.classic-build.lock",
+            build_work_dir / ".build.lock",
+            config.output_path.parent / f".{config.output_path.name}.build.lock",
             config.identifiers_order_path.parent
-            / f".{config.identifiers_order_path.name}.classic-build.lock",
+            / f".{config.identifiers_order_path.name}.build.lock",
         },
         key=lambda path: str(path.resolve()),
     )
@@ -274,11 +272,11 @@ def _final_pair_locks(config: ClassicBuildConfig):
 def _serialize_final_pair_build(function):
     @wraps(function)
     def locked(
-        config: ClassicBuildConfig,
+        config: BaseBuildConfig,
         *,
         dataset_uuid: UUID | None = None,
         identifiers_uuid: UUID | None = None,
-    ) -> ClassicBuildResult:
+    ) -> BaseBuildResult:
         with _final_pair_locks(config):
             return function(
                 config,
@@ -289,50 +287,47 @@ def _serialize_final_pair_build(function):
     return locked
 
 
-def _tracked_stage01_groups(
-    stage00_output_dir: Path,
-    stage01_output_dir: Path,
-) -> list[Stage01GroupInput]:
-    manifest_path = stage00_output_dir / TREE_MANIFEST_NAME
-    state_path = stage00_output_dir / STAGE_STATE_NAME
+def _tracked_preparation_groups(
+    routed_dir: Path,
+    prepared_dir: Path,
+) -> list[PreparationGroupInput]:
+    manifest_path = routed_dir / TREE_MANIFEST_NAME
+    state_path = routed_dir / PIPELINE_STATE_NAME
     if not manifest_path.is_file():
-        raise FileNotFoundError(f"Missing Stage 00 tree manifest: {manifest_path}")
+        raise FileNotFoundError(f"Missing Routing tree manifest: {manifest_path}")
     if not state_path.is_file():
-        raise FileNotFoundError(f"Missing Stage 00 state: {state_path}")
+        raise FileNotFoundError(f"Missing Routing state: {state_path}")
 
     manifest = _read_json(manifest_path)
     state = _read_json(state_path)
-    if manifest.get("format") != TREE_MANIFEST_FORMAT:
-        raise ValueError(
-            f"Unsupported Stage 00 tree manifest format: {manifest.get('format')!r}"
-        )
-    if state.get("format") != STAGE_STATE_FORMAT:
-        raise ValueError(f"Unsupported Stage 00 state format: {state.get('format')!r}")
     if state.get("tree_identity") != manifest.get("tree_identity"):
-        raise ValueError("Stage 00 state identity does not match tree manifest")
+        raise ValueError("Routing state identity does not match tree manifest")
 
-    dirty = state.get("dirty", {})
-    if dirty.get("stage01_groups"):
-        raise ValueError("Classic build requires no dirty Stage 01 groups")
-    if dirty.get("deleted_stage00_groups"):
-        raise ValueError("Classic build requires no deleted Stage 00 groups")
-    if "stage01_groups" not in state:
-        raise ValueError("Classic build requires Stage 01 to run first")
+    preparation_build = state.get("builds", {}).get("preparation")
+    if (
+        not isinstance(preparation_build, dict)
+        or preparation_build.get("status") != "complete"
+    ):
+        raise ValueError("Base build requires Preparation to run first")
+    dirty = state["dirty"]["preparation"]
+    if dirty["all"] or dirty["group_keys"] or dirty["deleted_routed_group_keys"]:
+        raise ValueError("Base build requires Preparation to be current")
+    prepared_groups = state["products"]["prepared_groups"]
 
-    groups: list[Stage01GroupInput] = []
+    groups: list[PreparationGroupInput] = []
     seen: set[Path] = set()
-    for group in sorted(state.get("stage01_groups", []), key=lambda row: row["key"]):
+    for group in sorted(prepared_groups, key=lambda row: row["key"]):
         files: list[Path] = []
         for rel_path in group.get("files", []):
-            path = stage01_output_dir / str(rel_path)
+            path = prepared_dir / str(rel_path)
             if path in seen:
-                raise ValueError(f"Duplicate Stage 01 group file in state: {path}")
+                raise ValueError(f"Duplicate Preparation group file in state: {path}")
             if not path.is_file():
-                raise FileNotFoundError(f"Missing Stage 01 group file: {path}")
+                raise FileNotFoundError(f"Missing Preparation group file: {path}")
             seen.add(path)
             files.append(path)
         groups.append(
-            Stage01GroupInput(
+            PreparationGroupInput(
                 key=str(group["key"]),
                 checksum=str(group["checksum"]),
                 row_count=int(group["row_count"]),
@@ -341,18 +336,13 @@ def _tracked_stage01_groups(
             )
         )
     if not groups:
-        raise ValueError("Classic build found no Stage 01 groups")
+        raise ValueError("Base build found no Preparation groups")
     return groups
 
 
 def _group_natural_max_level(group: dict[str, Any]) -> int | None:
     value = group.get("natural_max_level")
-    if value is not None:
-        return int(value)
-    return max(
-        (int(str(node).split(":", 1)[0]) for node in group.get("final_nodes", [])),
-        default=None,
-    )
+    return None if value is None else int(value)
 
 
 def _publish_intermediates(
@@ -398,35 +388,39 @@ def _publish_intermediates(
 
 
 @_serialize_final_pair_build
-def build_classic_artifacts(
-    config: ClassicBuildConfig,
+def build_base_artifacts(
+    config: BaseBuildConfig,
     *,
     dataset_uuid: UUID | None = None,
     identifiers_uuid: UUID | None = None,
-) -> ClassicBuildResult:
-    """Build the traditional magnitude-level octree from staged parquet groups."""
+) -> BaseBuildResult:
+    """Materialize and pack the configured render and identifiers artifacts."""
     config.validate()
-    stage01_groups = _tracked_stage01_groups(
-        config.stage00_output_dir,
-        config.stage01_output_dir,
+    preparation_groups = _tracked_preparation_groups(
+        config.routed_dir,
+        config.prepared_dir,
     )
-    materialization_plan = ClassicMaterializationPlan(
+    materialization_plan = MaterializationPlan(
         max_level=config.max_level,
-        mag_limit=config.mag_limit,
-        batch_size=config.batch_size,
+        limiting_magnitude=config.limiting_magnitude,
+        batch_rows=config.batch_rows,
         max_open_files=config.max_open_files,
         partition_from_level=config.partition_from_level,
         partition_prefix_bits=config.partition_prefix_bits,
         star_format_version=config.star_format_version,
         terminal_waterline=config.terminal_waterline,
     )
-    input_identity = classic_input_identity(stage01_groups, materialization_plan)
-
-    intermediates_dir = config.intermediates_dir or (
-        config.stage01_output_dir / CLASSIC_INTERMEDIATES_DIR_NAME
+    input_identity = materialization_input_identity(
+        preparation_groups, materialization_plan
     )
-    work_dir = config.work_dir or (config.stage01_output_dir / CLASSIC_WORK_DIR_NAME)
-    final_state_path = work_dir / CLASSIC_FINAL_STATE_NAME
+
+    materialized_dir = config.materialized_dir or (
+        config.prepared_dir / DEFAULT_MATERIALIZED_DIR_NAME
+    )
+    build_work_dir = config.build_work_dir or (
+        config.prepared_dir / DEFAULT_BUILD_WORK_DIR_NAME
+    )
+    final_state_path = build_work_dir / BASE_FINAL_STATE_NAME
     _clean_incomplete_final_products(
         config.output_path,
         config.identifiers_order_path,
@@ -444,7 +438,7 @@ def build_classic_artifacts(
     resolved_identifiers_uuid = identifiers_uuid or cached_identifiers_uuid or uuid4()
     if (
         final_state is not None
-        and _published_topology_is_valid(intermediates_dir, config=config)
+        and _published_topology_is_valid(materialized_dir, config=config)
         and _final_pair_is_valid(
             final_state,
             config=config,
@@ -453,10 +447,10 @@ def build_classic_artifacts(
             identifiers_uuid=resolved_identifiers_uuid,
         )
     ):
-        return ClassicBuildResult(
+        return BaseBuildResult(
             output_path=config.output_path,
             identifiers_order_path=config.identifiers_order_path,
-            intermediates_dir=intermediates_dir,
+            materialized_dir=materialized_dir,
             dataset_uuid=resolved_dataset_uuid,
             identifiers_uuid=resolved_identifiers_uuid,
             row_count=int(final_state["row_count"]),
@@ -465,28 +459,28 @@ def build_classic_artifacts(
         )
 
     materialized = load_published_materialization(
-        intermediates_dir,
+        materialized_dir,
         input_identity=input_identity,
         plan=materialization_plan,
     )
     if materialized is None:
-        materialized = materialize_classic_groups(
-            groups=stage01_groups,
-            work_dir=work_dir,
+        materialized = materialize_groups(
+            groups=preparation_groups,
+            build_work_dir=build_work_dir,
             plan=materialization_plan,
         )
         work_artifacts_dir = materialized.render_manifest_path.parent
         _publish_intermediates(
             temporary_dir=work_artifacts_dir,
-            final_dir=intermediates_dir,
+            final_dir=materialized_dir,
         )
         # The work directory owns content-addressed normalized runs, topology
-        # inputs and completed partitions. materialize_classic_groups prunes
+        # inputs and completed partitions. materialize_groups prunes
         # superseded products after successful publication assembly; retaining
         # this bounded checkpoint is what makes later shard rebuilds incremental.
-    render_manifest_path = intermediates_dir / materialized.render_manifest_path.name
+    render_manifest_path = materialized_dir / materialized.render_manifest_path.name
     identifiers_manifest_path = (
-        intermediates_dir / materialized.identifiers_manifest_path.name
+        materialized_dir / materialized.identifiers_manifest_path.name
     )
 
     output_tmp = config.output_path.with_name(
@@ -498,24 +492,24 @@ def build_classic_artifacts(
     output_tmp.unlink(missing_ok=True)
     identifiers_tmp.unlink(missing_ok=True)
     try:
-        combine_octree(
+        pack_octree(
             render_manifest_path,
             output_tmp,
-            plan=CombinePlan(
+            plan=PackingPlan(
                 max_open_files=config.max_open_files,
                 retain_relocation_files=config.retain_relocation_files,
                 star_format_version=config.star_format_version,
                 index_emission_strategy=IndexEmissionStrategy(
                     config.index_emission_strategy
                 ),
-                cache_dir=work_dir / ".combine-index-cache",
+                cache_dir=build_work_dir / ".packing-index-cache",
             ),
             descriptor=PackedDescriptorFields(
                 artifact_kind="render",
                 dataset_uuid=resolved_dataset_uuid,
             ),
         )
-        combine_identifiers_order(
+        pack_identifiers_order(
             identifiers_manifest_path,
             identifiers_tmp,
             parent_dataset_uuid=resolved_dataset_uuid,
@@ -528,7 +522,6 @@ def build_classic_artifacts(
         _atomic_write_json(
             final_state_path,
             {
-                "format": CLASSIC_FINAL_STATE_FORMAT,
                 "base_identity": base_identity,
                 "dataset_uuid": str(resolved_dataset_uuid),
                 "identifiers_uuid": str(resolved_identifiers_uuid),
@@ -543,10 +536,10 @@ def build_classic_artifacts(
         output_tmp.unlink(missing_ok=True)
         identifiers_tmp.unlink(missing_ok=True)
 
-    return ClassicBuildResult(
+    return BaseBuildResult(
         output_path=config.output_path,
         identifiers_order_path=config.identifiers_order_path,
-        intermediates_dir=intermediates_dir,
+        materialized_dir=materialized_dir,
         dataset_uuid=resolved_dataset_uuid,
         identifiers_uuid=resolved_identifiers_uuid,
         row_count=materialized.row_count,

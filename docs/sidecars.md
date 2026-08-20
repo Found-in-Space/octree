@@ -17,14 +17,13 @@ names or definitions used for build/discovery.
 
 Sidecars consume a published render octree and its matching
 `identifiers.order`; they do not participate in routing, topology planning, or
-base materialization. The current compatibility mapping is:
+base materialization. The command mapping is:
 
-- `stage-02` publishes `stars.octree` and `identifiers.order`;
-- `stage-03` builds the configured sidecar families from those artifacts.
+- `build` publishes `stars.octree` and `identifiers.order`;
+- `sidecars build` builds the configured sidecar families from those artifacts.
 
 Each output profile must get separate sidecar artifacts because its node set and
-identity order may differ. The purpose-based architectural action is
-`sidecars`; `stage-03` is its current compatibility command.
+identity order may differ. `sidecars build` is the public orchestration command.
 
 ## Core Invariants
 
@@ -99,7 +98,7 @@ Supported enrichment fields are:
 - `constellation`
 - `proper_name`
 
-`[[stage03.sidecars]]` currently configures sidecar definitions in the project
+`[[sidecars.families]]` configures sidecar definitions in the project
 file.
 
 For `meta`, `fields = [...]` limits which enrichment columns are emitted. `source` and `source_id` are always included.
@@ -193,9 +192,9 @@ is a reusable dataset companion rather than part of this optional sidecar.
 
 ## Intermediate Files
 
-The current implementation builds per-sidecar intermediate shard files under:
+The implementation builds per-sidecar intermediate shard files under:
 
-- `paths.stage03_output_dir/intermediates/<sidecar-name>/`
+- `paths.sidecars_work_dir/intermediates/<sidecar-name>/`
 
 For the `meta` sidecar, shard filenames end with:
 
@@ -206,9 +205,9 @@ These intermediates use the same shard structure as render intermediates, but wi
 
 ## Final Artifacts
 
-The current compatibility builder writes each selected family to:
+The builder writes each selected family to:
 
-- `paths.stage03_output_dir/<sidecar-name>.octree`
+- `paths.sidecars_output_dir/<sidecar-name>.octree`
 
 A future multi-profile directory layout must keep separate artifacts per
 profile; that path migration is independent of the artifact format.
@@ -226,7 +225,7 @@ For sidecars the descriptor carries:
 
 The sidecar build writes:
 
-- `paths.stage03_output_dir/manifest.json`
+- `paths.sidecars_output_dir/manifest.json`
 
 It records:
 
@@ -261,6 +260,6 @@ item-order mapping, which defeats the simple sidecar invariant.
 
 ## Related Docs
 
-- `docs/stages.md`
+- `docs/products.md`
 - `docs/identifiers-order.md`
 - `docs/reader.md`

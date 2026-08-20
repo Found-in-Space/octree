@@ -58,14 +58,14 @@ The reader is split into four layers with clear responsibilities and no circular
 │              File header                         │  STAR header parsing, bootstrap fields
 │         foundinspace.octree.reader.header         │
 ├──────────────────────────────────────────────────┤
-│          Binary record constants                 │  shared with combine pipeline
-│       foundinspace.octree.combine.records         │
+│          Binary record constants                 │  shared with packing pipeline
+│       foundinspace.octree.packing.records         │
 └──────────────────────────────────────────────────┘
 ```
 
 ### Dependency rule
 
-Each layer may import from layers below it and from `combine.records` for binary constants. No layer may import from the write pipeline modules (`assembly`, `combine.pipeline`, `combine.dfs`).
+Each layer may import from layers below it and from `packing.records` for binary constants. No layer may import from the write pipeline modules (`assembly`, `packing.pipeline`, `packing.dfs`).
 
 ---
 
@@ -99,9 +99,9 @@ def read_header(path: Path) -> OctreeHeader:
     """
 ```
 
-This function opens the file, reads 64 bytes, unpacks via `HEADER_FMT` from `combine.records`, probes 4 bytes at `index_offset` to confirm `OSHR` magic, and returns an `OctreeHeader`. It does not hold the file open.
+This function opens the file, reads 64 bytes, unpacks via `HEADER_FMT` from `packing.records`, probes 4 bytes at `index_offset` to confirm `OSHR` magic, and returns an `OctreeHeader`. It does not hold the file open.
 
-`HEADER_FMT` tuple-to-field mapping (from `pack_top_level_header` in `combine.records`):
+`HEADER_FMT` tuple-to-field mapping (from `pack_top_level_header` in `packing.records`):
 
 | Index | Field |
 |-------|-------|
@@ -216,7 +216,7 @@ half_size = world_half_size / n
 center.x = world_center.x + (2 × (gx + 0.5) − n) × half_size
 ```
 
-Grid coordinates `(gx, gy, gz)` are decoded from the node's `local_path` relative to the shard's `parent_global_depth` and `parent_grid_{x,y,z}`, using the octant bit convention already used by the combine pipeline.
+Grid coordinates `(gx, gy, gz)` are decoded from the node's `local_path` relative to the shard's `parent_global_depth` and `parent_grid_{x,y,z}`, using the octant bit convention already used by the packing pipeline.
 
 Octant bit convention (per octant value `o`):
 
@@ -486,7 +486,7 @@ src/foundinspace/octree/
 
 ## Shared constants
 
-The reader imports binary layout constants from the existing `combine.records` module:
+The reader imports binary layout constants from the existing `packing.records` module:
 
 - `HEADER_FMT`, `HEADER_SIZE`, `HEADER_MAGIC`
 - `SHARD_HDR_FMT`, `SHARD_HDR_SIZE`, `SHARD_MAGIC`
@@ -540,4 +540,4 @@ Unit tests should cover:
 
 4. **AABB distance** — verify `NodeEntry.aabb_distance` for points inside, on the boundary, and outside the box.
 
-5. **End-to-end** — build a small octree via the write pipeline (stages 00–02 with a tiny test catalog), then read it back with `OctreeReader` and verify both queries return expected stars. This test already has infrastructure in `tests/test_combine_e2e.py`.
+5. **End-to-end** — route, prepare, and build a tiny test catalogue, then read it back with `OctreeReader` and verify both queries return expected stars. This test already has infrastructure in `tests/test_packing_e2e.py`.

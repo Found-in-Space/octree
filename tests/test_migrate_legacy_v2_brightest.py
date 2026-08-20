@@ -5,16 +5,6 @@ from pathlib import Path
 
 import pytest
 
-from combine_helpers import PayloadNode, build_intermediates
-from foundinspace.octree.combine import CombinePlan, combine_octree
-from foundinspace.octree.combine.records import (
-    FRONTIER_REF_SIZE,
-    HEADER_FMT,
-    HEADER_SIZE,
-    SHARD_HDR_FMT,
-    SHARD_NODE_V2_FMT,
-    SHARD_NODE_V2_SIZE,
-)
 from foundinspace.octree.migrate_legacy_v2_brightest import (
     LEGACY_HEADER_FLAG,
     MigrationError,
@@ -22,7 +12,17 @@ from foundinspace.octree.migrate_legacy_v2_brightest import (
     migrate_legacy_v2,
     preflight_legacy_v2,
 )
+from foundinspace.octree.packing import PackingPlan, pack_octree
+from foundinspace.octree.packing.records import (
+    FRONTIER_REF_SIZE,
+    HEADER_FMT,
+    HEADER_SIZE,
+    SHARD_HDR_FMT,
+    SHARD_NODE_V2_FMT,
+    SHARD_NODE_V2_SIZE,
+)
 from foundinspace.octree.reader import IndexNavigator, read_header
+from packing_helpers import PayloadNode, build_intermediates
 
 
 def _build_legacy_artifact(tmp_path: Path, *, level: int = 6) -> Path:
@@ -32,10 +32,10 @@ def _build_legacy_artifact(tmp_path: Path, *, level: int = 6) -> Path:
         max_level=level,
     )
     artifact = tmp_path / "legacy-v2.octree"
-    combine_octree(
+    pack_octree(
         manifest,
         artifact,
-        plan=CombinePlan(max_open_files=2, star_format_version=2),
+        plan=PackingPlan(max_open_files=2, star_format_version=2),
     )
     _rewrite_current_v2_as_legacy(artifact)
     return artifact

@@ -1,10 +1,10 @@
 """Isolated A/B benchmark for STAR Phase-B index emission.
 
 Run the standard 2k/8k/16k dense and sparse matrix with:
-    uv run python benchmarks/benchmark_combine_index.py
+    uv run python benchmarks/benchmark_packing_index.py
 
 Add the 64k sparse case with:
-    uv run python benchmarks/benchmark_combine_index.py --include-64k
+    uv run python benchmarks/benchmark_packing_index.py --include-64k
 """
 
 from __future__ import annotations
@@ -31,12 +31,12 @@ from foundinspace.octree.assembly.formats import (
 from foundinspace.octree.assembly.manifest import write_manifest
 from foundinspace.octree.assembly.types import CellKey, EncodedCell, ShardKey
 from foundinspace.octree.assembly.writer import IntermediateShardWriter
-from foundinspace.octree.combine.pipeline import (
-    CombinePlan,
+from foundinspace.octree.packing.pipeline import (
     IndexEmissionStrategy,
+    PackingPlan,
     write_final_shard_index,
 )
-from foundinspace.octree.combine.records import RELOC_MAGIC
+from foundinspace.octree.packing.records import RELOC_MAGIC
 
 
 class _MeasuredSink:
@@ -126,12 +126,12 @@ def _measure(
     strategy: IndexEmissionStrategy,
 ) -> dict[str, object]:
     manifest, relocations = _fixture(root, count, sparse=sparse)
-    plan = CombinePlan(
+    plan = PackingPlan(
         max_open_files=4,
         cache_dir=root / "cache",
         index_emission_strategy=strategy,
     )
-    import foundinspace.octree.combine.streaming_index as streaming_index
+    import foundinspace.octree.packing.streaming_index as streaming_index
 
     pwrite_calls = 0
     pwrite_bytes = 0

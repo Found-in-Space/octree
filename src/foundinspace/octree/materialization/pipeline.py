@@ -16,7 +16,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
-from .assembly.formats import (
+from ..assembly.formats import (
     IDENTIFIERS_ARTIFACT_KIND,
     IDENTIFIERS_INDEX_MAGIC,
     IDENTIFIERS_MANIFEST_NAME,
@@ -24,38 +24,36 @@ from .assembly.formats import (
     RENDER_ARTIFACT_KIND,
     RENDER_MANIFEST_NAME,
 )
-from .assembly.identity_encoder import write_identity_arrays
-from .assembly.manifest import (
+from ..assembly.identity_encoder import write_identity_arrays
+from ..assembly.manifest import (
     manifest_entries,
     read_manifest,
     validate_shard,
     write_manifest,
 )
-from .assembly.types import CellKey, ShardKey
-from .assembly.writer import IntermediateShardWriter, identifiers_shard_filenames
-from .config import (
+from ..assembly.types import CellKey, ShardKey
+from ..assembly.writer import IntermediateShardWriter, identifiers_shard_filenames
+from ..config import (
     DEFAULT_STAR_FORMAT_VERSION,
     DEFAULT_TERMINAL_WATERLINE,
     MORTON_BITS,
 )
-from .encoding.render import RENDER_RECORD_SIZE, encode_render_records
-from .materialization import runs as shared_runs
-from .sources.stage00 import _atomic_write_json
-from .terminal_packing import TerminalMap, build_terminal_map
+from ..encoding.render import RENDER_RECORD_SIZE, encode_render_records
+from ..sources.routing import _atomic_write_json
+from ..terminal_packing import TerminalMap, build_terminal_map
+from . import runs as shared_runs
 
-CLASSIC_BUILD_STATE_NAME = "classic-build-state.json"
-CLASSIC_BUILD_STATE_FORMAT = "foundinspace.octree.classic-build/v1"
-CLASSIC_WORK_STATE_NAME = "classic-work-state.json"
-CLASSIC_WORK_STATE_FORMAT = "foundinspace.octree.classic-work/v2"
-CLASSIC_ALGORITHM_VERSION = "sorted-cell-merge-terminal-packing/v4"
-CLASSIC_PARTITION_CACHE_DIR = "partition-cache"
-CLASSIC_TOPOLOGY_CACHE_DIR = "topology-cache"
-CLASSIC_OVERLAP_IN_MEMORY_MAX_BYTES = 256 * 1024 * 1024
-CLASSIC_OVERLAP_EXTERNAL_SORT_MEMORY_LIMIT = "512MB"
+MATERIALIZATION_STATE_NAME = "materialization-state.json"
+MATERIALIZATION_WORK_STATE_NAME = "materialization-work-state.json"
+MATERIALIZATION_ALGORITHM_VERSION = "sorted-cell-merge-terminal-packing/v4"
+MATERIALIZATION_PARTITION_CACHE_DIR = "partition-cache"
+MATERIALIZATION_TOPOLOGY_CACHE_DIR = "topology-cache"
+MATERIALIZATION_OVERLAP_IN_MEMORY_MAX_BYTES = 256 * 1024 * 1024
+MATERIALIZATION_OVERLAP_EXTERNAL_SORT_MEMORY_LIMIT = "512MB"
 # Merge runs are sequential-scan intermediates.  Keep their physical writes
 # bounded independently of the number (and size distribution) of cells.
-CLASSIC_MERGE_WRITE_MAX_BYTES = 256 * 1024 * 1024
-CLASSIC_MERGE_WRITE_MAX_PIECES = 1024
+MATERIALIZATION_MERGE_WRITE_MAX_BYTES = 256 * 1024 * 1024
+MATERIALIZATION_MERGE_WRITE_MAX_PIECES = 1024
 
 _RAW_COLUMNS = (
     "x_icrs_pc",
@@ -86,8 +84,8 @@ _CANONICAL_SORT_KEYS = [
     ("source", "ascending"),
     ("source_id", "ascending"),
 ]
-_CONTRIBUTOR_COLUMN = "_classic_contributor_index"
-_CONTRIBUTOR_ROW_COLUMN = "_classic_contributor_row"
+_CONTRIBUTOR_COLUMN = "_materialization_contributor_index"
+_CONTRIBUTOR_ROW_COLUMN = "_materialization_contributor_row"
 _OVERLAP_SCHEMA = _COMPACT_SCHEMA.append(
     pa.field(_CONTRIBUTOR_COLUMN, pa.int32(), nullable=False)
 ).append(
@@ -111,7 +109,7 @@ _RUN_LAYOUT = shared_runs.SortedRunLayout(
 
 
 @dataclass(frozen=True, slots=True)
-class Stage01GroupInput:
+class PreparationGroupInput:
     key: str
     checksum: str
     row_count: int
@@ -120,15 +118,15 @@ class Stage01GroupInput:
 
 
 @dataclass(frozen=True, slots=True)
-class ClassicMaterializationPlan:
+class MaterializationPlan:
     max_level: int
-    mag_limit: float
-    batch_size: int
+    limiting_magnitude: float
+    batch_rows: int
     max_open_files: int
     partition_from_level: int
     partition_prefix_bits: int
     star_format_version: int = DEFAULT_STAR_FORMAT_VERSION
-    terminal_waterline: int = DEFAULT_TERMINAL_WATERLINE
+    terminal_waterline: int | None = DEFAULT_TERMINAL_WATERLINE
 
     @property
     def merge_fan_in(self) -> int:
@@ -136,7 +134,7 @@ class ClassicMaterializationPlan:
 
 
 @dataclass(frozen=True, slots=True)
-class ClassicMaterializationResult:
+class MaterializationResult:
     render_manifest_path: Path
     identifiers_manifest_path: Path
     row_count: int
@@ -152,13 +150,12 @@ class _RunInfo:
     row_count: int
 
 
-def classic_input_identity(
-    groups: Sequence[Stage01GroupInput],
-    plan: ClassicMaterializationPlan,
+def materialization_input_identity(
+    groups: Sequence[PreparationGroupInput],
+    plan: MaterializationPlan,
 ) -> str:
     canonical = {
-        "format": CLASSIC_BUILD_STATE_FORMAT,
-        "algorithm": CLASSIC_ALGORITHM_VERSION,
+        "algorithm": MATERIALIZATION_ALGORITHM_VERSION,
         "groups": [
             {
                 "key": group.key,
@@ -168,7 +165,7 @@ def classic_input_identity(
             for group in sorted(groups, key=lambda item: item.key)
         ],
         "max_level": plan.max_level,
-        "mag_limit": plan.mag_limit,
+        "limiting_magnitude": plan.limiting_magnitude,
         "partition_from_level": plan.partition_from_level,
         "partition_prefix_bits": plan.partition_prefix_bits,
         "star_format_version": plan.star_format_version,
@@ -183,7 +180,7 @@ def classic_input_identity(
 
 
 def _topology_identity(
-    plan: ClassicMaterializationPlan,
+    plan: MaterializationPlan,
     terminal_map_path: Path | None,
 ) -> str:
     if plan.star_format_version == 1:
@@ -195,6 +192,8 @@ def _topology_identity(
         )
     if terminal_map_path is None:
         raise ValueError("STAR v2 materialization requires a terminal map")
+    if plan.terminal_waterline is None:
+        raise ValueError("STAR v2 materialization requires a terminal waterline")
     raw = json.loads(terminal_map_path.read_text(encoding="utf-8"))
     level_content: list[dict[str, Any]] = []
     for entry in raw.get("levels", []):
@@ -220,15 +219,15 @@ def _topology_identity(
 
 
 def _group_materialization_identity(
-    group: Stage01GroupInput,
+    group: PreparationGroupInput,
     *,
-    plan: ClassicMaterializationPlan,
+    plan: MaterializationPlan,
     topology_identity: str,
 ) -> str:
     return _materialization_identity(
         {
-            "format": "foundinspace.octree.normalized-group/v1",
-            "algorithm": CLASSIC_ALGORITHM_VERSION,
+            "kind": "normalized-group",
+            "algorithm": MATERIALIZATION_ALGORITHM_VERSION,
             "group_key": group.key,
             "checksum": group.checksum,
             "row_count": group.row_count,
@@ -249,12 +248,12 @@ def _partition_materialization_identity(
     *,
     contributors: list[dict[str, Any]],
     topology_identity: str,
-    plan: ClassicMaterializationPlan,
+    plan: MaterializationPlan,
 ) -> str:
     return _materialization_identity(
         {
-            "format": "foundinspace.octree.materialized-partition/v1",
-            "algorithm": CLASSIC_ALGORITHM_VERSION,
+            "kind": "materialized-partition",
+            "algorithm": MATERIALIZATION_ALGORITHM_VERSION,
             "partition_key": partition_key,
             "contributors": contributors,
             "topology_identity": topology_identity,
@@ -285,15 +284,13 @@ def load_published_materialization(
     out_dir: Path,
     *,
     input_identity: str,
-    plan: ClassicMaterializationPlan,
-) -> ClassicMaterializationResult | None:
-    state_path = out_dir / CLASSIC_BUILD_STATE_NAME
+    plan: MaterializationPlan,
+) -> MaterializationResult | None:
+    state_path = out_dir / MATERIALIZATION_STATE_NAME
     if not state_path.is_file():
         return None
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        if state.get("format") != CLASSIC_BUILD_STATE_FORMAT:
-            return None
         if state.get("input_identity") != input_identity:
             return None
         render_manifest = read_manifest(out_dir, name=RENDER_MANIFEST_NAME)
@@ -313,7 +310,7 @@ def load_published_materialization(
                 entry,
                 expected_magic=IDENTIFIERS_INDEX_MAGIC,
             )
-        return ClassicMaterializationResult(
+        return MaterializationResult(
             render_manifest_path=out_dir / RENDER_MANIFEST_NAME,
             identifiers_manifest_path=out_dir / IDENTIFIERS_MANIFEST_NAME,
             row_count=int(state["row_count"]),
@@ -329,7 +326,7 @@ def _validate_published_terminal_map(
     out_dir: Path,
     render_manifest: dict[str, Any],
     *,
-    plan: ClassicMaterializationPlan,
+    plan: MaterializationPlan,
 ) -> None:
     terminal_map_path_raw = render_manifest.get("terminal_map_path")
     if plan.star_format_version == 1:
@@ -349,24 +346,24 @@ def _validate_published_terminal_map(
         )
 
 
-def materialize_classic_groups(
+def materialize_groups(
     *,
-    groups: Sequence[Stage01GroupInput],
-    work_dir: Path,
-    plan: ClassicMaterializationPlan,
-) -> ClassicMaterializationResult:
+    groups: Sequence[PreparationGroupInput],
+    build_work_dir: Path,
+    plan: MaterializationPlan,
+) -> MaterializationResult:
     if not groups:
-        raise ValueError("Classic materialization requires Stage 01 groups")
+        raise ValueError("Materialization requires Preparation groups")
     groups = tuple(sorted(groups, key=lambda group: group.key))
     if len({group.key for group in groups}) != len(groups):
-        raise ValueError("Classic materialization group keys must be unique")
-    input_identity = classic_input_identity(groups, plan)
-    state = _prepare_work_state(work_dir, input_identity=input_identity)
-    runs_dir = work_dir / "runs"
-    merge_dir = work_dir / "merge"
-    artifacts_dir = work_dir / "artifacts"
-    partition_cache_dir = work_dir / CLASSIC_PARTITION_CACHE_DIR
-    topology_cache_dir = work_dir / CLASSIC_TOPOLOGY_CACHE_DIR
+        raise ValueError("Materialization group keys must be unique")
+    input_identity = materialization_input_identity(groups, plan)
+    state = _prepare_work_state(build_work_dir, input_identity=input_identity)
+    runs_dir = build_work_dir / "runs"
+    merge_dir = build_work_dir / "merge"
+    artifacts_dir = build_work_dir / "artifacts"
+    partition_cache_dir = build_work_dir / MATERIALIZATION_PARTITION_CACHE_DIR
+    topology_cache_dir = build_work_dir / MATERIALIZATION_TOPOLOGY_CACHE_DIR
     runs_dir.mkdir(parents=True, exist_ok=True)
     merge_dir.mkdir(parents=True, exist_ok=True)
     partition_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -374,13 +371,15 @@ def materialize_classic_groups(
     terminal_map: TerminalMap | None = None
     cached_terminal_map_path: Path | None = None
     if plan.star_format_version == 2:
+        if plan.terminal_waterline is None:
+            raise ValueError("STAR v2 materialization requires a terminal waterline")
         cached_terminal_map_path = build_terminal_map(
             groups=groups,
-            work_dir=work_dir,
+            work_dir=build_work_dir,
             artifacts_dir=topology_cache_dir,
             max_level=plan.max_level,
             waterline=plan.terminal_waterline,
-            batch_size=plan.batch_size,
+            batch_size=plan.batch_rows,
         )
         terminal_map = TerminalMap(cached_terminal_map_path)
     topology_identity = _topology_identity(plan, cached_terminal_map_path)
@@ -400,7 +399,7 @@ def materialize_classic_groups(
         )
         existing = completed_groups.get(group.key)
         if _completed_group_is_valid(
-            work_dir,
+            build_work_dir,
             existing,
             expected_identity=group_identity,
         ):
@@ -414,7 +413,7 @@ def materialize_classic_groups(
         )
         group_result["identity"] = group_identity
         completed_groups[group.key] = group_result
-        _atomic_write_json(work_dir / CLASSIC_WORK_STATE_NAME, state)
+        _atomic_write_json(build_work_dir / MATERIALIZATION_WORK_STATE_NAME, state)
 
     runs_by_partition: dict[str, list[_RunInfo]] = {}
     contributors_by_partition: dict[str, list[dict[str, Any]]] = {}
@@ -425,7 +424,7 @@ def materialize_classic_groups(
         row_count += int(result["row_count"])
         folded_row_count += int(result["folded_row_count"])
         for raw_run in result.get("runs", []):
-            run = _run_from_state(work_dir, raw_run)
+            run = _run_from_state(build_work_dir, raw_run)
             partition_key = _shard_state_key(run.shard)
             runs_by_partition.setdefault(partition_key, []).append(run)
             contributors_by_partition.setdefault(partition_key, []).append(
@@ -439,7 +438,7 @@ def materialize_classic_groups(
     expected_rows = sum(group.row_count for group in groups)
     if row_count != expected_rows:
         raise ValueError(
-            "Classic normalized run row count mismatch: "
+            "Materialization normalized run row count mismatch: "
             f"expected={expected_rows}, actual={row_count}"
         )
 
@@ -460,7 +459,7 @@ def materialize_classic_groups(
         )
         existing = completed_partitions.get(partition_key)
         if _completed_partition_is_valid(
-            work_dir,
+            build_work_dir,
             existing,
             expected_identity=partition_identity,
         ):
@@ -481,13 +480,13 @@ def materialize_classic_groups(
             plan=plan,
         )
         result["identity"] = partition_identity
-        result["cache_dir"] = cache_dir.relative_to(work_dir).as_posix()
+        result["cache_dir"] = cache_dir.relative_to(build_work_dir).as_posix()
         result["contributors"] = contributors_by_partition[partition_key]
         completed_partitions[partition_key] = result
-        _atomic_write_json(work_dir / CLASSIC_WORK_STATE_NAME, state)
+        _atomic_write_json(build_work_dir / MATERIALIZATION_WORK_STATE_NAME, state)
 
     published_terminal_map_path = _assemble_publication_artifacts(
-        work_dir=work_dir,
+        build_work_dir=build_work_dir,
         artifacts_dir=artifacts_dir,
         completed_partitions=completed_partitions,
         cached_terminal_map_path=cached_terminal_map_path,
@@ -505,7 +504,7 @@ def materialize_classic_groups(
         partition_rows += int(result["row_count"])
     if partition_rows != row_count:
         raise ValueError(
-            "Classic partition row count mismatch: "
+            "Materialization partition row count mismatch: "
             f"normalized={row_count}, materialized={partition_rows}"
         )
 
@@ -515,7 +514,7 @@ def materialize_classic_groups(
         render_entries,
         artifact_kind=RENDER_ARTIFACT_KIND,
         index_magic=INDEX_MAGIC,
-        mag_limit=plan.mag_limit,
+        mag_limit=plan.limiting_magnitude,
         name=RENDER_MANIFEST_NAME,
         terminal_map_path=published_terminal_map_path,
     )
@@ -525,13 +524,12 @@ def materialize_classic_groups(
         identifiers_entries,
         artifact_kind=IDENTIFIERS_ARTIFACT_KIND,
         index_magic=IDENTIFIERS_INDEX_MAGIC,
-        mag_limit=plan.mag_limit,
+        mag_limit=plan.limiting_magnitude,
         name=IDENTIFIERS_MANIFEST_NAME,
     )
     _atomic_write_json(
-        artifacts_dir / CLASSIC_BUILD_STATE_NAME,
+        artifacts_dir / MATERIALIZATION_STATE_NAME,
         {
-            "format": CLASSIC_BUILD_STATE_FORMAT,
             "input_identity": input_identity,
             "row_count": row_count,
             "folded_row_count": folded_row_count,
@@ -540,13 +538,13 @@ def materialize_classic_groups(
     )
     state["input_identity"] = input_identity
     state["topology_identity"] = topology_identity
-    _atomic_write_json(work_dir / CLASSIC_WORK_STATE_NAME, state)
+    _atomic_write_json(build_work_dir / MATERIALIZATION_WORK_STATE_NAME, state)
     _prune_inactive_materialization_cache(
-        work_dir,
+        build_work_dir,
         completed_groups=completed_groups,
         completed_partitions=completed_partitions,
     )
-    return ClassicMaterializationResult(
+    return MaterializationResult(
         render_manifest_path=render_manifest_path,
         identifiers_manifest_path=identifiers_manifest_path,
         row_count=row_count,
@@ -556,21 +554,22 @@ def materialize_classic_groups(
     )
 
 
-def _prepare_work_state(work_dir: Path, *, input_identity: str) -> dict[str, Any]:
-    state_path = work_dir / CLASSIC_WORK_STATE_NAME
+def _prepare_work_state(build_work_dir: Path, *, input_identity: str) -> dict[str, Any]:
+    state_path = build_work_dir / MATERIALIZATION_WORK_STATE_NAME
     if state_path.is_file():
         try:
             state = json.loads(state_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             state = {}
-        if state.get("format") == CLASSIC_WORK_STATE_FORMAT:
+        if isinstance(state.get("completed_groups"), dict) and isinstance(
+            state.get("completed_partitions"), dict
+        ):
             state["input_identity"] = input_identity
             return state
-    if work_dir.exists():
-        shutil.rmtree(work_dir)
-    work_dir.mkdir(parents=True)
+    if build_work_dir.exists():
+        shutil.rmtree(build_work_dir)
+    build_work_dir.mkdir(parents=True)
     state = {
-        "format": CLASSIC_WORK_STATE_FORMAT,
         "input_identity": input_identity,
         "completed_groups": {},
         "completed_partitions": {},
@@ -580,10 +579,10 @@ def _prepare_work_state(work_dir: Path, *, input_identity: str) -> dict[str, Any
 
 
 def _normalize_group(
-    group: Stage01GroupInput,
+    group: PreparationGroupInput,
     *,
     runs_dir: Path,
-    plan: ClassicMaterializationPlan,
+    plan: MaterializationPlan,
     terminal_map: TerminalMap | None,
     group_identity: str,
 ) -> dict[str, Any]:
@@ -625,10 +624,10 @@ def _normalize_group(
 
 
 def _stream_ordered_group(
-    group: Stage01GroupInput,
+    group: PreparationGroupInput,
     *,
     group_dir: Path,
-    plan: ClassicMaterializationPlan,
+    plan: MaterializationPlan,
     terminal_map: TerminalMap | None,
 ) -> dict[str, Any]:
     runs: list[dict[str, Any]] = []
@@ -646,7 +645,7 @@ def _stream_ordered_group(
         runs.append(
             _run_state(
                 path=current_path,
-                work_dir=group_dir.parents[2],
+                build_work_dir=group_dir.parents[2],
                 shard=current_shard,
                 row_count=current_rows,
             )
@@ -655,7 +654,7 @@ def _stream_ordered_group(
         current_rows = 0
 
     try:
-        for raw_batch in _iter_raw_group_batches(group, batch_size=plan.batch_size):
+        for raw_batch in _iter_raw_group_batches(group, batch_rows=plan.batch_rows):
             compact, folded_rows = _normalize_batch(
                 raw_batch,
                 plan=plan,
@@ -663,7 +662,7 @@ def _stream_ordered_group(
             )
             if folded_rows:
                 raise ValueError(
-                    f"Stage 01 group {group.key} exceeded its tracked natural max level"
+                    f"Preparation group {group.key} exceeded its tracked natural max level"
                 )
             for shard, segment in _partition_segments(compact, plan=plan):
                 if current_shard != shard:
@@ -671,7 +670,7 @@ def _stream_ordered_group(
                         shard
                     ) <= _shard_sort_key(current_shard):
                         raise ValueError(
-                            f"Stage 01 group {group.key} is not in canonical order"
+                            f"Preparation group {group.key} is not in canonical order"
                         )
                     close_run()
                     current_shard = shard
@@ -684,7 +683,7 @@ def _stream_ordered_group(
                 assert current_writer is not None
                 current_writer.write_table(
                     segment,
-                    row_group_size=plan.batch_size,
+                    row_group_size=plan.batch_rows,
                 )
                 current_rows += len(segment)
                 row_count += len(segment)
@@ -702,10 +701,10 @@ def _stream_ordered_group(
 
 
 def _externally_sort_folded_group(
-    group: Stage01GroupInput,
+    group: PreparationGroupInput,
     *,
     group_dir: Path,
-    plan: ClassicMaterializationPlan,
+    plan: MaterializationPlan,
     terminal_map: TerminalMap | None,
 ) -> dict[str, Any]:
     batches_dir = group_dir / "batches"
@@ -717,7 +716,7 @@ def _externally_sort_folded_group(
     row_count = 0
     folded_row_count = 0
     for batch_index, raw_batch in enumerate(
-        _iter_raw_group_batches(group, batch_size=plan.batch_size)
+        _iter_raw_group_batches(group, batch_rows=plan.batch_rows)
     ):
         compact, batch_folded_rows = _normalize_batch(
             raw_batch,
@@ -740,7 +739,7 @@ def _externally_sort_folded_group(
                 segment,
                 path,
                 compression="zstd",
-                row_group_size=plan.batch_size,
+                row_group_size=plan.batch_rows,
             )
             paths_by_shard.setdefault(shard, []).append(path)
             rows_by_shard[shard] = rows_by_shard.get(shard, 0) + len(segment)
@@ -751,7 +750,7 @@ def _externally_sort_folded_group(
         terminal_map is None or terminal_map.terminal_count == 0
     ):
         raise ValueError(
-            f"Stage 01 group {group.key} did not reach its tracked natural max level"
+            f"Preparation group {group.key} did not reach its tracked natural max level"
         )
     runs: list[dict[str, Any]] = []
     for shard in sorted(paths_by_shard, key=_shard_sort_key):
@@ -761,18 +760,18 @@ def _externally_sort_folded_group(
         reduced = _reduce_runs(
             paths,
             partition_dir=shard_merge_dir,
-            batch_size=plan.batch_size,
+            batch_rows=plan.batch_rows,
             fan_in=plan.merge_fan_in,
         )
         output = group_dir / f"{_shard_file_stem(shard)}.parquet"
         if len(reduced) == 1:
             os.replace(reduced[0], output)
         else:
-            _write_merged_run(reduced, output, batch_size=plan.batch_size)
+            _write_merged_run(reduced, output, batch_rows=plan.batch_rows)
         runs.append(
             _run_state(
                 path=output,
-                work_dir=group_dir.parents[2],
+                build_work_dir=group_dir.parents[2],
                 shard=shard,
                 row_count=rows_by_shard[shard],
             )
@@ -789,7 +788,7 @@ def _externally_sort_folded_group(
 def _normalize_batch(
     table: pa.Table,
     *,
-    plan: ClassicMaterializationPlan,
+    plan: MaterializationPlan,
     terminal_map: TerminalMap | None = None,
 ) -> tuple[pa.Table, int]:
     if len(table) == 0:
@@ -837,7 +836,7 @@ def _normalize_batch(
     )
     for name in ("source", "source_id"):
         if table.column(name).null_count:
-            raise ValueError(f"Classic materialization input has null {name} values")
+            raise ValueError(f"Materialization input has null {name} values")
     compact = pa.table(
         {
             "final_level": pa.array(final_levels, type=pa.int16()),
@@ -856,7 +855,7 @@ def _normalize_batch(
 def _partition_segments(
     compact: pa.Table,
     *,
-    plan: ClassicMaterializationPlan,
+    plan: MaterializationPlan,
 ) -> Iterator[tuple[ShardKey, pa.Table]]:
     levels = np.asarray(compact.column("final_level"), dtype=np.int16)
     nodes = np.asarray(compact.column("final_node_id"), dtype=np.uint64)
@@ -874,9 +873,9 @@ def _partition_segments(
 
 
 def _iter_raw_group_batches(
-    group: Stage01GroupInput,
+    group: PreparationGroupInput,
     *,
-    batch_size: int,
+    batch_rows: int,
 ) -> Iterator[pa.Table]:
     for path in group.files:
         schema = pq.read_schema(path)
@@ -884,13 +883,13 @@ def _iter_raw_group_batches(
         missing = sorted(set(_RAW_COLUMNS) - names)
         if missing:
             raise ValueError(
-                "Classic materialization requires raw Stage 01 fields; "
-                f"{path} is missing {missing}. Rebuild Stage 00 and Stage 01."
+                "Materialization requires raw Preparation fields; "
+                f"{path} is missing {missing}. Rebuild Routing and Preparation."
             )
         columns = [*_RAW_COLUMNS]
         columns.extend(name for name in _OPTIONAL_COLUMNS if name in names)
         parquet = pq.ParquetFile(path)
-        for batch in parquet.iter_batches(batch_size=batch_size, columns=columns):
+        for batch in parquet.iter_batches(batch_size=batch_rows, columns=columns):
             table = pa.Table.from_batches([batch])
             if "teff" not in table.schema.names:
                 table = table.append_column(
@@ -901,7 +900,7 @@ def _iter_raw_group_batches(
 
 
 def _group_requires_folding(
-    group: Stage01GroupInput,
+    group: PreparationGroupInput,
     *,
     max_level: int,
 ) -> bool:
@@ -919,10 +918,10 @@ def _group_requires_folding(
     return False
 
 
-def _ensure_group_row_count(group: Stage01GroupInput, actual: int) -> None:
+def _ensure_group_row_count(group: PreparationGroupInput, actual: int) -> None:
     if actual != group.row_count:
         raise ValueError(
-            f"Stage 01 group {group.key} row count mismatch: "
+            f"Preparation group {group.key} row count mismatch: "
             f"state={group.row_count}, files={actual}"
         )
 
@@ -930,12 +929,12 @@ def _ensure_group_row_count(group: Stage01GroupInput, actual: int) -> None:
 def _run_state(
     *,
     path: Path,
-    work_dir: Path,
+    build_work_dir: Path,
     shard: ShardKey,
     row_count: int,
 ) -> dict[str, Any]:
     return {
-        "path": path.relative_to(work_dir).as_posix(),
+        "path": path.relative_to(build_work_dir).as_posix(),
         "level": shard.level,
         "prefix_bits": shard.prefix_bits,
         "prefix": shard.prefix,
@@ -952,11 +951,11 @@ def _numpy_column(
 ) -> np.ndarray:
     if name not in table.schema.names:
         if required:
-            raise ValueError(f"Classic materialization input is missing {name}")
+            raise ValueError(f"Materialization input is missing {name}")
         return np.full(len(table), np.nan, dtype=dtype)
     column = table.column(name).combine_chunks()
     if required and column.null_count:
-        raise ValueError(f"Classic materialization input has null {name} values")
+        raise ValueError(f"Materialization input has null {name} values")
     values = column.to_numpy(zero_copy_only=False)
     if not required and column.null_count:
         values = np.asarray(values, dtype=np.float64)
@@ -967,7 +966,7 @@ def _numpy_column(
 def _shard_for_cell(
     level: int,
     node_id: int,
-    plan: ClassicMaterializationPlan,
+    plan: MaterializationPlan,
 ) -> ShardKey:
     if (
         level == 0
@@ -986,7 +985,7 @@ def _materialize_partition(
     shard: ShardKey,
     merge_root: Path,
     artifacts_dir: Path,
-    plan: ClassicMaterializationPlan,
+    plan: MaterializationPlan,
 ) -> dict[str, Any]:
     partition_dir = merge_root / _shard_file_stem(shard)
     if partition_dir.exists():
@@ -995,7 +994,7 @@ def _materialize_partition(
     final_runs = _reduce_runs(
         [run.path for run in runs],
         partition_dir=partition_dir,
-        batch_size=plan.batch_size,
+        batch_rows=plan.batch_rows,
         fan_in=plan.merge_fan_in,
     )
     render_writer = IntermediateShardWriter(shard, artifacts_dir)
@@ -1012,7 +1011,7 @@ def _materialize_partition(
     try:
         merged_batches = _iter_merged_batches(
             final_runs,
-            batch_size=plan.batch_size,
+            batch_rows=plan.batch_rows,
             spill_dir=partition_dir,
         )
         for key, keyed_batches in groupby(merged_batches, key=lambda item: item[0]):
@@ -1059,9 +1058,9 @@ def _materialize_partition(
         render_entry = render_writer.close()
         identifiers_entry = identifiers_writer.close()
         if render_entry is None or identifiers_entry is None:
-            raise ValueError(f"Classic partition unexpectedly empty: {shard}")
+            raise ValueError(f"Materialization partition unexpectedly empty: {shard}")
         if render_entry["record_count"] != identifiers_entry["record_count"]:
-            raise ValueError("Classic render and identifiers record counts differ")
+            raise ValueError("Render and identifiers record counts differ")
     except Exception:
         render_writer.abort()
         identifiers_writer.abort()
@@ -1082,20 +1081,20 @@ def _reduce_runs(
     paths: list[Path],
     *,
     partition_dir: Path,
-    batch_size: int,
+    batch_rows: int,
     fan_in: int,
 ) -> list[Path]:
     return shared_runs.reduce_sorted_runs(
         paths,
         partition_dir=partition_dir,
-        batch_size=batch_size,
+        batch_size=batch_rows,
         fan_in=fan_in,
         layout=_RUN_LAYOUT,
-        bounds=_classic_merge_bounds(),
+        bounds=_materialization_merge_bounds(),
         write_run=lambda source, output, rows: _write_merged_run(
             source,
             output,
-            batch_size=rows,
+            batch_rows=rows,
         ),
     )
 
@@ -1104,23 +1103,23 @@ def _write_merged_run(
     paths: Sequence[Path],
     output: Path,
     *,
-    batch_size: int,
+    batch_rows: int,
 ) -> None:
     def merge_batches(
         source: Sequence[Path], rows: int, spill_dir: Path
     ) -> Iterator[tuple[tuple[int, int], pa.Table]]:
         yield from _iter_merged_batches(
             source,
-            batch_size=rows,
+            batch_rows=rows,
             spill_dir=spill_dir,
         )
 
     shared_runs.write_merged_run(
         paths,
         output,
-        batch_size=batch_size,
+        batch_size=batch_rows,
         layout=_RUN_LAYOUT,
-        bounds=_classic_merge_bounds(),
+        bounds=_materialization_merge_bounds(),
         merge_batches=merge_batches,
     )
 
@@ -1128,7 +1127,7 @@ def _write_merged_run(
 def _iter_merged_batches(
     paths: Sequence[Path],
     *,
-    batch_size: int,
+    batch_rows: int,
     spill_dir: Path,
 ) -> Iterator[tuple[tuple[int, int], pa.Table]]:
     def external_sort(
@@ -1141,15 +1140,15 @@ def _iter_merged_batches(
         yield from _iter_externally_sorted_overlap(
             spill_path,
             key=key,
-            batch_size=batch_size,
+            batch_rows=batch_size,
         )
 
     yield from shared_runs.iter_merged_batches(
         paths,
-        batch_size=batch_size,
+        batch_size=batch_rows,
         spill_dir=spill_dir,
         layout=_RUN_LAYOUT,
-        bounds=_classic_merge_bounds(),
+        bounds=_materialization_merge_bounds(),
         external_overlap_sort=external_sort,
     )
 
@@ -1172,12 +1171,12 @@ def _iter_in_memory_sorted_overlap(
     chunks: Sequence[pa.Table],
     *,
     key: tuple[int, int],
-    batch_size: int,
+    batch_rows: int,
 ) -> Iterator[tuple[tuple[int, int], pa.Table]]:
     yield from shared_runs._iter_in_memory_sorted_overlap(
         chunks,
         key=key,
-        batch_size=batch_size,
+        batch_size=batch_rows,
         layout=_RUN_LAYOUT,
     )
 
@@ -1186,14 +1185,14 @@ def _iter_externally_sorted_overlap(
     spill_path: Path,
     *,
     key: tuple[int, int],
-    batch_size: int,
+    batch_rows: int,
 ) -> Iterator[tuple[tuple[int, int], pa.Table]]:
     yield from shared_runs._iter_externally_sorted_overlap(
         spill_path,
         key=key,
-        batch_size=batch_size,
+        batch_size=batch_rows,
         layout=_RUN_LAYOUT,
-        bounds=_classic_merge_bounds(),
+        bounds=_materialization_merge_bounds(),
     )
 
 
@@ -1201,18 +1200,18 @@ def _overlap_sort_query(path: Path) -> str:
     return shared_runs._overlap_sort_query(path, layout=_RUN_LAYOUT)
 
 
-def _classic_merge_bounds() -> shared_runs.RunMergeBounds:
+def _materialization_merge_bounds() -> shared_runs.RunMergeBounds:
     return shared_runs.RunMergeBounds(
-        overlap_in_memory_max_bytes=CLASSIC_OVERLAP_IN_MEMORY_MAX_BYTES,
-        external_sort_memory_limit=CLASSIC_OVERLAP_EXTERNAL_SORT_MEMORY_LIMIT,
-        write_max_bytes=CLASSIC_MERGE_WRITE_MAX_BYTES,
-        write_max_pieces=CLASSIC_MERGE_WRITE_MAX_PIECES,
+        overlap_in_memory_max_bytes=MATERIALIZATION_OVERLAP_IN_MEMORY_MAX_BYTES,
+        external_sort_memory_limit=MATERIALIZATION_OVERLAP_EXTERNAL_SORT_MEMORY_LIMIT,
+        write_max_bytes=MATERIALIZATION_MERGE_WRITE_MAX_BYTES,
+        write_max_pieces=MATERIALIZATION_MERGE_WRITE_MAX_PIECES,
     )
 
 
 def _assemble_publication_artifacts(
     *,
-    work_dir: Path,
+    build_work_dir: Path,
     artifacts_dir: Path,
     completed_partitions: dict[str, Any],
     cached_terminal_map_path: Path | None,
@@ -1223,7 +1222,7 @@ def _assemble_publication_artifacts(
     artifacts_dir.mkdir(parents=True)
     for partition_key in sorted(completed_partitions, key=_shard_state_sort_key):
         result = completed_partitions[partition_key]
-        cache_dir = work_dir / str(result["cache_dir"])
+        cache_dir = build_work_dir / str(result["cache_dir"])
         for entry_name in ("render_entry", "identifiers_entry"):
             entry = result[entry_name]
             for path_name in ("index_path", "payload_path"):
@@ -1269,16 +1268,16 @@ def _link_or_copy_cached_file(source: Path, target: Path) -> None:
 
 
 def _prune_inactive_materialization_cache(
-    work_dir: Path,
+    build_work_dir: Path,
     *,
     completed_groups: dict[str, Any],
     completed_partitions: dict[str, Any],
 ) -> None:
     active_group_dirs = {
-        (work_dir / str(result["cache_dir"])).resolve()
+        (build_work_dir / str(result["cache_dir"])).resolve()
         for result in completed_groups.values()
     }
-    runs_dir = work_dir / "runs"
+    runs_dir = build_work_dir / "runs"
     if runs_dir.is_dir():
         for group_root in runs_dir.iterdir():
             if not group_root.is_dir():
@@ -1293,10 +1292,10 @@ def _prune_inactive_materialization_cache(
                 group_root.rmdir()
 
     active_partition_dirs = {
-        (work_dir / str(result["cache_dir"])).resolve()
+        (build_work_dir / str(result["cache_dir"])).resolve()
         for result in completed_partitions.values()
     }
-    partition_root = work_dir / CLASSIC_PARTITION_CACHE_DIR
+    partition_root = build_work_dir / MATERIALIZATION_PARTITION_CACHE_DIR
     if partition_root.is_dir():
         for shard_root in partition_root.iterdir():
             if not shard_root.is_dir():
@@ -1314,7 +1313,7 @@ def _prune_inactive_materialization_cache(
 def _fixed_binary_bytes(column: pa.ChunkedArray) -> bytes:
     values = column.combine_chunks()
     if values.null_count:
-        raise ValueError("Classic compact render column contains nulls")
+        raise ValueError("Compact render column contains nulls")
     data = values.buffers()[1]
     if data is None:
         return b""
@@ -1324,7 +1323,7 @@ def _fixed_binary_bytes(column: pa.ChunkedArray) -> bytes:
 
 
 def _completed_group_is_valid(
-    work_dir: Path,
+    build_work_dir: Path,
     raw: Any,
     *,
     expected_identity: str | None = None,
@@ -1334,7 +1333,7 @@ def _completed_group_is_valid(
     try:
         if expected_identity is not None and raw.get("identity") != expected_identity:
             return False
-        cache_dir = _cached_state_dir(work_dir, raw)
+        cache_dir = _cached_state_dir(build_work_dir, raw)
         if not cache_dir.is_dir():
             return False
         expected_rows = int(raw["row_count"])
@@ -1343,7 +1342,7 @@ def _completed_group_is_valid(
             return False
         actual_rows = 0
         for run in raw["runs"]:
-            path = work_dir / str(run["path"])
+            path = build_work_dir / str(run["path"])
             if not path.resolve().is_relative_to(cache_dir.resolve()):
                 return False
             if not path.is_file() or not pq.read_schema(path).equals(_COMPACT_SCHEMA):
@@ -1355,7 +1354,7 @@ def _completed_group_is_valid(
 
 
 def _completed_partition_is_valid(
-    work_dir: Path,
+    build_work_dir: Path,
     raw: Any,
     *,
     expected_identity: str | None = None,
@@ -1365,7 +1364,7 @@ def _completed_partition_is_valid(
     try:
         if expected_identity is not None and raw.get("identity") != expected_identity:
             return False
-        cache_dir = _cached_state_dir(work_dir, raw)
+        cache_dir = _cached_state_dir(build_work_dir, raw)
         if not cache_dir.is_dir():
             return False
         validate_shard(
@@ -1383,19 +1382,19 @@ def _completed_partition_is_valid(
         return False
 
 
-def _cached_state_dir(work_dir: Path, raw: dict[str, Any]) -> Path:
+def _cached_state_dir(build_work_dir: Path, raw: dict[str, Any]) -> Path:
     relative = Path(str(raw["cache_dir"]))
     if relative.is_absolute() or ".." in relative.parts:
         raise ValueError(f"Invalid materialization cache path: {relative}")
-    path = work_dir / relative
-    if not path.resolve().is_relative_to(work_dir.resolve()):
+    path = build_work_dir / relative
+    if not path.resolve().is_relative_to(build_work_dir.resolve()):
         raise ValueError(f"Materialization cache escapes work directory: {relative}")
     return path
 
 
-def _run_from_state(work_dir: Path, raw: dict[str, Any]) -> _RunInfo:
+def _run_from_state(build_work_dir: Path, raw: dict[str, Any]) -> _RunInfo:
     return _RunInfo(
-        path=work_dir / str(raw["path"]),
+        path=build_work_dir / str(raw["path"]),
         shard=ShardKey(
             level=int(raw["level"]),
             prefix_bits=int(raw["prefix_bits"]),

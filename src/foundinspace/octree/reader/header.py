@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from uuid import UUID
 
-from ..combine.records import (
+from ..packing.records import (
     DESCRIPTOR_SIZE,
     HEADER_FMT,
     HEADER_MAGIC,

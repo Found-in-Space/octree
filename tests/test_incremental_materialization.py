@@ -7,13 +7,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import foundinspace.octree.classic_materialization as materialization
-from foundinspace.octree.classic_materialization import (
-    ClassicMaterializationPlan,
-    Stage01GroupInput,
-    materialize_classic_groups,
-)
+import foundinspace.octree.materialization.pipeline as materialization
 from foundinspace.octree.config import MORTON_BITS, WORLD_CENTER, WORLD_HALF_SIZE_PC
+from foundinspace.octree.materialization.pipeline import (
+    MaterializationPlan,
+    PreparationGroupInput,
+    materialize_groups,
+)
 
 
 def _morton_for_node(level: int, node_id: int) -> int:
@@ -39,7 +39,7 @@ def _write_group(
     checksum: str,
     node_id: int,
     source_ids: tuple[str, ...],
-) -> Stage01GroupInput:
+) -> PreparationGroupInput:
     level = 2
     center = _node_center(level, node_id)
     path = root / f"{key}.parquet"
@@ -65,7 +65,7 @@ def _write_group(
         path,
         compression="zstd",
     )
-    return Stage01GroupInput(
+    return PreparationGroupInput(
         key=key,
         checksum=checksum,
         row_count=len(source_ids),
@@ -74,11 +74,11 @@ def _write_group(
     )
 
 
-def _plan(*, star_format_version: int) -> ClassicMaterializationPlan:
-    return ClassicMaterializationPlan(
+def _plan(*, star_format_version: int) -> MaterializationPlan:
+    return MaterializationPlan(
         max_level=2,
-        mag_limit=6.5,
-        batch_size=1,
+        limiting_magnitude=6.5,
+        batch_rows=1,
         max_open_files=2,
         partition_from_level=1,
         partition_prefix_bits=1,
@@ -89,7 +89,9 @@ def _plan(*, star_format_version: int) -> ClassicMaterializationPlan:
 
 def _state(work_dir: Path) -> dict:
     return json.loads(
-        (work_dir / materialization.CLASSIC_WORK_STATE_NAME).read_text(encoding="utf-8")
+        (work_dir / materialization.MATERIALIZATION_WORK_STATE_NAME).read_text(
+            encoding="utf-8"
+        )
     )
 
 
@@ -131,7 +133,7 @@ def test_one_changed_group_reuses_unrelated_runs_and_partition(
     )
     work_dir = tmp_path / "work"
     plan = _plan(star_format_version=1)
-    materialize_classic_groups(groups=(group_a, group_b), work_dir=work_dir, plan=plan)
+    materialize_groups(groups=(group_a, group_b), build_work_dir=work_dir, plan=plan)
 
     first = _state(work_dir)
     stable_group = first["completed_groups"]["b"]
@@ -166,9 +168,9 @@ def test_one_changed_group_reuses_unrelated_runs_and_partition(
 
     monkeypatch.setattr(materialization, "_normalize_group", track_normalize)
     monkeypatch.setattr(materialization, "_materialize_partition", track_partition)
-    result = materialize_classic_groups(
+    result = materialize_groups(
         groups=(changed_a, group_b),
-        work_dir=work_dir,
+        build_work_dir=work_dir,
         plan=plan,
     )
 
@@ -195,7 +197,7 @@ def test_one_changed_group_reuses_unrelated_runs_and_partition(
         "_materialize_partition",
         lambda *_args, **_kwargs: pytest.fail("unchanged partition was materialized"),
     )
-    materialize_classic_groups(groups=(group_b,), work_dir=work_dir, plan=plan)
+    materialize_groups(groups=(group_b,), build_work_dir=work_dir, plan=plan)
     deleted = _state(work_dir)
     assert set(deleted["completed_groups"]) == {"b"}
     assert set(deleted["completed_partitions"]) == {stable_partition_key}
@@ -227,7 +229,7 @@ def test_v2_count_change_with_same_terminal_map_reuses_unrelated_group_run(
     )
     work_dir = tmp_path / "work"
     plan = _plan(star_format_version=2)
-    materialize_classic_groups(groups=(group_a, group_b), work_dir=work_dir, plan=plan)
+    materialize_groups(groups=(group_a, group_b), build_work_dir=work_dir, plan=plan)
     first = _state(work_dir)
     first_topology = first["topology_identity"]
     stable_group = first["completed_groups"]["b"]
@@ -249,9 +251,9 @@ def test_v2_count_change_with_same_terminal_map_reuses_unrelated_group_run(
         return original_normalize(group, **kwargs)
 
     monkeypatch.setattr(materialization, "_normalize_group", track_normalize)
-    materialize_classic_groups(
+    materialize_groups(
         groups=(changed_a, group_b),
-        work_dir=work_dir,
+        build_work_dir=work_dir,
         plan=plan,
     )
 

@@ -7,10 +7,9 @@ from uuid import UUID
 
 from click.testing import CliRunner
 
-from combine_helpers import PayloadNode, build_intermediates
 from foundinspace.octree._cli import cli
-from foundinspace.octree.combine import CombinePlan, combine_octree
-from foundinspace.octree.combine.records import PackedDescriptorFields
+from foundinspace.octree.packing import PackingPlan, pack_octree
+from foundinspace.octree.packing.records import PackedDescriptorFields
 from foundinspace.octree.reader.index import Point
 from foundinspace.octree.terminal_memory_benchmark import (
     ExtractedSample,
@@ -23,6 +22,7 @@ from foundinspace.octree.terminal_memory_benchmark import (
     parse_sample_spec,
     safe_magnitude_prefix_count,
 )
+from packing_helpers import PayloadNode, build_intermediates
 
 STAR_RECORD = struct.Struct("<fffhBB")
 DATASET_UUID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
@@ -85,10 +85,10 @@ def _build_octree(tmp_path: Path) -> Path:
         max_level=1,
     )
     output = tmp_path / "stars.octree"
-    combine_octree(
+    pack_octree(
         manifest,
         output,
-        plan=CombinePlan(max_open_files=2),
+        plan=PackingPlan(max_open_files=2),
         descriptor=PackedDescriptorFields(
             artifact_kind="render",
             dataset_uuid=DATASET_UUID,
@@ -218,7 +218,8 @@ def test_terminal_memory_benchmark_cli_reads_local_octree(tmp_path: Path) -> Non
     result = runner.invoke(
         cli,
         [
-            "terminal-memory-benchmark",
+            "benchmark",
+            "terminal-memory",
             str(octree),
             "--sample",
             "fixture:0,0,0@0",

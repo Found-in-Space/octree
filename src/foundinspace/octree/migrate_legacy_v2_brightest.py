@@ -20,7 +20,7 @@ from typing import BinaryIO
 
 import click
 
-from .combine.records import (
+from .packing.records import (
     FRONTIER_REF_FMT,
     FRONTIER_REF_SIZE,
     HAS_CHILDREN,

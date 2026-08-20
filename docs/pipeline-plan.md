@@ -1,22 +1,16 @@
 # Incremental Streaming Pipeline Plan
 
-This document tracks migration from the current numbered compatibility commands
-to the product flow defined in
+This document tracks the incremental product flow defined in
 [`streaming-pipeline.md`](streaming-pipeline.md). The goal is simple: when a
-small part of an upstream catalogue changes, reuse every routed, sorted,
+small part of an upstream catalogue changes, reuse every routed, prepared,
 topology, materialized, and packed result whose relevant semantic content did
 not change.
-
-Numeric stage labels describe current entry points only. New contracts and
-implementation work use the product names `routed contributions`, `sorted
-contributions`, `profile topology`, `materialized buckets`, `packing`, and
-`sidecars`.
 
 ## Current status
 
 Implemented or available on the current work branch:
 
-- The compatibility `stage-00` command routes directory-based or root-level
+- The `route` command routes directory-based or root-level
   Parquet shards into an adaptive octree-shaped staging tree.
 - A shard may be a HEALPix pixel, a batch shard, or another stable upstream
   replacement unit.
@@ -29,7 +23,7 @@ Implemented or available on the current work branch:
   group checkpoints.
 - Shard replacement compares old and new contribution checksums and records
   only changed, created, or removed groups for preparation.
-- The compatibility `stage-01` command sorts changed contributions into
+- The `prepare` command sorts changed contributions into
   replaceable canonical Parquet groups.
 - Ordinary groups use the bounded Arrow fast path. Oversized groups use
   DuckDB's disk-backed external sort with a bounded default memory limit.
@@ -44,7 +38,7 @@ Implemented or available on the current work branch:
 - Shared materialization run/merge helpers support bounded run generation,
   bounded fan-in merging, checkpointed group runs, and checkpointed spatial
   output partitions.
-- The compatibility `stage-02` path can materialize and pack the traditional
+- The `build` path can materialize and pack the level-capped or terminal-packed
   level-capped or terminal-packed output as `stars.octree` plus
   `identifiers.order`.
 - Materialization selects the final profile cell before encoding the
@@ -59,7 +53,7 @@ Implemented or available on the current work branch:
 - Final index topology is compiled from sorted node-ID streams into
   content-addressed five-level skeleton packs. Its cache identity excludes
   payload bytes, counts, lengths, and offsets.
-- The v1 packer is byte-equivalent to the legacy writer. Its default emitter
+- The STAR v1 packer preserves the established binary output. Its default emitter
   patches recorded parent frontier tables in a dedicated scratch index and then
   copies forward; a prefix-sum emitter provides a lower-scratch alternative.
 - A semantic final-pair checkpoint reuses an unchanged `stars.octree` and
@@ -67,7 +61,7 @@ Implemented or available on the current work branch:
 - Render artifacts, identity order, and sidecars carry UUID-backed parent
   identities.
 
-Compatibility limitations still to remove:
+Remaining product-granularity limitations:
 
 - downstream preparation changes currently fall back to a shared
   `clean`/`all` invalidation marker;
@@ -75,8 +69,7 @@ Compatibility limitations still to remove:
 - a genuine terminal-map change still has a global topology identity;
 - profile topology and materialized dependency manifests are not yet fully
   partitioned or connected to field-specific identities;
-- the current monolithic packer rewrites complete artifacts; and
-- current numeric commands collapse several target products together.
+- the current monolithic packer rewrites complete artifacts.
 
 The `clean`/`all` marker is bounded and safe, but it is not the target
 architecture. The target is partitioned dependency metadata with checksum
@@ -93,19 +86,18 @@ stopping at every product boundary.
 | Packed artifacts | Output profile | `stars.octree` and `identifiers.order` |
 | Sidecars | Profile, family, and affected identity partition | Schema-bearing sidecar artifacts |
 
-The intended orchestration vocabulary is:
+The orchestration vocabulary is:
 
 ```text
 route
 prepare
-materialize --profile NAME
-pack --profile NAME
-sidecars
-build --profile NAME
+build
+sidecars build
 ```
 
-Renaming the current CLI is deliberately separate from building these product
-contracts.
+Topology, materialization, and packing remain internal products under `build`.
+The selected profile and packing strategy come from the project file, keeping
+one reproducible source of build policy.
 
 ## Core invariants
 
@@ -481,18 +473,13 @@ Remaining work:
 - connect reused materialized partitions to exact dependency manifests;
 - production-accept the new index emitter on a controlled large build;
 - add sidecar partition reuse by sidecar identity;
-- evaluate a sharded final container separately from this migration.
+- evaluate a sharded final container as a separate format decision.
 
-### F. Naming and compatibility cleanup
+### F. Semantic organization
 
-Status: documentation uses purpose-based products; numeric CLI commands remain.
-
-Remaining work:
-
-- add purpose-based commands when product contracts are stable;
-- retain numeric aliases for a documented compatibility period;
-- rename paths, config sections, and reports without mixing that migration into
-  topology or materialization correctness work.
+Status: the CLI, project tables, paths, state, reports, modules, tests, and
+production template use purpose-based names. The project schema is unversioned
+and has no compatibility reader or aliases for older layouts.
 
 ## Suggested remaining implementation order
 
@@ -505,7 +492,6 @@ Remaining work:
    profiles.
 7. Production-accept index packing and add reuse/I/O reporting.
 8. Evaluate a sharded final container independently.
-9. Introduce purpose-based CLI/config names and compatibility aliases.
 
 ## Validation plan
 
@@ -548,8 +534,6 @@ Operational measurements:
 - Materialized partition size and file layout.
 - Whether a sharded final container is worth the runtime and publication
   complexity.
-- Compatibility lifetime for numeric commands after purpose-based commands
-  exist.
 
 ## Glossary
 

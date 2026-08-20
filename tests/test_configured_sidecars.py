@@ -9,30 +9,33 @@ from uuid import UUID
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from combine_helpers import (
-    PayloadNode,
-    build_identifiers_intermediates,
-    build_intermediates,
-)
 from foundinspace.octree.assembly.meta_encoder import (
     IdentifiersMap,
     write_meta_payload,
 )
-from foundinspace.octree.combine import CombinePlan, combine_octree
-from foundinspace.octree.combine.records import PackedDescriptorFields
-from foundinspace.octree.identifiers_order import combine_identifiers_order
+from foundinspace.octree.identifiers_order import pack_identifiers_order
+from foundinspace.octree.packing import PackingPlan, pack_octree
+from foundinspace.octree.packing.records import PackedDescriptorFields
 from foundinspace.octree.project import (
+    DatasetProjectConfig,
+    ExecutionProjectConfig,
+    MaterializationProjectConfig,
     OctreeProject,
+    PackingProjectConfig,
+    ProfileProjectConfig,
     ProjectPaths,
-    SidecarProjectConfig,
-    Stage00ProjectConfig,
-    Stage01ProjectConfig,
-    Stage02ProjectConfig,
-    Stage03ProjectConfig,
+    RoutingProjectConfig,
+    SidecarFamilyConfig,
+    SidecarsProjectConfig,
 )
 from foundinspace.octree.reader import Point, read_header
 from foundinspace.octree.reader.stats import collect_stats
-from foundinspace.octree.stage3 import build_stage03_sidecars
+from foundinspace.octree.sidecars.configured import build_configured_sidecars
+from packing_helpers import (
+    PayloadNode,
+    build_identifiers_intermediates,
+    build_intermediates,
+)
 
 STAR_RECORD_FMT = struct.Struct("<fffhBB")
 DATASET_UUID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
@@ -101,25 +104,25 @@ def _make_project(
         identities=identities,
     )
 
-    stage01_dir = tmp_path / "stage01"
+    preparation_dir = tmp_path / "preparation"
     render_manifest_path = build_intermediates(
-        stage01_dir / "render",
+        preparation_dir / "render",
         [node],
         max_level=0,
         mag_limit=6.5,
     )
     identifiers_manifest_path = build_identifiers_intermediates(
-        stage01_dir / "identifiers",
+        preparation_dir / "identifiers",
         [node],
         max_level=0,
         mag_limit=6.5,
     )
 
     render_path = tmp_path / "stars.octree"
-    combine_octree(
+    pack_octree(
         render_manifest_path,
         render_path,
-        plan=CombinePlan(max_open_files=2),
+        plan=PackingPlan(max_open_files=2),
         descriptor=PackedDescriptorFields(
             artifact_kind="render",
             dataset_uuid=DATASET_UUID,
@@ -127,7 +130,7 @@ def _make_project(
     )
 
     identifiers_order_path = tmp_path / "identifiers.order"
-    combine_identifiers_order(
+    pack_identifiers_order(
         identifiers_manifest_path,
         identifiers_order_path,
         parent_dataset_uuid=DATASET_UUID,
@@ -156,57 +159,69 @@ def _make_project(
     return OctreeProject(
         project_path=tmp_path / "project.toml",
         paths=ProjectPaths(
-            merged_healpix_dir=tmp_path / "merged",
+            input_shards_dir=tmp_path / "input",
             identifiers_map_path=identifiers_map_path,
-            stage00_output_dir=tmp_path / "stage00",
-            stage01_output_dir=stage01_dir,
-            stage02_output_path=render_path,
+            routed_dir=tmp_path / "routed",
+            prepared_dir=preparation_dir,
+            materialized_dir=tmp_path / "materialized",
+            build_work_dir=tmp_path / "work",
+            render_output_path=render_path,
             identifiers_order_output_path=identifiers_order_path,
-            stage03_output_dir=tmp_path / "stage03",
+            sidecars_output_dir=tmp_path / "sidecars",
+            sidecars_work_dir=tmp_path / "sidecars-work",
         ),
-        stage00=Stage00ProjectConfig(
-            batch_size=1000,
-            v_mag=6.5,
-            bucket_size=1_000_000,
+        dataset=DatasetProjectConfig(limiting_magnitude=6.5),
+        execution=ExecutionProjectConfig(
+            batch_rows=batch_size,
+            max_open_files=2,
+        ),
+        routing=RoutingProjectConfig(
+            input_mode="pre-routed",
+            scan_batch_rows=1_000,
+            bucket_rows=1_000_000,
             fragment_target_rows=100_000,
             max_open_writers=128,
             compact_after_files=64,
-            input_filter="none",
         ),
-        stage01=Stage01ProjectConfig(
-            input_glob="unused/*.parquet",
-            batch_size=batch_size,
-            deep_shard_from_level=99,
-            deep_prefix_bits=3,
+        materialization=MaterializationProjectConfig(
+            partition_from_level=8,
+            partition_prefix_bits=6,
         ),
-        stage02=Stage02ProjectConfig(max_open_files=2),
-        stage03=Stage03ProjectConfig(
-            sidecars=(
-                SidecarProjectConfig(
+        profile=ProfileProjectConfig(
+            name="classic",
+            max_level=0,
+            terminal_waterline=None,
+        ),
+        packing=PackingProjectConfig(index_emission_strategy="temp-pwrite-batched"),
+        sidecars=SidecarsProjectConfig(
+            shard_from_level=99,
+            shard_prefix_bits=3,
+            families=(
+                SidecarFamilyConfig(
                     name="meta",
                     fields=("proper_name", "hip_id"),
                 ),
-            )
+            ),
         ),
     )
 
 
-def test_build_stage03_sidecars_writes_meta_sidecar_and_manifest(
+def test_build_configured_sidecars_writes_meta_sidecar_and_manifest(
     tmp_path: Path,
 ) -> None:
     project = _make_project(tmp_path)
 
-    manifest_path = build_stage03_sidecars(project)
+    manifest_path = build_configured_sidecars(project)
 
     manifest = json.loads(manifest_path.read_text())
-    assert manifest["render_octree_path"] == str(project.paths.stage02_output_path)
+    assert manifest["render_octree_path"] == str(project.paths.render_output_path)
     assert manifest["identifiers_order_path"] == str(
         project.paths.identifiers_order_output_path
     )
     assert manifest["parent_dataset_uuid"] == str(DATASET_UUID)
     assert [item["name"] for item in manifest["sidecars"]] == ["meta"]
 
-    meta_path = project.paths.stage03_output_dir / "meta.octree"
+    meta_path = project.paths.sidecars_output_dir / "meta.octree"
     header = read_header(meta_path)
     assert header.artifact_kind == "sidecar"
     assert header.sidecar_kind == "meta"
@@ -214,7 +229,7 @@ def test_build_stage03_sidecars_writes_meta_sidecar_and_manifest(
     assert header.sidecar_uuid is not None
 
     report = collect_stats(
-        project.paths.stage02_output_path,
+        project.paths.render_output_path,
         point=Point(0.0, 0.0, 0.0),
         limiting_magnitude=6.5,
         radius_pc=3.0,
@@ -228,19 +243,19 @@ def test_build_stage03_sidecars_writes_meta_sidecar_and_manifest(
     assert second.get("hip_id") == 71683
 
 
-def test_build_stage03_sidecars_rebuilds_with_fresh_sidecar_uuid(
+def test_build_configured_sidecars_rebuilds_with_fresh_sidecar_uuid(
     tmp_path: Path,
 ) -> None:
     project = _make_project(tmp_path)
 
-    build_stage03_sidecars(project)
+    build_configured_sidecars(project)
     first_uuid = read_header(
-        project.paths.stage03_output_dir / "meta.octree"
+        project.paths.sidecars_output_dir / "meta.octree"
     ).sidecar_uuid
 
-    build_stage03_sidecars(project, family_name="meta")
+    build_configured_sidecars(project, family_name="meta")
     second_uuid = read_header(
-        project.paths.stage03_output_dir / "meta.octree"
+        project.paths.sidecars_output_dir / "meta.octree"
     ).sidecar_uuid
 
     assert first_uuid is not None
@@ -248,7 +263,7 @@ def test_build_stage03_sidecars_rebuilds_with_fresh_sidecar_uuid(
     assert second_uuid != first_uuid
 
 
-def test_build_stage03_sidecars_streams_cell_larger_than_batch(
+def test_build_configured_sidecars_streams_cell_larger_than_batch(
     tmp_path: Path,
 ) -> None:
     identities = [("gaia", str(index)) for index in range(23)]
@@ -268,10 +283,10 @@ def test_build_stage03_sidecars_streams_cell_larger_than_batch(
         batch_size=3,
     )
 
-    build_stage03_sidecars(project)
+    build_configured_sidecars(project)
 
     payload_path = next(
-        (project.paths.stage03_output_dir / "intermediates" / "meta").glob(
+        (project.paths.sidecars_work_dir / "intermediates" / "meta").glob(
             "*.meta.payload"
         )
     )

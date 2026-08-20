@@ -13,7 +13,7 @@ CloudFront Terraform root that used to live in this repository moved there as
 
 ## How it works
 
-The octree divides 3D space into nested cells across the 21-bit Morton address space. Each star is assigned to a level based on its absolute magnitude, not its position: the brightest stars go into the shallowest levels (largest cells), the faintest into the deepest (smallest cells). The placement threshold at each level is derived from `v_mag` (default 6.5, roughly the naked-eye limit) — a star is placed at the level whose cell half-size matches the distance from which that star would just be visible to the human eye.
+The octree divides 3D space into nested cells across the 21-bit Morton address space. Each star is assigned to a level based on its absolute magnitude, not its position: the brightest stars go into the shallowest levels (largest cells), the faintest into the deepest (smallest cells). The placement threshold at each level is derived from `limiting_magnitude` (default 6.5, roughly the naked-eye limit) — a star is placed at the level whose cell half-size matches the distance from which that star would just be visible to the human eye.
 
 At runtime, the viewer computes a visibility radius for each level. Bright-star cells have large visibility radii and are loaded from anywhere in the scene; faint-star cells have small radii and load only when the observer is nearby. This gives progressive, distance-dependent detail that mirrors how real starlight works.
 
@@ -31,11 +31,11 @@ The architecture is a sequence of purpose-named, reusable products:
 | **Build identity locator** | Published render plus exact identity order | Optional `identity-locator.idx` alternative index |
 | **Build sidecars** | Profile identity order plus enrichment | Named sidecar artifacts such as `meta.octree` |
 
-The numeric `stage-00` through `stage-03` commands are current compatibility
-entry points, not the durable architectural vocabulary. New product contracts
-and manifests should use purpose-based names. See
-[`docs/streaming-pipeline.md`](docs/streaming-pipeline.md) for the normative
-target and [`docs/stages.md`](docs/stages.md) for the compatibility mapping.
+The public workflow and every durable path, manifest, state key, and module use
+these purpose names. `build` is the deliberate higher-level boundary that plans
+topology, materializes profile buckets, and packs the two base artifacts in one
+restartable operation. See [`docs/products.md`](docs/products.md) for the
+product contracts.
 
 Routing preserves replaceability by upstream input shard id. That id comes from the
 input directory name or root-level parquet filename stem, so a HEALPix file,
@@ -63,8 +63,8 @@ HEALPix shard may require rereading that shard to discover moved rows, but an
 unchanged contribution must not be sorted or materialized again. Separate
 routing, ordering, render, identity, and sidecar identities stop propagation as
 soon as the relevant semantic content is unchanged. The current shared state
-still has a conservative downstream `clean`/`all` fallback; that is a migration
-constraint, not the target model.
+still has a conservative whole-product invalidation fallback; partitioned
+dependency metadata is the next refinement.
 
 Routing calculates only placement fields such as `morton_code` and natural
 `level`, while retaining raw position, magnitude, temperature, and identity
@@ -113,14 +113,14 @@ uv run fis-octree --help
 
 ### Project configuration
 
-Current compatibility build commands require an explicit TOML project file:
+Build commands require an explicit TOML project file:
 
 ```bash
 uv run fis-octree project init project.toml
-uv run fis-octree stage-00 --project project.toml
-uv run fis-octree stage-01 --project project.toml
-uv run fis-octree stage-02 --project project.toml
-uv run fis-octree stage-03 --project project.toml
+uv run fis-octree route --project project.toml
+uv run fis-octree prepare --project project.toml
+uv run fis-octree build --project project.toml
+uv run fis-octree sidecars build --project project.toml
 ```
 
 Optional sidecars are not part of the ordinary base build. The visual-duplicate
@@ -133,12 +133,12 @@ uv run fis-octree sidecars visual-duplicates \
   --evidence ../catalogs/publications/20260515.1/catalog/fis_gaia_hip_supplemental_display_map.parquet
 ```
 
-This purpose-named command defaults to
-`<render-name>.visual-duplicates.octree` beside the render artifact. It is not
-registered in `stage-03`, added to the starter project, or run by default.
+This command defaults to `visual-duplicates.octree` under
+`paths.sidecars_output_dir`, with restart data under
+`paths.sidecars_work_dir`. It is not registered in `sidecars build`, added to
+the starter project, or run by default.
 
-Exact Gaia/HIP lookup is a separate optional alternative index, likewise not a
-sidecar or numbered stage:
+Exact Gaia/HIP lookup is a separate optional alternative index, not a sidecar:
 
 ```bash
 uv run fis-octree identity-locator benchmark --project project.toml
@@ -153,28 +153,18 @@ uv run fis-octree identity-locator validate \
 The build defaults to `<render-stem>.identity-locator.idx`. It uses restartable
 bounded Parquet runs and DuckDB external merge sorts, while the local/HTTP
 reader performs exact finite range reads. No locator fields are added to the
-project TOML, and `stage-02` never runs it automatically. See
+project TOML, and `build` never runs it automatically. See
 [`docs/identity-lookup-index.md`](docs/identity-lookup-index.md). The measured
 production default uses 2,048-record logical pages and compact block-32 leaves
 with delta-coded IDs plus page-local cell dictionaries. The leaf layout is
 self-describing in every page. On the dataset-v2 production build this reduced
 the locator from 23.55 GB to 7.83 GB without a measured lookup regression.
 
-`stage-02` defaults to the measured batched temporary-index emitter. The
-alternative below uses less scratch space while producing identical bytes:
-
-```bash
-uv run fis-octree stage-02 --project project.toml \
-  --index-emission-strategy forward
-```
-
-The default temporary-index strategy needs scratch capacity approximately equal
-to the final index section in addition to the atomic final-output temporary
-file. Its scratch files and topology cache live below the configured Stage 02
-work directory.
-
-These numeric names will remain usable during migration; they should not be
-copied into new product or manifest names.
+The default temporary-index packing strategy needs scratch capacity
+approximately equal to the final index section in addition to the atomic
+final-output temporary file. Select the lower-scratch `forward` strategy with
+`packing.index_emission_strategy` in the project file. Scratch files and the
+topology cache live below `paths.build_work_dir`.
 
 Generate a starter config:
 
@@ -183,6 +173,9 @@ uv run fis-octree project init project.toml
 ```
 
 Paths in the project file may be absolute or relative to the project file's directory. Environment variable expansion is not supported in TOML values.
+The schema is intentionally unversioned: this codebase accepts only this
+semantic layout and contains no reader, alias, or migration path for older
+project files.
 
 ### Querying an octree
 
@@ -199,7 +192,7 @@ existing artifact and replays headset-oriented memory policies without
 rewriting the octree:
 
 ```bash
-uv run fis-octree terminal-memory-benchmark stars.octree \
+uv run fis-octree benchmark terminal-memory stars.octree \
   --sample sun:1,1,1@11 \
   --waterline 1000 \
   --chunk-stars 256
@@ -224,20 +217,19 @@ DuckDB memory and threading behaviour can be tuned at runtime via environment va
 
 ```
 src/foundinspace/octree/
-  _cli.py             # Click root and current compatibility commands
+  _cli.py             # Click root and purpose-named commands
   project.py          # TOML project file loading and validation
   config.py           # Build defaults (world size, Morton bits, max level)
-  classic.py          # Compatibility orchestration for classic materialization and packing
+  base_build.py       # Base topology, materialization, and packing orchestration
   materialization/    # Shared bounded run generation and merge machinery
   mag_levels.py       # Magnitude/level threshold calculations
   duckdb_util.py      # Shared DuckDB connection helper with env-variable tuning
   sources/            # Routed and sorted contribution preparation
   assembly/           # Shard assembly, manifests, build plan
-  combine/            # Payload relocation and streaming topology/index packing
+  packing/            # Payload relocation and streaming topology/index packing
   identifiers_order.py # identifiers.order artifact assembly
   identity_locator/    # Exact Gaia/HIP locator format, builder, reader, benchmark
   sidecars/            # Optional purpose-named sidecar builders
-  stage3.py           # Current named sidecar family builder
   encoding/           # Morton code and Teff encoding utilities
   reader/             # Binary octree reader (header, index, payload, stats)
 ```
@@ -246,10 +238,9 @@ src/foundinspace/octree/
 
 Pipeline architecture and supporting notes:
 
-- [`docs/streaming-pipeline.md`](docs/streaming-pipeline.md) — target
-  bounded-memory, immutable-contribution architecture
-- [`docs/staged-pipeline-plan.md`](docs/staged-pipeline-plan.md)
-- [`docs/stages.md`](docs/stages.md)
+- [`docs/products.md`](docs/products.md) — purpose-named product boundaries
+- [`docs/pipeline-plan.md`](docs/pipeline-plan.md) — bounded-memory,
+  immutable-contribution architecture and remaining refinements
 - [`docs/sidecars.md`](docs/sidecars.md)
 - [`docs/identifiers-order.md`](docs/identifiers-order.md)
 - [`docs/identity-lookup-index.md`](docs/identity-lookup-index.md)
@@ -265,13 +256,14 @@ Pipeline architecture and supporting notes:
 uv run pytest
 ```
 
-Tests live under `tests/` and cover stage CLIs, assembly, combine phases, reader stats, and binary format encoding.
+Tests live under `tests/` and cover the semantic CLIs, assembly, packing phases,
+reader stats, and binary format encoding.
 
 The isolated index-emitter benchmark covers dense and sparse 2k/8k/16k
 fixtures, with an optional production-shaped 64k sparse case:
 
 ```bash
-uv run python benchmarks/benchmark_combine_index.py --include-64k
+uv run python benchmarks/benchmark_packing_index.py --include-64k
 ```
 
 ## Development

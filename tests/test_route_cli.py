@@ -9,7 +9,7 @@ import pyarrow.parquet as pq
 from click.testing import CliRunner
 
 from foundinspace.octree._cli import cli
-from foundinspace.octree.sources.add_shard_columns import run_enrich_healpix
+from foundinspace.octree.sources.routing_columns import run_enrich_healpix
 
 
 def _write_parquet(df: pd.DataFrame, path: Path) -> None:
@@ -50,26 +50,21 @@ def _build_input_tree(root: Path) -> None:
     _write_parquet(p1, root / "1" / "part-b.parquet")
 
 
-def test_stage00_help_contains_batch_size():
+def test_route_help_uses_project_configuration():
     runner = CliRunner()
-    result = runner.invoke(cli, ["stage-00", "--help"])
+    result = runner.invoke(cli, ["route", "--help"])
     assert result.exit_code == 0
     assert "--project" in result.output
-    assert "--bucket-size" in result.output
-    assert "--fragment-target-rows" in result.output
-    assert "--max-open-writers" in result.output
-    assert "--compact-after-files" in result.output
-    assert "--input-filter" in result.output
     assert "--shard" in result.output
     assert "--replace-shards" in result.output
-    assert "--healpix" in result.output
+    assert "--max-shards" in result.output
     assert "--force" in result.output
     assert "octree project TOML" in result.output
 
 
 def test_run_enrich_healpix_per_pixel_non_destructive_and_resumable(tmp_path: Path):
     input_root = tmp_path / "merged" / "healpix"
-    output_root = tmp_path / "stage00"
+    output_root = tmp_path / "routing"
     _build_input_tree(input_root)
 
     processed, skipped = run_enrich_healpix(

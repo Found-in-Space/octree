@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 from urllib.request import Request, urlopen
 
-from foundinspace.octree.combine.records import SHARD_NODE_SIZE
+from foundinspace.octree.packing.records import SHARD_NODE_SIZE
 from foundinspace.octree.reader.header import OctreeHeader, read_header
 from foundinspace.octree.reader.index import IndexNavigator, NodeEntry, Point
 from foundinspace.octree.reader.payload import STAR_RECORD_FMT

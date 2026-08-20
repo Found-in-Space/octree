@@ -25,7 +25,7 @@ from ..terminal_packing import (
     TerminalMap,
 )
 from .lookup import FileHandleCache, FixedRecordFile
-from .manifest import CombineManifest
+from .manifest import PackingManifest
 from .records import (
     DESCRIPTOR_SIZE,
     FRONTIER_REF_FMT,
@@ -112,7 +112,7 @@ class _FrontierFrame:
 
 
 def write_streaming_index(
-    manifest: CombineManifest,
+    manifest: PackingManifest,
     relocation_files: tuple[Path, ...],
     output_fp: BinaryIO,
     *,
@@ -250,7 +250,7 @@ def _clean_incomplete_trees(cache_dir: Path) -> None:
 
 
 def _topology_identity(
-    manifest: CombineManifest,
+    manifest: PackingManifest,
     *,
     cache_dir: Path,
     star_format_version: int,
@@ -349,7 +349,7 @@ def _legacy_topology_checksum(path: Path, *, magic: bytes, cache_dir: Path) -> s
     return checksum
 
 
-def _iter_own_nodes(manifest: CombineManifest, level: int) -> Iterator[int]:
+def _iter_own_nodes(manifest: PackingManifest, level: int) -> Iterator[int]:
     shards = [entry for entry in manifest.shards if entry.key.level == level]
     shards.sort(key=lambda entry: _spatial_shard_range(entry.key)[0])
     previous: int | None = None
@@ -383,7 +383,7 @@ def _spatial_shard_range(key) -> tuple[int, int]:
 
 
 def _build_topology_runs(
-    manifest: CombineManifest,
+    manifest: PackingManifest,
     *,
     scratch: Path,
     star_format_version: int,

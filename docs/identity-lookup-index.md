@@ -3,9 +3,8 @@
 ## Status
 
 Locator v1 is implemented as the optional, dataset-scoped
-`identity-locator.idx`. It is a purpose-named alternative index and does not
-introduce another numbered pipeline stage. The separately described alias
-index remains a future product.
+`identity-locator.idx`. It is a purpose-named alternative index. The separately
+described alias index remains a future product.
 
 The locator design is deliberately simple: sorted, independently readable
 binary pages with a small navigation tree. Locator v1 uses compact block-32
@@ -416,7 +415,7 @@ fis-octree identity-locator validate LOCATOR IDENTIFIERS --report BUILD_REPORT
 
 Build defaults to `<render-stem>.identity-locator.idx` with an adjacent report.
 Benchmark produces an adjacent benchmark report. Neither command adds project
-TOML fields or runs from `stage-02`.
+TOML fields or runs from `build`.
 
 Alias construction is a separate bounded ingestion of curated identifier maps
 and cross-catalogue evidence. It resolves every posting to an exact canonical
@@ -481,5 +480,5 @@ validation or range-read behavior.
 - [`identity-locator-v2-benchmark.md`](identity-locator-v2-benchmark.md)
 - [`sidecars.md`](sidecars.md)
 - [`reader.md`](reader.md)
-- [`stages.md`](stages.md)
+- [`products.md`](products.md)
 - [`streaming-pipeline.md`](streaming-pipeline.md)

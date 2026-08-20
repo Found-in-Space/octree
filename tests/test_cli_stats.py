@@ -8,14 +8,14 @@ import pytest
 from click.testing import CliRunner
 
 import foundinspace.octree.reader.source as reader_source
-from combine_helpers import (
+from foundinspace.octree._cli import _format_identifiers, cli
+from foundinspace.octree.packing import PackingPlan, pack_octree
+from foundinspace.octree.packing.records import PackedDescriptorFields
+from packing_helpers import (
     PayloadNode,
     build_intermediates,
     build_sidecar_intermediates,
 )
-from foundinspace.octree._cli import _format_identifiers, cli
-from foundinspace.octree.combine import CombinePlan, combine_octree
-from foundinspace.octree.combine.records import PackedDescriptorFields
 
 DATASET_UUID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 SIDECAR_UUID = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
@@ -60,10 +60,10 @@ def _build_small_octree(tmp_path: Path) -> Path:
         mag_limit=6.5,
     )
     output = tmp_path / "stars.octree"
-    combine_octree(
+    pack_octree(
         manifest_path,
         output,
-        plan=CombinePlan(max_open_files=2),
+        plan=PackingPlan(max_open_files=2),
         descriptor=PackedDescriptorFields(
             artifact_kind="render",
             dataset_uuid=DATASET_UUID,
@@ -110,19 +110,19 @@ def _build_small_octree_with_meta(tmp_path: Path) -> tuple[Path, Path]:
     )
     output = tmp_path / "stars.octree"
     meta_output = tmp_path / "stars.meta.octree"
-    combine_octree(
+    pack_octree(
         render_manifest_path,
         output,
-        plan=CombinePlan(max_open_files=2),
+        plan=PackingPlan(max_open_files=2),
         descriptor=PackedDescriptorFields(
             artifact_kind="render",
             dataset_uuid=DATASET_UUID,
         ),
     )
-    combine_octree(
+    pack_octree(
         sidecar_manifest_path,
         meta_output,
-        plan=CombinePlan(max_open_files=2),
+        plan=PackingPlan(max_open_files=2),
         descriptor=PackedDescriptorFields(
             artifact_kind="sidecar",
             parent_dataset_uuid=DATASET_UUID,

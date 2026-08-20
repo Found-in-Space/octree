@@ -4,19 +4,20 @@ STAR v2 adds terminal subtree packing and serialized payload star counts while
 leaving the existing header, descriptor, shard header, payload codec, and star
 record unchanged.
 
-## Compatibility build policy
+## Build policy
 
 New project files default to:
 
 ```toml
-[stage02]
-star_format_version = 2
+[profile]
+name = "terminal-packed"
+max_level = 14
 terminal_waterline = 1000
 ```
 
-The command-line overrides are `--star-format-version {1,2}` and
-`--terminal-waterline N`. Selecting version 1 disables terminal packing and
-emits the existing byte-compatible STAR v1 index.
+Selecting `name = "classic"` disables terminal packing and emits the STAR v1
+index; omit `terminal_waterline` for that profile. Build policy has no
+command-line override.
 
 For v2, topology planning first writes immutable, content-addressed count runs
 for each sorted input group and occupied octree level. Input is read in bounded
@@ -66,7 +67,7 @@ configured classic level cap even when no emitted node reaches that level.
 
 ## Shared index packing
 
-STAR v1 and v2 use the same streaming index compiler. For classic v2, terminal
+STAR v1 and v2 use the same streaming index compiler. For terminal-packed v2, terminal
 planning publishes the authoritative final logical topology after selection.
 Each logical record contains node ID, child mask, payload/terminal flags, and
 the absolute subtree-brightest level. That level occupies an existing padding

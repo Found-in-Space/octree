@@ -27,8 +27,6 @@ from ..assembly.writer import (
     belongs_to_shard,
     sidecar_shard_filenames,
 )
-from ..combine import CombinePlan, combine_octree
-from ..combine.records import PackedDescriptorFields
 from ..identifiers_order import (
     IDENTITY_UNCOMPRESSED_CELL_LIMIT_BYTES,
     IdentifiersOrderReader,
@@ -37,6 +35,8 @@ from ..identifiers_order import (
 from ..identifiers_order import (
     read_header as read_identifiers_order_header,
 )
+from ..packing import PackingPlan, pack_octree
+from ..packing.records import PackedDescriptorFields
 from ..reader import read_header
 
 SIDECAR_KIND = "visual-duplicates"
@@ -225,10 +225,10 @@ def build_visual_duplicates_sidecar(
     temporary_output = output_path.with_name(f".{output_path.name}.tmp")
     temporary_output.unlink(missing_ok=True)
     try:
-        combine_octree(
+        pack_octree(
             work_manifest_path,
             temporary_output,
-            plan=CombinePlan(max_open_files=config.max_open_files),
+            plan=PackingPlan(max_open_files=config.max_open_files),
             descriptor=PackedDescriptorFields(
                 artifact_kind="sidecar",
                 parent_dataset_uuid=render_header.dataset_uuid,

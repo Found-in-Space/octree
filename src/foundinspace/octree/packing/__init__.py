@@ -1,22 +1,22 @@
 from .dfs import CellPayloadRef, iter_cells_dfs
 from .pipeline import (
-    CombinePlan,
     IndexEmissionStrategy,
     IndexPassResult,
+    PackingPlan,
     PayloadPassResult,
-    combine_octree,
     finalize_octree_header,
+    pack_octree,
     relocate_payloads_dfs,
     write_final_shard_index,
 )
 
 __all__ = [
     "CellPayloadRef",
-    "CombinePlan",
+    "PackingPlan",
     "IndexEmissionStrategy",
     "IndexPassResult",
     "PayloadPassResult",
-    "combine_octree",
+    "pack_octree",
     "finalize_octree_header",
     "iter_cells_dfs",
     "relocate_payloads_dfs",

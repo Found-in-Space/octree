@@ -9,8 +9,8 @@ import pyarrow.parquet as pq
 import pytest
 
 import foundinspace.octree.terminal_packing as terminal_packing
-from foundinspace.octree.classic_materialization import Stage01GroupInput
 from foundinspace.octree.config import MORTON_BITS
+from foundinspace.octree.materialization.pipeline import PreparationGroupInput
 from foundinspace.octree.terminal_packing import TerminalMap, build_terminal_map
 
 
@@ -31,7 +31,7 @@ def _build_map(
     for level, node_id, count in cells:
         levels.extend([level] * count)
         morton_codes.extend([_morton_for_node(level, node_id)] * count)
-    source = tmp_path / "stage01.parquet"
+    source = tmp_path / "preparation.parquet"
     pq.write_table(
         pa.table(
             {
@@ -41,7 +41,7 @@ def _build_map(
         ),
         source,
     )
-    group = Stage01GroupInput(
+    group = PreparationGroupInput(
         key="group",
         checksum="sha256:test",
         row_count=len(levels),
@@ -68,7 +68,7 @@ def _write_group(
     key: str,
     checksum: str,
     cells: list[tuple[int, int, int]],
-) -> Stage01GroupInput:
+) -> PreparationGroupInput:
     directory.mkdir(parents=True, exist_ok=True)
     levels: list[int] = []
     morton_codes: list[int] = []
@@ -85,7 +85,7 @@ def _write_group(
         ),
         source,
     )
-    return Stage01GroupInput(
+    return PreparationGroupInput(
         key=key,
         checksum=checksum,
         row_count=len(levels),
@@ -96,7 +96,7 @@ def _write_group(
 
 def _build_groups(
     tmp_path: Path,
-    groups: tuple[Stage01GroupInput, ...],
+    groups: tuple[PreparationGroupInput, ...],
     *,
     max_level: int = 2,
     waterline: int = 2,

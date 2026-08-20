@@ -1,23 +1,23 @@
 from __future__ import annotations
 
-from combine_helpers import PayloadNode, build_intermediates
 from foundinspace.octree.assembly.formats import (
     INDEX_FILE_HDR,
     INDEX_MAGIC,
     INDEX_RECORD,
 )
-from foundinspace.octree.combine.lookup import (
+from foundinspace.octree.packing.lookup import (
     FileHandleCache,
     FixedRecordFile,
     IntermediateLookup,
     RelocationLookup,
 )
-from foundinspace.octree.combine.pipeline import relocate_payloads_dfs
-from foundinspace.octree.combine.records import (
+from foundinspace.octree.packing.pipeline import relocate_payloads_dfs
+from foundinspace.octree.packing.records import (
     RELOC_HEADER_FMT,
     RELOC_MAGIC,
     RELOC_RECORD_FMT,
 )
+from packing_helpers import PayloadNode, build_intermediates
 
 
 def test_fixed_record_find_and_range(tmp_path) -> None:
@@ -72,9 +72,9 @@ def test_intermediate_and_relocation_lookup(tmp_path) -> None:
         out_fp.write(b"\x00" * 64)
         phase_a = relocate_payloads_dfs(manifest_path, out_fp, plan=_Plan())
 
-    from foundinspace.octree.combine.manifest import read_combine_manifest
+    from foundinspace.octree.packing.manifest import read_packing_manifest
 
-    manifest = read_combine_manifest(manifest_path)
+    manifest = read_packing_manifest(manifest_path)
     il = IntermediateLookup(manifest, max_open_files=2)
     rl = RelocationLookup(phase_a.relocation_files, max_open_files=2)
     try:
@@ -98,9 +98,9 @@ def test_lookup_open_files_are_bounded(tmp_path) -> None:
         ],
         max_level=2,
     )
-    from foundinspace.octree.combine.manifest import read_combine_manifest
+    from foundinspace.octree.packing.manifest import read_packing_manifest
 
-    manifest = read_combine_manifest(manifest_path)
+    manifest = read_packing_manifest(manifest_path)
     il = IntermediateLookup(manifest, max_open_files=1)
     try:
         assert il.has_payload_node(0, 0)

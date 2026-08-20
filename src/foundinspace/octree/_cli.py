@@ -174,7 +174,7 @@ def identity_locator_build(
 
     project = _load_project_or_die(project_path)
     output, report, work = _identity_locator_paths(
-        project.paths.stage02_output_path,
+        project.paths.render_output_path,
         output_path,
         report_path,
         work_dir,
@@ -182,7 +182,7 @@ def identity_locator_build(
     try:
         result = build_identity_locator(
             IdentityLocatorBuildConfig(
-                render_octree_path=project.paths.stage02_output_path,
+                render_octree_path=project.paths.render_output_path,
                 identifiers_order_path=project.paths.identifiers_order_output_path,
                 output_path=output,
                 report_path=report,
@@ -285,7 +285,7 @@ def identity_locator_benchmark(
     )
 
     project = _load_project_or_die(project_path)
-    render_path = project.paths.stage02_output_path
+    render_path = project.paths.render_output_path
     report = report_path or render_path.with_name(
         f"{render_path.stem}.identity-locator.benchmark.json"
     )
@@ -412,6 +412,11 @@ def sidecars_group() -> None:
     """Build optional enrichment artifacts for a published render octree."""
 
 
+@cli.group("benchmark")
+def benchmark_group() -> None:
+    """Evaluate packing and runtime design choices."""
+
+
 @sidecars_group.command("visual-duplicates")
 @click.option(
     "--project",
@@ -479,15 +484,15 @@ def visual_duplicates_sidecar(
     )
 
     project = _load_project_or_die(project_path)
-    render_path = project.paths.stage02_output_path
-    resolved_output = output_path or render_path.with_name(
-        f"{render_path.stem}.visual-duplicates.octree"
+    render_path = project.paths.render_output_path
+    resolved_output = output_path or (
+        project.paths.sidecars_output_dir / "visual-duplicates.octree"
     )
     resolved_report = report_path or resolved_output.with_name(
         f"{resolved_output.stem}.report.json"
     )
-    resolved_work_dir = work_dir or resolved_output.with_name(
-        f".{resolved_output.stem}.work"
+    resolved_work_dir = work_dir or (
+        project.paths.sidecars_work_dir / "visual-duplicates"
     )
 
     last_reported_cells = -1
@@ -513,9 +518,9 @@ def visual_duplicates_sidecar(
                 output_path=resolved_output,
                 work_dir=resolved_work_dir,
                 report_path=resolved_report,
-                deep_shard_from_level=project.stage01.deep_shard_from_level,
-                deep_prefix_bits=project.stage01.deep_prefix_bits,
-                max_open_files=project.stage02.max_open_files,
+                deep_shard_from_level=project.sidecars.shard_from_level,
+                deep_prefix_bits=project.sidecars.shard_prefix_bits,
+                max_open_files=project.execution.max_open_files,
                 max_evidence_pairs=max_pairs,
                 force=force,
                 progress=report_progress,
@@ -535,7 +540,7 @@ def visual_duplicates_sidecar(
     click.echo(f"Wrote {result.report_path}")
 
 
-@cli.command("stage-00")
+@cli.command("route")
 @click.option(
     "--project",
     "project_path",
@@ -544,156 +549,74 @@ def visual_duplicates_sidecar(
     help="Path to octree project TOML.",
 )
 @click.option(
-    "--input-root",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Input shard root. Defaults to paths.merged_healpix_dir.",
-)
-@click.option(
-    "--output-dir",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Stage 00 packed staging output directory. Defaults to paths.stage00_output_dir.",
-)
-@click.option(
     "--shard",
-    "--healpix",
     "shard_ids",
     multiple=True,
-    help=(
-        "Input shard directory or root-level parquet shard to process. "
-        "May be passed multiple times. --healpix is a compatibility alias."
-    ),
+    help="Input shard directory or root-level parquet shard. May be repeated.",
 )
 @click.option(
-    "--max-pixels",
+    "--max-shards",
     type=int,
     default=None,
     help="Process at most this many input shard directories or files.",
 )
 @click.option(
-    "--bucket-size",
-    type=int,
-    default=None,
-    help=(
-        "Rows a packed staging node may hold before it becomes lower-mag limited. "
-        "Defaults to stage00.bucket_size."
-    ),
-)
-@click.option(
-    "--batch-size",
-    type=int,
-    default=None,
-    help="Parquet batch size. Defaults to stage00.batch_size.",
-)
-@click.option(
-    "--fragment-target-rows",
-    type=int,
-    default=None,
-    help="Rows per physical Stage 00 parquet fragment. Defaults to stage00.fragment_target_rows.",
-)
-@click.option(
-    "--max-open-writers",
-    type=int,
-    default=None,
-    help="Maximum open Stage 00 parquet writers. Defaults to stage00.max_open_writers.",
-)
-@click.option(
-    "--compact-after-files",
-    type=int,
-    default=None,
-    help="Compact a node/input-shard/kind group after this many files. Defaults to stage00.compact_after_files.",
-)
-@click.option(
-    "--input-filter",
-    type=click.Choice(["none", "raw-cartesian-to-stage00-routing/v1"]),
-    default=None,
-    help="Explicit pre-filter before Stage 00 routing. Defaults to stage00.input_filter.",
-)
-@click.option(
     "--force",
     is_flag=True,
-    help="Replace an existing Stage 00 output directory.",
+    help="Replace the configured routed-contribution directory.",
 )
 @click.option(
     "--replace-shards",
     is_flag=True,
-    help="Replace existing Stage 00 fragments for the selected --shard values.",
+    help="Replace existing routed fragments for the selected --shard values.",
 )
-def stage_00(
+def route(
     project_path: Path,
-    input_root: Path | None,
-    output_dir: Path | None,
     shard_ids: tuple[str, ...],
-    max_pixels: int | None,
-    bucket_size: int | None,
-    batch_size: int | None,
-    fragment_target_rows: int | None,
-    max_open_writers: int | None,
-    compact_after_files: int | None,
-    input_filter: str | None,
+    max_shards: int | None,
     force: bool,
     replace_shards: bool,
 ) -> None:
-    """Pack input shards into adaptive Stage 00 staging buckets."""
-    from foundinspace.octree.sources.stage00 import Stage00Config, run_stage00
+    """Route input shards into adaptive contribution buckets."""
+    from foundinspace.octree.sources.routing import (
+        RoutingConfig,
+        route_contributions,
+    )
 
     project = _load_project_or_die(project_path)
     mag_config = MagLevelConfig(
-        v_mag=project.stage00.v_mag,
+        v_mag=project.dataset.limiting_magnitude,
         morton_bits=MORTON_BITS,
     )
-    resolved_input = (
-        input_root if input_root is not None else project.paths.merged_healpix_dir
-    )
-    resolved_output = (
-        output_dir if output_dir is not None else project.paths.stage00_output_dir
-    )
-    config = Stage00Config(
-        input_root=resolved_input,
-        output_dir=resolved_output,
+    config = RoutingConfig(
+        input_shards_dir=project.paths.input_shards_dir,
+        routed_dir=project.paths.routed_dir,
         mag_config=mag_config,
-        bucket_size=(
-            bucket_size if bucket_size is not None else project.stage00.bucket_size
-        ),
-        batch_size=batch_size or project.stage00.batch_size,
-        fragment_target_rows=(
-            fragment_target_rows
-            if fragment_target_rows is not None
-            else project.stage00.fragment_target_rows
-        ),
-        max_open_writers=(
-            max_open_writers
-            if max_open_writers is not None
-            else project.stage00.max_open_writers
-        ),
-        compact_after_files=(
-            compact_after_files
-            if compact_after_files is not None
-            else project.stage00.compact_after_files
-        ),
-        input_filter=(
-            input_filter if input_filter is not None else project.stage00.input_filter
-        ),
+        bucket_rows=project.routing.bucket_rows,
+        scan_batch_rows=project.routing.scan_batch_rows,
+        fragment_target_rows=project.routing.fragment_target_rows,
+        max_open_writers=project.routing.max_open_writers,
+        compact_after_files=project.routing.compact_after_files,
+        input_mode=project.routing.input_mode,
         shard_ids=tuple(shard_ids),
-        max_pixels=max_pixels,
+        max_shards=max_shards,
         force=force,
         replace_shards=replace_shards,
     )
     click.echo(
-        "Stage 00 — adaptive staging buckets: "
-        f"{config.input_root} -> {config.output_dir}; "
+        "Routing contributions: "
+        f"{config.input_shards_dir} -> {config.routed_dir}; "
         f"mode={'replace-shards' if config.replace_shards else 'full'}; "
-        f"bucket_size={config.bucket_size:,}; "
+        f"bucket_rows={config.bucket_rows:,}; "
         f"fragment_target_rows={config.fragment_target_rows:,}; "
         f"max_open_writers={config.max_open_writers:,}; "
         f"compact_after_files={config.compact_after_files:,}; "
-        f"input_filter={config.input_filter}"
+        f"input_mode={config.input_mode}"
     )
-    report_path = run_stage00(config)
+    report_path = route_contributions(config)
     report = json.loads(report_path.read_text(encoding="utf-8"))
     click.echo(
-        "Stage 00 summary: "
+        "Routing summary: "
         f"input_shards={len(report['processed_input_shards'])}, "
         f"rows={report['rows_in']:,}, "
         f"nodes={report['staging_nodes']:,}, "
@@ -705,10 +628,10 @@ def stage_00(
         f"split_rewrites={report['split_rewrites']:,}, "
         f"compaction_rewrites={report['compaction_rewrites']:,}"
     )
-    click.echo(f"Stage 00 report written to {report_path}")
+    click.echo(f"Routing report written to {report_path}")
 
 
-@cli.command("stage-01")
+@cli.command("prepare")
 @click.option(
     "--project",
     "project_path",
@@ -719,50 +642,52 @@ def stage_00(
 @click.option(
     "--force",
     is_flag=True,
-    help="Replace existing Stage 01 sorted output and rebuild all groups.",
+    help="Replace existing prepared output and rebuild all groups.",
 )
-def stage_01(
+def prepare(
     project_path: Path,
     force: bool,
 ) -> None:
-    """Sort and compact Stage 00 groups into deterministic Stage 01 groups."""
-    from foundinspace.octree.sources.stage01 import Stage01Config, run_stage01
+    """Sort routed contributions into deterministic prepared groups."""
+    from foundinspace.octree.sources.preparation import (
+        PreparationConfig,
+        prepare_contributions,
+    )
 
     project = _load_project_or_die(project_path)
-    config = Stage01Config(
-        stage00_output_dir=project.paths.stage00_output_dir,
-        output_dir=project.paths.stage01_output_dir,
-        v_mag=project.stage00.v_mag,
-        bucket_size=project.stage00.bucket_size,
-        input_filter=project.stage00.input_filter,
-        batch_size=project.stage01.batch_size,
-        fragment_target_rows=project.stage00.fragment_target_rows,
+    config = PreparationConfig(
+        routed_dir=project.paths.routed_dir,
+        prepared_dir=project.paths.prepared_dir,
+        limiting_magnitude=project.dataset.limiting_magnitude,
+        bucket_rows=project.routing.bucket_rows,
+        input_mode=project.routing.input_mode,
+        batch_rows=project.execution.batch_rows,
+        fragment_target_rows=project.routing.fragment_target_rows,
         force=force,
     )
     click.echo(
-        "Stage 01 — sort staged groups: "
-        f"{config.stage00_output_dir} -> {config.output_dir}; "
+        "Preparing routed contributions: "
+        f"{config.routed_dir} -> {config.prepared_dir}; "
         f"fragment_target_rows={config.fragment_target_rows:,}; "
-        f"batch_size={config.batch_size:,}; "
+        f"batch_rows={config.batch_rows:,}; "
         f"force={config.force}"
     )
-    report_path = run_stage01(config)
+    report_path = prepare_contributions(config)
     report = json.loads(report_path.read_text(encoding="utf-8"))
     click.echo(
-        "Stage 01 summary: "
+        "Preparation summary: "
         f"processed_groups={report['processed_group_count']:,}, "
         f"changed_groups={report['changed_group_count']:,}, "
         f"unchanged_groups={report['unchanged_group_count']:,}, "
         f"deleted_groups={report['deleted_group_count']:,}, "
         f"in_memory_sorts={report['in_memory_sort_group_count']:,}, "
         f"external_sorts={report['external_sort_group_count']:,}, "
-        f"dirty_stage03={report['dirty_stage03_mode']}, "
         f"files_written={report['output_files_written']:,}"
     )
-    click.echo(f"Stage 01 report written to {report_path}")
+    click.echo(f"Preparation report written to {report_path}")
 
 
-@cli.command("stage-02")
+@cli.command("build")
 @click.option(
     "--project",
     "project_path",
@@ -773,113 +698,59 @@ def stage_01(
 @click.option(
     "--retain-relocation-files",
     is_flag=True,
-    help="Keep intermediate relocation files created during combine.",
+    help="Keep intermediate relocation files created during packing.",
 )
-@click.option(
-    "--max-level",
-    type=click.IntRange(min=0, max=MORTON_BITS),
-    default=None,
-    help="Classic output level cap. Defaults to stage02.classic_max_level.",
-)
-@click.option(
-    "--star-format-version",
-    type=click.Choice(("1", "2")),
-    default=None,
-    help="STAR output version. Defaults to stage02.star_format_version.",
-)
-@click.option(
-    "--terminal-waterline",
-    type=click.IntRange(min=1),
-    default=None,
-    help="Maximum stars in a packed v2 terminal subtree.",
-)
-@click.option(
-    "--index-emission-strategy",
-    type=click.Choice(("temp-pwrite-batched", "forward")),
-    default="temp-pwrite-batched",
-    show_default=True,
-    help=("Index emitter: batched temporary index, or lower-scratch forward output."),
-)
-@click.option(
-    "--intermediates-dir",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Optional isolated directory for published Stage 02 intermediates.",
-)
-@click.option(
-    "--work-dir",
-    type=click.Path(path_type=Path),
-    default=None,
-    help="Optional isolated directory for resumable Stage 02 work state.",
-)
-def stage_02(
+def build(
     project_path: Path,
     retain_relocation_files: bool,
-    max_level: int | None,
-    star_format_version: str | None,
-    terminal_waterline: int | None,
-    index_emission_strategy: str,
-    intermediates_dir: Path | None,
-    work_dir: Path | None,
 ) -> None:
-    """Build the classic stars.octree from sorted Stage 01 groups."""
-    from foundinspace.octree.classic import (
-        ClassicBuildConfig,
-        build_classic_artifacts,
+    """Plan, materialize, and pack the configured base artifacts."""
+    from foundinspace.octree.base_build import (
+        BaseBuildConfig,
+        build_base_artifacts,
     )
-    from foundinspace.octree.combine import IndexEmissionStrategy
+    from foundinspace.octree.packing import IndexEmissionStrategy
 
     project = _load_project_or_die(project_path)
-    resolved_max_level = (
-        max_level if max_level is not None else project.stage02.classic_max_level
-    )
-    resolved_format_version = (
-        int(star_format_version)
-        if star_format_version is not None
-        else project.stage02.star_format_version
-    )
-    resolved_terminal_waterline = (
-        terminal_waterline
-        if terminal_waterline is not None
-        else project.stage02.terminal_waterline
-    )
-    result = build_classic_artifacts(
-        ClassicBuildConfig(
-            stage00_output_dir=project.paths.stage00_output_dir,
-            stage01_output_dir=project.paths.stage01_output_dir,
-            output_path=project.paths.stage02_output_path,
+    result = build_base_artifacts(
+        BaseBuildConfig(
+            routed_dir=project.paths.routed_dir,
+            prepared_dir=project.paths.prepared_dir,
+            output_path=project.paths.render_output_path,
             identifiers_order_path=project.paths.identifiers_order_output_path,
-            mag_limit=project.stage00.v_mag,
-            max_level=resolved_max_level,
-            batch_size=project.stage01.batch_size,
-            max_open_files=project.stage02.max_open_files,
-            partition_from_level=project.stage02.partition_from_level,
-            partition_prefix_bits=project.stage02.partition_prefix_bits,
+            limiting_magnitude=project.dataset.limiting_magnitude,
+            max_level=project.profile.max_level,
+            batch_rows=project.execution.batch_rows,
+            max_open_files=project.execution.max_open_files,
+            partition_from_level=project.materialization.partition_from_level,
+            partition_prefix_bits=project.materialization.partition_prefix_bits,
             retain_relocation_files=retain_relocation_files,
-            star_format_version=resolved_format_version,
-            terminal_waterline=resolved_terminal_waterline,
-            index_emission_strategy=IndexEmissionStrategy(index_emission_strategy),
-            intermediates_dir=intermediates_dir,
-            work_dir=work_dir,
+            star_format_version=project.profile.star_format_version,
+            terminal_waterline=project.profile.terminal_waterline,
+            index_emission_strategy=IndexEmissionStrategy(
+                project.packing.index_emission_strategy
+            ),
+            materialized_dir=project.paths.materialized_dir,
+            build_work_dir=project.paths.build_work_dir,
         )
     )
     click.echo(
-        "Stage 02 classic summary: "
+        "Build summary: "
         f"rows={result.row_count:,}, "
         f"folded_rows={result.folded_row_count:,}, "
         f"cells={result.cell_count:,}, "
-        f"max_level={resolved_max_level}, "
-        f"star_format_version={resolved_format_version}, "
-        f"index_emission_strategy={index_emission_strategy}, "
+        f"profile={project.profile.name}, "
+        f"max_level={project.profile.max_level}, "
+        f"index_emission_strategy={project.packing.index_emission_strategy}, "
         "terminal_waterline="
-        f"{resolved_terminal_waterline if resolved_format_version == 2 else 'disabled'}, "
+        f"{project.profile.terminal_waterline or 'disabled'}, "
         f"dataset_uuid={result.dataset_uuid}"
     )
     click.echo(f"Wrote {result.output_path}")
     click.echo(f"Wrote {result.identifiers_order_path}")
 
 
-@cli.command("stage-03")
+@sidecars_group.command("build")
 @click.option(
     "--project",
     "project_path",
@@ -894,19 +765,19 @@ def stage_02(
     default=None,
     help="Optional single sidecar family to build.",
 )
-def stage_03(
+def build_sidecars(
     project_path: Path,
     family_name: str | None,
 ) -> None:
     """Build named sidecars from the render octree and identifiers/order artifact."""
-    from foundinspace.octree.stage3 import build_stage03_sidecars
+    from foundinspace.octree.sidecars.configured import build_configured_sidecars
 
     project = _load_project_or_die(project_path)
-    manifest_path = build_stage03_sidecars(project, family_name=family_name)
-    click.echo(f"Stage 03 manifest written to {manifest_path}")
+    manifest_path = build_configured_sidecars(project, family_name=family_name)
+    click.echo(f"Sidecars manifest written to {manifest_path}")
 
 
-@cli.command("stage-03-benchmark")
+@benchmark_group.command("packing-order")
 @click.option(
     "--project",
     "project_path",
@@ -946,7 +817,7 @@ def stage_03(
     "--magnitude",
     type=float,
     default=None,
-    help="Limiting apparent magnitude. Defaults to stage00.v_mag.",
+    help="Limiting apparent magnitude. Defaults to dataset.limiting_magnitude.",
 )
 @click.option(
     "--target",
@@ -989,7 +860,7 @@ def stage_03(
     is_flag=True,
     help="Print machine-readable JSON instead of a table.",
 )
-def stage_03_benchmark(
+def packing_order_benchmark(
     project_path: Path,
     profiles: tuple[str, ...],
     orders: tuple[str, ...],
@@ -1003,23 +874,23 @@ def stage_03_benchmark(
     coalesce_gap_bytes: int,
     as_json: bool,
 ) -> None:
-    """Estimate Stage 03 packing order range-read behavior from Stage 01."""
-    from foundinspace.octree.stage03_benchmark import (
+    """Estimate packing-order range-read behavior from prepared groups."""
+    from foundinspace.octree.packing_benchmark import (
         PACKING_ORDERS,
         PROFILES,
         SCENARIOS,
+        PackingBenchmarkConfig,
         Point3,
-        Stage03BenchmarkConfig,
         report_to_json,
-        run_stage03_packing_benchmark,
+        run_packing_benchmark,
     )
 
     project = _load_project_or_die(project_path)
     center_point = _parse_point(center)
     target_point = _parse_point(target)
-    config = Stage03BenchmarkConfig(
-        stage00_output_dir=project.paths.stage00_output_dir,
-        stage01_output_dir=project.paths.stage01_output_dir,
+    config = PackingBenchmarkConfig(
+        routed_dir=project.paths.routed_dir,
+        prepared_dir=project.paths.prepared_dir,
         profiles=profiles or PROFILES,
         orders=orders or PACKING_ORDERS,
         scenarios=scenarios or SCENARIOS,
@@ -1027,15 +898,15 @@ def stage_03_benchmark(
         target=Point3(target_point.x, target_point.y, target_point.z),
         limiting_magnitude=magnitude
         if magnitude is not None
-        else project.stage00.v_mag,
+        else project.dataset.limiting_magnitude,
         vertical_fov_deg=vertical_fov,
         aspect_ratio=aspect_ratio,
         tile_prefix_depth=tile_prefix_depth,
         coalesce_gap_bytes=coalesce_gap_bytes,
-        batch_size=project.stage01.batch_size,
+        batch_rows=project.execution.batch_rows,
     )
     try:
-        report = run_stage03_packing_benchmark(config)
+        report = run_packing_benchmark(config)
     except (FileNotFoundError, NotADirectoryError, ValueError) as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -1045,16 +916,16 @@ def stage_03_benchmark(
 
     console = Console()
     console.print(
-        "Stage 03 packing benchmark: "
-        f"{config.stage01_output_dir} | "
+        "Packing-order benchmark: "
+        f"{config.prepared_dir} | "
         f"profiles={','.join(config.profiles)} | "
         f"orders={','.join(config.orders)} | "
         f"scenarios={','.join(config.scenarios)}"
     )
-    _render_stage03_benchmark(console, report)
+    _render_packing_benchmark(console, report)
 
 
-@cli.command("terminal-memory-benchmark")
+@benchmark_group.command("terminal-memory")
 @click.argument("octree_source", type=str)
 @click.option(
     "--sample",
@@ -1285,8 +1156,8 @@ def _format_ratio(value: float) -> str:
     return f"{value:.3f}"
 
 
-def _render_stage03_benchmark(console: Console, report: dict) -> None:
-    table = Table(title="Stage 03 Packing Benchmark")
+def _render_packing_benchmark(console: Console, report: dict) -> None:
+    table = Table(title="Sidecars Packing Benchmark")
     table.add_column("Profile")
     table.add_column("Order")
     table.add_column("Scenario")
@@ -1367,7 +1238,7 @@ def _resolve_octree_source(source: str) -> OctreeSource:
     octree_path = Path(normalized).expanduser()
     if not octree_path.exists():
         raise FileNotFoundError(
-            f"Octree file not found: {octree_path}. Run stage-02 first."
+            f"Octree file not found: {octree_path}. Run build first."
         )
     return octree_path
 
@@ -1514,7 +1385,7 @@ def _render_stats(console: Console, report: StatsReport, nearest_n: int) -> None
     "--meta-octree",
     type=str,
     default=None,
-    help="Optional metadata octree path or URL for the Stage 03 `meta` sidecar.",
+    help="Optional metadata octree path or URL for the Sidecars `meta` sidecar.",
 )
 def stats(
     octree_source: str,
@@ -1524,7 +1395,7 @@ def stats(
     nearest: int,
     meta_octree: str | None,
 ) -> None:
-    """Read a stage-02 octree and print bounded query stats."""
+    """Read a build octree and print bounded query stats."""
     if radius < 0:
         raise click.BadParameter("--radius must be >= 0")
     if nearest <= 0:

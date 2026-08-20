@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ..assembly.types import ShardKey
 from .lookup import IntermediateLookup
-from .manifest import read_combine_manifest
+from .manifest import read_packing_manifest
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,7 +24,7 @@ def iter_cells_dfs(
     *,
     max_open_files: int = 32,
 ) -> Iterator[CellPayloadRef]:
-    manifest = read_combine_manifest(manifest_path, deep_validation=False)
+    manifest = read_packing_manifest(manifest_path, deep_validation=False)
     lookup = IntermediateLookup(manifest, max_open_files=max_open_files)
     try:
         max_level = manifest.max_level

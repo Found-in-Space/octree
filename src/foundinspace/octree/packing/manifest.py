@@ -27,7 +27,7 @@ class ShardEntry:
 
 
 @dataclass(frozen=True, slots=True)
-class CombineManifest:
+class PackingManifest:
     manifest_path: Path
     root_dir: Path
     artifact_kind: str
@@ -47,9 +47,9 @@ def _parse_world_center(raw: object) -> tuple[float, float, float]:
     return (float(raw[0]), float(raw[1]), float(raw[2]))
 
 
-def read_combine_manifest(
+def read_packing_manifest(
     manifest_path: Path, *, deep_validation: bool = True
-) -> CombineManifest:
+) -> PackingManifest:
     raw = read_manifest_file(manifest_path)
     got_format = str(raw.get("format", ""))
     if got_format != MANIFEST_FORMAT:
@@ -130,7 +130,7 @@ def read_combine_manifest(
             )
 
     shards.sort(key=lambda s: (s.key.level, s.key.prefix_bits, s.key.prefix))
-    return CombineManifest(
+    return PackingManifest(
         manifest_path=manifest_path,
         root_dir=root_dir,
         artifact_kind=artifact_kind,

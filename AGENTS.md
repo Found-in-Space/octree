@@ -24,7 +24,7 @@ Hooks: `ruff-check` (lint + fix) and `ruff-format`, scoped to `src/` and `tests/
 ### Examples
 
 - `uv run fis-octree --help`
-- `uv run pytest tests/test_stage02_cli.py`
+- `uv run pytest tests/test_build_cli.py`
 
 ## Large-Dataset Architecture
 
@@ -58,7 +58,6 @@ Hooks: `ruff-check` (lint + fix) and `ruff-format`, scoped to `src/` and `tests/
   A one-star edit should normally rebuild one sorted contribution and only its
   dependent topology/materialization partitions, not every intermediate made
   from the star's input shard.
-- Avoid introducing new architecture or public names based on the temporary
-  numeric stage labels. Prefer names that describe the data product or action,
-  such as `bucket preparation`, `sorted runs`, `topology planning`,
-  `materialization`, and `packing`.
+- Use names that describe the data product or action, such as `routing`,
+  `preparation`, `sorted runs`, `topology planning`, `materialization`, and
+  `packing`.

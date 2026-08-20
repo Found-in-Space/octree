@@ -1,8 +1,8 @@
-"""Streaming row source for Stage 01.
+"""Streaming row source for Preparation.
 
 Produces ``(node_id, render, source, source_id)`` tuples ordered by
 ``(node_id, mag_abs, source_id)`` for one shard stream, using DuckDB to query
-Stage 00 parquet output (see docs/sidecars.md R2).
+Routing parquet output (see docs/sidecars.md R2).
 
 Query shape (precomputed-render mode)::
 

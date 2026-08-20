@@ -1,10 +1,8 @@
-# Pipeline Products and Compatibility Stages
+# Pipeline Products
 
 The durable octree flow is defined by the products it publishes, not by a
-numbered sequence. Numeric stage names describe the current CLI and directory
-layout only. They remain compatibility labels while the implementation moves to
-the purpose-based contracts in
-[`streaming-pipeline.md`](streaming-pipeline.md).
+numbered sequence. The CLI, project schema, directory layout, state, reports,
+and implementation modules all use the purpose-based contracts below.
 
 The central requirement is selective reuse: changing one star in one upstream
 shard must not rewrite a routed contribution, sorted group, topology partition,
@@ -31,21 +29,21 @@ upstream shards
 | Packed artifacts | Output profile | `stars.octree` and `identifiers.order` |
 | Sidecars | Profile, family, and affected identity range | Schema-bearing sidecar artifacts |
 
-## Compatibility mapping
+## Command boundaries
 
-The current commands collapse some target products together:
+The public commands intentionally expose a few useful orchestration boundaries:
 
-| Compatibility command | Current responsibility | Target action/product |
+| Command | Responsibility | Product |
 |---|---|---|
-| `stage-00` | Route input shards into the adaptive staging tree | `route` / routed contributions |
-| `stage-01` | Sort and compact changed staging groups | `prepare` / sorted contributions |
-| `stage-02` | Plan classic or terminal topology, materialize, and pack | `materialize` plus `pack` |
-| `stage-03` | Build optional sidecars | `sidecars` |
+| `route` | Route input shards into the adaptive staging tree | `route` / routed contributions |
+| `prepare` | Sort and compact changed staging groups | `prepare` / sorted contributions |
+| `build` | Plan classic or terminal topology, materialize, and pack | `materialize` plus `pack` |
+| `sidecars build` | Build optional sidecars | `sidecars` |
 
-No new architecture, manifest, or module should acquire another numbered-stage
-name. The intended public vocabulary is `route`, `prepare`, `materialize`,
-`pack`, `sidecars`, and `build`. Renaming the existing CLI is a separate
-migration and is not implied by this document.
+`build` remains one public command because topology planning, materialization,
+and packing share a restartable base-artifact contract. Their internal product
+boundaries stay independently reusable without forcing operators to coordinate
+three commands.
 
 ## Shared identities and manifests
 
@@ -75,8 +73,9 @@ products:
 - sidecar identity: fields and schema used by that sidecar family.
 
 Dirty propagation stops whenever the identity relevant to the next consumer is
-unchanged. The current `clean`/`all` downstream marker is a conservative
-compatibility fallback, not the target contract.
+unchanged. The current whole-product invalidation marker is conservative; the
+next refinement is partitioned dependency metadata with checksum stopping at
+every product boundary.
 
 ## Routed contributions
 
@@ -201,7 +200,7 @@ logical topology runs. A bounded fan-in merge orders those nodes exactly as the
 five-level final shards are written. Each five-level logical skeleton is
 content-addressed, while the physical skeleton bytes are range-partitioned by
 their level-four spatial ancestor into a configured, bounded number of
-content-addressed pack files in the durable classic work directory. Skeletons
+content-addressed pack files in the configured build work directory. Skeletons
 record node presence, payload presence, child masks, frontier count and terminal
 policy, but deliberately exclude payload bytes, lengths, star counts and all
 absolute offsets. Payload relocation is then a sequential merge with the
@@ -218,14 +217,14 @@ it writes compact child-offset streams by five-level boundary and emits directly
 to the final artifact. Both consume the same immutable skeleton and relocation
 streams and produce byte-identical output.
 
-`stage-02 --index-emission-strategy temp-pwrite-batched` selects the default
-emitter. `--index-emission-strategy forward` selects the lower-scratch
-alternative. The per-child positional-write benchmark variant is intentionally
-not exposed as a production option. Because the two production emitters are
-byte-identical serialization mechanics, this operational choice is excluded
-from the final artifact's semantic identity.
+`packing.index_emission_strategy = "temp-pwrite-batched"` selects the default
+emitter. `"forward"` selects the lower-scratch alternative. The per-child
+positional-write benchmark variant is intentionally not exposed as a production
+option. Because the two production emitters are byte-identical serialization
+mechanics, this operational choice is excluded from the final artifact's
+semantic identity.
 
-`benchmarks/benchmark_combine_index.py` compares both production emitters and a
+`benchmarks/benchmark_packing_index.py` compares both production emitters and a
 per-child control in isolated cold and warm processes. The acceptance matrix
 uses dense and sparse 2k/8k/16k fixtures plus an optional sparse 64k case with
 `node_id = i << 15`. In the reproduced sparse 64k run, batched emission took
@@ -238,13 +237,12 @@ replace acceptance on a controlled large build.
 
 Intermediate manifests carry a checksum of each shard's ordered node-ID
 stream. This lets payload-only changes reuse the topology plan without reading
-or compiling the topology again. Legacy manifests are scanned once and receive
-a local checksum checkpoint. Normal cache validation trusts immutable published
-files: it checks the compact plan checksum plus skeleton header, policy, size
-and pack existence metadata. Full pack hashes are verified at initial
-publication rather than reread on every restart. Cache compilation, publication,
-temporary cleanup and active-plan pruning share an exclusive cache lock, so one
-compiler cannot delete another compiler's live files.
+or compiling the topology again. Normal cache validation trusts immutable
+published files: it checks the compact plan checksum plus skeleton header,
+policy, size and pack existence metadata. Full pack hashes are verified at
+initial publication rather than reread on every restart. Cache compilation,
+publication, temporary cleanup and active-plan pruning share an exclusive cache
+lock, so one compiler cannot delete another compiler's live files.
 
 The classic final render/identifiers pair has a durable semantic checkpoint.
 An unchanged input/policy/descriptor identity reuses both artifacts and their

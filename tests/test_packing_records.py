@@ -4,7 +4,7 @@ from uuid import UUID
 
 import pytest
 
-from foundinspace.octree.combine.records import (
+from foundinspace.octree.packing.records import (
     DESCRIPTOR_SIZE,
     FRONTIER_REF_SIZE,
     HAS_CHILDREN,

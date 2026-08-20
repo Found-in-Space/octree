@@ -56,7 +56,7 @@ def _load_existing_manifest_entries(
         return [], [], set()
     if render_manifest is None or identifiers_manifest is None:
         raise ValueError(
-            "Stage 01 resume requires both render and identifiers manifests"
+            "Preparation resume requires both render and identifiers manifests"
         )
 
     render_entries_list = manifest_entries(render_manifest)
@@ -121,9 +121,9 @@ def build_intermediates(
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print("Stage 01: validating input columns...", flush=True)
+    print("Preparation: validating input columns...", flush=True)
     _check_input_columns(parquet_glob)
-    print("Stage 01: input columns OK.", flush=True)
+    print("Preparation: input columns OK.", flush=True)
 
     render_entries_list, identifiers_entries_list, completed_shards = (
         _load_existing_manifest_entries(
@@ -134,7 +134,7 @@ def build_intermediates(
     )
     if completed_shards:
         print(
-            f"Stage 01: resuming from existing manifests with "
+            f"Preparation: resuming from existing manifests with "
             f"{len(completed_shards)} completed shard(s).",
             flush=True,
         )
@@ -147,7 +147,7 @@ def build_intermediates(
     for level in range(plan.max_level + 1):
         shard_keys = plan.shard_keys_for_level(level)
         print(
-            f"Stage 01: level {level}/{plan.max_level} ({len(shard_keys)} shard(s))...",
+            f"Preparation: level {level}/{plan.max_level} ({len(shard_keys)} shard(s))...",
             flush=True,
         )
 
@@ -161,13 +161,13 @@ def build_intermediates(
             if shard_key_id in completed_shards:
                 skipped_shards += 1
                 print(
-                    "Stage 01: shard already complete in manifests, skipping.",
+                    "Preparation: shard already complete in manifests, skipping.",
                     flush=True,
                 )
                 continue
 
             print(
-                f"Stage 01: shard {shard_i}/{len(shard_keys)} at level {level} "
+                f"Preparation: shard {shard_i}/{len(shard_keys)} at level {level} "
                 f"(prefix_bits={shard.prefix_bits}, prefix={shard.prefix})",
                 flush=True,
             )
@@ -199,7 +199,7 @@ def build_intermediates(
                 if render_manifest is not None or identifiers_manifest is not None:
                     if render_manifest is None or identifiers_manifest is None:
                         raise ValueError(
-                            "Render / identifiers shard presence mismatch during Stage 01"
+                            "Render / identifiers shard presence mismatch during Preparation"
                         )
                     if (
                         render_manifest["record_count"]
@@ -233,19 +233,19 @@ def build_intermediates(
                         name=IDENTIFIERS_MANIFEST_NAME,
                     )
                     print(
-                        f"Stage 01: shard complete ({shard_cells} cell(s), "
+                        f"Preparation: shard complete ({shard_cells} cell(s), "
                         f"{render_manifest['record_count']} record(s)).",
                         flush=True,
                     )
                 else:
-                    print("Stage 01: shard complete (empty).", flush=True)
+                    print("Preparation: shard complete (empty).", flush=True)
             except Exception:
                 render_writer.abort()
                 identifiers_writer.abort()
                 raise
 
     print(
-        "Stage 01: writing manifests "
+        "Preparation: writing manifests "
         f"({len(render_entries_list)} non-empty shard(s))...",
         flush=True,
     )
@@ -269,7 +269,7 @@ def build_intermediates(
     )
     elapsed = time.perf_counter() - start_t
     print(
-        f"Stage 01: done in {elapsed:.1f}s "
+        f"Preparation: done in {elapsed:.1f}s "
         f"(levels={plan.max_level + 1}, shards={shard_total}, "
         f"non_empty_shards={shard_non_empty}, skipped_shards={skipped_shards}, "
         f"new_cells={total_cells}).",

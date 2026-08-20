@@ -14,23 +14,13 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import foundinspace.octree.classic as classic
-import foundinspace.octree.classic_materialization as classic_materialization
-import foundinspace.octree.combine.streaming_index as streaming_index
+import foundinspace.octree.base_build as base_build_module
+import foundinspace.octree.materialization.pipeline as materialization
+import foundinspace.octree.packing.streaming_index as streaming_index
 from foundinspace.octree.assembly import BuildPlan, build_intermediates
-from foundinspace.octree.classic import (
-    ClassicBuildConfig,
-    build_classic_artifacts,
-)
-from foundinspace.octree.combine import (
-    CombinePlan,
-    IndexEmissionStrategy,
-    combine_octree,
-)
-from foundinspace.octree.combine.records import (
-    SHARD_HDR_FMT,
-    SHARD_NODE_V2_FMT,
-    PackedDescriptorFields,
+from foundinspace.octree.base_build import (
+    BaseBuildConfig,
+    build_base_artifacts,
 )
 from foundinspace.octree.config import (
     MORTON_BITS,
@@ -40,43 +30,56 @@ from foundinspace.octree.config import (
 from foundinspace.octree.encoding.render import encode_render_records
 from foundinspace.octree.identifiers_order import (
     IdentifiersOrderReader,
-    combine_identifiers_order,
+    pack_identifiers_order,
 )
 from foundinspace.octree.identifiers_order import (
     read_header as read_identifiers_header,
 )
 from foundinspace.octree.mag_levels import MagLevelConfig
-from foundinspace.octree.reader import IndexNavigator, OctreeReader, Point, read_header
-from foundinspace.octree.sources.stage00 import (
-    STAGE00_INPUT_FILTER_RAW_CARTESIAN,
-    Stage00Config,
-    run_stage00,
+from foundinspace.octree.packing import (
+    IndexEmissionStrategy,
+    PackingPlan,
+    pack_octree,
 )
-from foundinspace.octree.sources.stage01 import Stage01Config, run_stage01
+from foundinspace.octree.packing.records import (
+    SHARD_HDR_FMT,
+    SHARD_NODE_V2_FMT,
+    PackedDescriptorFields,
+)
+from foundinspace.octree.reader import IndexNavigator, OctreeReader, Point, read_header
+from foundinspace.octree.sources.preparation import (
+    PreparationConfig,
+    prepare_contributions,
+)
+from foundinspace.octree.sources.routing import (
+    ROUTING_INPUT_MODE_CARTESIAN,
+    RoutingConfig,
+    route_contributions,
+)
 
 
 def test_final_pair_lock_preserves_live_temp_across_work_dirs(tmp_path: Path) -> None:
     output = tmp_path / "products" / "stars.octree"
     identifiers = tmp_path / "products" / "identifiers.order"
-    base = ClassicBuildConfig(
-        stage00_output_dir=tmp_path / "stage00",
-        stage01_output_dir=tmp_path / "stage01",
+    base = BaseBuildConfig(
+        routed_dir=tmp_path / "routing",
+        prepared_dir=tmp_path / "preparation",
         output_path=output,
         identifiers_order_path=identifiers,
-        mag_limit=6.5,
-        work_dir=tmp_path / "work-a",
+        limiting_magnitude=6.5,
+        build_work_dir=tmp_path / "work-a",
     )
-    competing = replace(base, work_dir=tmp_path / "work-b")
+    competing = replace(base, build_work_dir=tmp_path / "work-b")
     started = threading.Event()
     finished = threading.Event()
 
     def cleanup_from_competing_build() -> None:
         started.set()
-        with classic._final_pair_locks(competing):
-            classic._clean_incomplete_final_products(output, identifiers)
+        with base_build_module._final_pair_locks(competing):
+            base_build_module._clean_incomplete_final_products(output, identifiers)
         finished.set()
 
-    with classic._final_pair_locks(base):
+    with base_build_module._final_pair_locks(base):
         live = output.with_name(f".{output.name}.live.tmp")
         live.write_bytes(b"still in use")
         thread = threading.Thread(target=cleanup_from_competing_build)
@@ -93,23 +96,23 @@ def test_final_pair_lock_preserves_live_temp_across_work_dirs(tmp_path: Path) ->
 def test_emission_strategy_does_not_change_final_artifact_identity(
     tmp_path: Path,
 ) -> None:
-    (tmp_path / "stage00").mkdir()
-    (tmp_path / "stage01").mkdir()
-    base = ClassicBuildConfig(
-        stage00_output_dir=tmp_path / "stage00",
-        stage01_output_dir=tmp_path / "stage01",
+    (tmp_path / "routing").mkdir()
+    (tmp_path / "preparation").mkdir()
+    base = BaseBuildConfig(
+        routed_dir=tmp_path / "routing",
+        prepared_dir=tmp_path / "preparation",
         output_path=tmp_path / "stars.octree",
         identifiers_order_path=tmp_path / "identifiers.order",
-        mag_limit=6.5,
+        limiting_magnitude=6.5,
     )
     forward = replace(
         base,
         index_emission_strategy=IndexEmissionStrategy.FORWARD,
     )
 
-    assert classic._final_base_identity(
+    assert base_build_module._final_base_identity(
         base, input_identity="sha256:input"
-    ) == classic._final_base_identity(forward, input_identity="sha256:input")
+    ) == base_build_module._final_base_identity(forward, input_identity="sha256:input")
     with pytest.raises(ValueError, match="temp-pwrite-batched or forward"):
         replace(
             base,
@@ -153,7 +156,7 @@ def _write_compact_run(path: Path, rows: list[tuple[float | None, str, int]]) ->
                     type=pa.binary(16),
                 ),
             },
-            schema=classic_materialization._COMPACT_SCHEMA,
+            schema=materialization._COMPACT_SCHEMA,
         ),
         path,
         compression="zstd",
@@ -177,7 +180,7 @@ def _write_compact_cells(
                     pa.binary(16),
                 ),
             },
-            schema=classic_materialization._COMPACT_SCHEMA,
+            schema=materialization._COMPACT_SCHEMA,
         ),
         path,
         compression="zstd",
@@ -193,9 +196,9 @@ def _merged_compact_runs(
     return pa.concat_tables(
         [
             batch
-            for _key, batch in classic_materialization._iter_merged_batches(
+            for _key, batch in materialization._iter_merged_batches(
                 paths,
-                batch_size=batch_size,
+                batch_rows=batch_size,
                 spill_dir=spill_dir,
             )
         ],
@@ -322,44 +325,44 @@ def _write_legacy_input(root: Path, rows: list[dict], *, max_level: int) -> None
     )
 
 
-def _build_stages(
+def _build_products(
     tmp_path: Path,
     rows: list[dict],
     *,
-    input_filter: str = "none",
+    input_mode: str = "pre-routed",
 ) -> tuple[Path, Path, Path]:
     input_root = tmp_path / "input"
-    stage00_dir = tmp_path / "stage00"
-    stage01_dir = tmp_path / "stage01"
+    routing_dir = tmp_path / "routing"
+    preparation_dir = tmp_path / "preparation"
     _write_input(
         input_root,
         rows,
-        include_routing=input_filter == "none",
+        include_routing=input_mode == "pre-routed",
     )
-    run_stage00(
-        Stage00Config(
-            input_root=input_root,
-            output_dir=stage00_dir,
+    route_contributions(
+        RoutingConfig(
+            input_shards_dir=input_root,
+            routed_dir=routing_dir,
             mag_config=MagLevelConfig(v_mag=6.5),
-            bucket_size=100,
-            batch_size=10,
+            bucket_rows=100,
+            scan_batch_rows=10,
             fragment_target_rows=10,
             compact_after_files=0,
-            input_filter=input_filter,
+            input_mode=input_mode,
         )
     )
-    run_stage01(
-        Stage01Config(
-            stage00_output_dir=stage00_dir,
-            output_dir=stage01_dir,
-            v_mag=6.5,
-            bucket_size=100,
-            input_filter=input_filter,
-            batch_size=10,
+    prepare_contributions(
+        PreparationConfig(
+            routed_dir=routing_dir,
+            prepared_dir=preparation_dir,
+            limiting_magnitude=6.5,
+            bucket_rows=100,
+            input_mode=input_mode,
+            batch_rows=10,
             fragment_target_rows=10,
         )
     )
-    return input_root, stage00_dir, stage01_dir
+    return input_root, routing_dir, preparation_dir
 
 
 def test_classic_build_matches_legacy_builder_when_rows_are_within_cap(
@@ -412,19 +415,19 @@ def test_classic_build_matches_legacy_builder_when_rows_are_within_cap(
             "z_icrs_pc": _node_center(8, 32 << 18)[2],
         },
     ]
-    _input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
-    classic_output = tmp_path / "classic.octree"
-    classic_identifiers = tmp_path / "classic.identifiers.order"
+    _input_root, routing_dir, preparation_dir = _build_products(tmp_path, rows)
+    classic_output = tmp_path / "base_build_module.octree"
+    classic_identifiers = tmp_path / "base_build_module.identifiers.order"
 
-    build_classic_artifacts(
-        ClassicBuildConfig(
-            stage00_output_dir=stage00_dir,
-            stage01_output_dir=stage01_dir,
+    build_base_artifacts(
+        BaseBuildConfig(
+            routed_dir=routing_dir,
+            prepared_dir=preparation_dir,
             output_path=classic_output,
             identifiers_order_path=classic_identifiers,
-            mag_limit=6.5,
+            limiting_magnitude=6.5,
             max_level=8,
-            batch_size=10,
+            batch_rows=10,
             max_open_files=4,
             star_format_version=1,
         ),
@@ -448,16 +451,16 @@ def test_classic_build_matches_legacy_builder_when_rows_are_within_cap(
     )
     legacy_output = tmp_path / "legacy.octree"
     legacy_identifiers = tmp_path / "legacy.identifiers.order"
-    combine_octree(
+    pack_octree(
         legacy_render_manifest,
         legacy_output,
-        plan=CombinePlan(max_open_files=4),
+        plan=PackingPlan(max_open_files=4),
         descriptor=PackedDescriptorFields(
             artifact_kind="render",
             dataset_uuid=_DATASET_UUID,
         ),
     )
-    combine_identifiers_order(
+    pack_identifiers_order(
         legacy_intermediates / "identifiers-manifest.json",
         legacy_identifiers,
         parent_dataset_uuid=_DATASET_UUID,
@@ -488,25 +491,25 @@ def test_classic_build_folds_deep_rows_into_capped_node(tmp_path: Path) -> None:
             "mag_abs": 8.0,
         },
     ]
-    _input_root, stage00_dir, stage01_dir = _build_stages(
+    _input_root, routing_dir, preparation_dir = _build_products(
         tmp_path,
         rows,
-        input_filter=STAGE00_INPUT_FILTER_RAW_CARTESIAN,
+        input_mode=ROUTING_INPUT_MODE_CARTESIAN,
     )
-    stage01_file = next(stage01_dir.rglob("*.parquet"))
-    assert "render" not in pq.read_schema(stage01_file).names
+    preparation_file = next(preparation_dir.rglob("*.parquet"))
+    assert "render" not in pq.read_schema(preparation_file).names
     output_path = tmp_path / "stars.octree"
     identifiers_path = tmp_path / "identifiers.order"
 
-    result = build_classic_artifacts(
-        ClassicBuildConfig(
-            stage00_output_dir=stage00_dir,
-            stage01_output_dir=stage01_dir,
+    result = build_base_artifacts(
+        BaseBuildConfig(
+            routed_dir=routing_dir,
+            prepared_dir=preparation_dir,
             output_path=output_path,
             identifiers_order_path=identifiers_path,
-            mag_limit=6.5,
+            limiting_magnitude=6.5,
             max_level=14,
-            batch_size=10,
+            batch_rows=10,
             max_open_files=4,
             star_format_version=1,
         ),
@@ -566,19 +569,19 @@ def test_classic_v2_packs_terminal_and_preserves_order_and_positions(
             "z_icrs_pc": child_center[2],
         },
     ]
-    _input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
+    _input_root, routing_dir, preparation_dir = _build_products(tmp_path, rows)
     output_path = tmp_path / "stars.octree"
     identifiers_path = tmp_path / "identifiers.order"
 
-    result = build_classic_artifacts(
-        ClassicBuildConfig(
-            stage00_output_dir=stage00_dir,
-            stage01_output_dir=stage01_dir,
+    result = build_base_artifacts(
+        BaseBuildConfig(
+            routed_dir=routing_dir,
+            prepared_dir=preparation_dir,
             output_path=output_path,
             identifiers_order_path=identifiers_path,
-            mag_limit=6.5,
+            limiting_magnitude=6.5,
             max_level=2,
-            batch_size=1,
+            batch_rows=1,
             max_open_files=2,
             star_format_version=2,
             terminal_waterline=2,
@@ -640,18 +643,18 @@ def test_classic_v2_counts_index_only_and_nested_terminal_nodes(
                 "z_icrs_pc": center[2],
             }
         )
-    _input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
+    _input_root, routing_dir, preparation_dir = _build_products(tmp_path, rows)
     output_path = tmp_path / "stars.octree"
 
-    build_classic_artifacts(
-        ClassicBuildConfig(
-            stage00_output_dir=stage00_dir,
-            stage01_output_dir=stage01_dir,
+    build_base_artifacts(
+        BaseBuildConfig(
+            routed_dir=routing_dir,
+            prepared_dir=preparation_dir,
             output_path=output_path,
             identifiers_order_path=tmp_path / "identifiers.order",
-            mag_limit=6.5,
+            limiting_magnitude=6.5,
             max_level=2,
-            batch_size=1,
+            batch_rows=1,
             max_open_files=2,
             star_format_version=2,
             terminal_waterline=1,
@@ -694,7 +697,7 @@ def test_classic_v2_preserves_exact_level_for_nonterminal_folded_payload(
         }
         for source_id, magnitude in (("a", 7.0), ("b", 8.0))
     ]
-    _input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
+    _input_root, routing_dir, preparation_dir = _build_products(tmp_path, rows)
     output_path = tmp_path / "stars.octree"
 
     monkeypatch.setattr(
@@ -705,15 +708,15 @@ def test_classic_v2_preserves_exact_level_for_nonterminal_folded_payload(
         ),
     )
 
-    build_classic_artifacts(
-        ClassicBuildConfig(
-            stage00_output_dir=stage00_dir,
-            stage01_output_dir=stage01_dir,
+    build_base_artifacts(
+        BaseBuildConfig(
+            routed_dir=routing_dir,
+            prepared_dir=preparation_dir,
             output_path=output_path,
             identifiers_order_path=tmp_path / "identifiers.order",
-            mag_limit=6.5,
+            limiting_magnitude=6.5,
             max_level=2,
-            batch_size=1,
+            batch_rows=1,
             max_open_files=2,
             star_format_version=2,
             terminal_waterline=1,
@@ -744,12 +747,12 @@ def test_classic_v2_preserves_exact_level_for_nonterminal_folded_payload(
     assert folded.flags & 0xF0 == 0
 
 
-def test_classic_build_merges_sorted_stage01_groups_in_canonical_order(
+def test_classic_build_merges_sorted_preparation_groups_in_canonical_order(
     tmp_path: Path,
 ) -> None:
     input_root = tmp_path / "input"
-    stage00_dir = tmp_path / "stage00"
-    stage01_dir = tmp_path / "stage01"
+    routing_dir = tmp_path / "routing"
+    preparation_dir = tmp_path / "preparation"
     level14_center = _node_center(14, 0)
     level15_center = _node_center(15, 0)
     level16_center = _node_center(16, 0)
@@ -807,38 +810,38 @@ def test_classic_build_merges_sorted_stage01_groups_in_canonical_order(
         ],
         shard_id="102",
     )
-    run_stage00(
-        Stage00Config(
-            input_root=input_root,
-            output_dir=stage00_dir,
+    route_contributions(
+        RoutingConfig(
+            input_shards_dir=input_root,
+            routed_dir=routing_dir,
             mag_config=MagLevelConfig(v_mag=6.5),
-            bucket_size=100,
-            batch_size=2,
+            bucket_rows=100,
+            scan_batch_rows=2,
             fragment_target_rows=1,
             compact_after_files=0,
         )
     )
-    run_stage01(
-        Stage01Config(
-            stage00_output_dir=stage00_dir,
-            output_dir=stage01_dir,
-            v_mag=6.5,
-            bucket_size=100,
-            batch_size=2,
+    prepare_contributions(
+        PreparationConfig(
+            routed_dir=routing_dir,
+            prepared_dir=preparation_dir,
+            limiting_magnitude=6.5,
+            bucket_rows=100,
+            batch_rows=2,
             fragment_target_rows=1,
         )
     )
     identifiers_path = tmp_path / "identifiers.order"
 
-    result = build_classic_artifacts(
-        ClassicBuildConfig(
-            stage00_output_dir=stage00_dir,
-            stage01_output_dir=stage01_dir,
+    result = build_base_artifacts(
+        BaseBuildConfig(
+            routed_dir=routing_dir,
+            prepared_dir=preparation_dir,
             output_path=tmp_path / "stars.octree",
             identifiers_order_path=identifiers_path,
-            mag_limit=6.5,
+            limiting_magnitude=6.5,
             max_level=14,
-            batch_size=2,
+            batch_rows=2,
             max_open_files=2,
             star_format_version=1,
         ),
@@ -872,12 +875,12 @@ def test_merged_run_coalesces_many_tiny_cells_into_bounded_row_groups(
     # Exercise piece compaction without allowing the piece count to dictate
     # physical row groups.
     monkeypatch.setattr(
-        classic_materialization,
-        "CLASSIC_MERGE_WRITE_MAX_PIECES",
+        materialization,
+        "MATERIALIZATION_MERGE_WRITE_MAX_PIECES",
         3,
     )
 
-    classic_materialization._write_merged_run([first, second], output, batch_size=10)
+    materialization._write_merged_run([first, second], output, batch_rows=10)
 
     parquet = pq.ParquetFile(output)
     assert parquet.metadata.num_row_groups == 4
@@ -899,7 +902,7 @@ def test_merged_run_preserves_cell_across_physical_row_group_boundaries(
     ]
     _write_compact_cells(source, rows)
 
-    classic_materialization._write_merged_run([source], output, batch_size=5)
+    materialization._write_merged_run([source], output, batch_rows=5)
 
     parquet = pq.ParquetFile(output)
     assert [
@@ -907,9 +910,7 @@ def test_merged_run_preserves_cell_across_physical_row_group_boundaries(
         for index in range(parquet.metadata.num_row_groups)
     ] == [5, 5, 5, 2]
     keyed = list(
-        classic_materialization._iter_merged_batches(
-            [output], batch_size=4, spill_dir=tmp_path
-        )
+        materialization._iter_merged_batches([output], batch_rows=4, spill_dir=tmp_path)
     )
     assert [key for key, _table in keyed] == [
         (14, 0),
@@ -934,12 +935,12 @@ def test_merged_run_byte_cap_splits_oversized_variable_width_cell(
     rows = [(14, 0, float(index), f"id-{index}-" + "x" * 180) for index in range(12)]
     _write_compact_cells(source, rows)
     monkeypatch.setattr(
-        classic_materialization,
-        "CLASSIC_MERGE_WRITE_MAX_BYTES",
+        materialization,
+        "MATERIALIZATION_MERGE_WRITE_MAX_BYTES",
         700,
     )
 
-    classic_materialization._write_merged_run([source], output, batch_size=12)
+    materialization._write_merged_run([source], output, batch_rows=12)
 
     parquet = pq.ParquetFile(output)
     assert parquet.metadata.num_row_groups > 1
@@ -987,7 +988,7 @@ def test_classic_overlap_spill_matches_in_memory_sort(
         spill_dir=spill_dir,
         batch_size=100,
     )
-    original_external_sort = classic_materialization._iter_externally_sorted_overlap
+    original_external_sort = materialization._iter_externally_sorted_overlap
     external_sort_calls = 0
 
     def track_external_sort(*args, **kwargs):
@@ -996,12 +997,12 @@ def test_classic_overlap_spill_matches_in_memory_sort(
         yield from original_external_sort(*args, **kwargs)
 
     monkeypatch.setattr(
-        classic_materialization,
-        "CLASSIC_OVERLAP_IN_MEMORY_MAX_BYTES",
+        materialization,
+        "MATERIALIZATION_OVERLAP_IN_MEMORY_MAX_BYTES",
         1,
     )
     monkeypatch.setattr(
-        classic_materialization,
+        materialization,
         "_iter_externally_sorted_overlap",
         track_external_sort,
     )
@@ -1058,18 +1059,18 @@ def test_classic_build_externally_merges_folded_group_batches(
                 "z_icrs_pc": center[2],
             }
         )
-    _input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
+    _input_root, routing_dir, preparation_dir = _build_products(tmp_path, rows)
     identifiers_path = tmp_path / "identifiers.order"
 
-    result = build_classic_artifacts(
-        ClassicBuildConfig(
-            stage00_output_dir=stage00_dir,
-            stage01_output_dir=stage01_dir,
+    result = build_base_artifacts(
+        BaseBuildConfig(
+            routed_dir=routing_dir,
+            prepared_dir=preparation_dir,
             output_path=tmp_path / "stars.octree",
             identifiers_order_path=identifiers_path,
-            mag_limit=6.5,
+            limiting_magnitude=6.5,
             max_level=14,
-            batch_size=2,
+            batch_rows=2,
             max_open_files=2,
             star_format_version=1,
         ),
@@ -1103,24 +1104,26 @@ def test_classic_build_reuses_completed_sorted_materialization(
             "z_icrs_pc": -100_000.0,
         }
     ]
-    _input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
-    config = ClassicBuildConfig(
-        stage00_output_dir=stage00_dir,
-        stage01_output_dir=stage01_dir,
+    _input_root, routing_dir, preparation_dir = _build_products(tmp_path, rows)
+    config = BaseBuildConfig(
+        routed_dir=routing_dir,
+        prepared_dir=preparation_dir,
         output_path=tmp_path / "stars.octree",
         identifiers_order_path=tmp_path / "identifiers.order",
-        mag_limit=6.5,
+        limiting_magnitude=6.5,
         max_level=1,
-        batch_size=10,
+        batch_rows=10,
         max_open_files=2,
         star_format_version=1,
     )
-    build_classic_artifacts(
+    build_base_artifacts(
         config,
         dataset_uuid=_DATASET_UUID,
         identifiers_uuid=_IDENTIFIERS_UUID,
     )
-    intermediates_dir = stage01_dir / "classic-intermediates"
+    intermediates_dir = (
+        preparation_dir / base_build_module.DEFAULT_MATERIALIZED_DIR_NAME
+    )
     mtimes = {
         path.name: path.stat().st_mtime_ns
         for path in intermediates_dir.iterdir()
@@ -1145,21 +1148,21 @@ def test_classic_build_reuses_completed_sorted_materialization(
 
     monkeypatch.setattr(builtins, "open", reject_intermediate_open)
     monkeypatch.setattr(
-        classic,
-        "combine_octree",
+        base_build_module,
+        "pack_octree",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("final no-op invoked render combine")
+            AssertionError("final no-op invoked render packing")
         ),
     )
     monkeypatch.setattr(
-        classic,
-        "combine_identifiers_order",
+        base_build_module,
+        "pack_identifiers_order",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("final no-op invoked identifiers combine")
+            AssertionError("final no-op invoked identifiers packing")
         ),
     )
 
-    reused = build_classic_artifacts(config)
+    reused = build_base_artifacts(config)
 
     assert {
         path.name: path.stat().st_mtime_ns
@@ -1190,20 +1193,20 @@ def test_classic_build_supports_isolated_intermediates_and_work_dirs(
             "z_icrs_pc": -100_000.0,
         }
     ]
-    _input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
-    v1_config = ClassicBuildConfig(
-        stage00_output_dir=stage00_dir,
-        stage01_output_dir=stage01_dir,
+    _input_root, routing_dir, preparation_dir = _build_products(tmp_path, rows)
+    v1_config = BaseBuildConfig(
+        routed_dir=routing_dir,
+        prepared_dir=preparation_dir,
         output_path=tmp_path / "stars-v1.octree",
         identifiers_order_path=tmp_path / "identifiers-v1.order",
-        mag_limit=6.5,
+        limiting_magnitude=6.5,
         max_level=1,
-        batch_size=10,
+        batch_rows=10,
         max_open_files=2,
         star_format_version=1,
     )
-    build_classic_artifacts(v1_config)
-    v1_intermediates = stage01_dir / "classic-intermediates"
+    build_base_artifacts(v1_config)
+    v1_intermediates = preparation_dir / base_build_module.DEFAULT_MATERIALIZED_DIR_NAME
     assert (v1_intermediates / "render-manifest.json").is_file()
 
     v2_intermediates = tmp_path / "v2-intermediates"
@@ -1214,16 +1217,16 @@ def test_classic_build_supports_isolated_intermediates_and_work_dirs(
         identifiers_order_path=tmp_path / "identifiers-v2.order",
         star_format_version=2,
         terminal_waterline=1,
-        intermediates_dir=v2_intermediates,
-        work_dir=v2_work,
+        materialized_dir=v2_intermediates,
+        build_work_dir=v2_work,
     )
-    build_classic_artifacts(v2_config)
+    build_base_artifacts(v2_config)
 
     assert (v1_intermediates / "render-manifest.json").is_file()
     assert (v2_intermediates / "render-manifest.json").is_file()
     assert v2_config.output_path.is_file()
     assert v2_config.identifiers_order_path.is_file()
-    assert (v2_work / "classic-work-state.json").is_file()
+    assert (v2_work / materialization.MATERIALIZATION_WORK_STATE_NAME).is_file()
     assert (v2_work / "runs").is_dir()
     assert (v2_work / "partition-cache").is_dir()
 
@@ -1245,25 +1248,27 @@ def test_classic_v2_rebuilds_damaged_published_terminal_map(
             "z_icrs_pc": center[2],
         }
     ]
-    _input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
-    config = ClassicBuildConfig(
-        stage00_output_dir=stage00_dir,
-        stage01_output_dir=stage01_dir,
+    _input_root, routing_dir, preparation_dir = _build_products(tmp_path, rows)
+    config = BaseBuildConfig(
+        routed_dir=routing_dir,
+        prepared_dir=preparation_dir,
         output_path=tmp_path / "stars.octree",
         identifiers_order_path=tmp_path / "identifiers.order",
-        mag_limit=6.5,
+        limiting_magnitude=6.5,
         max_level=2,
-        batch_size=10,
+        batch_rows=10,
         max_open_files=2,
         star_format_version=2,
         terminal_waterline=1,
     )
-    build_classic_artifacts(
+    build_base_artifacts(
         config,
         dataset_uuid=_DATASET_UUID,
         identifiers_uuid=_IDENTIFIERS_UUID,
     )
-    intermediates_dir = stage01_dir / "classic-intermediates"
+    intermediates_dir = (
+        preparation_dir / base_build_module.DEFAULT_MATERIALIZED_DIR_NAME
+    )
     render_manifest_path = intermediates_dir / "render-manifest.json"
     render_manifest = json.loads(render_manifest_path.read_text(encoding="utf-8"))
     terminal_map_path = intermediates_dir / render_manifest["terminal_map_path"]
@@ -1279,7 +1284,7 @@ def test_classic_v2_rebuilds_damaged_published_terminal_map(
     else:
         terminal_level_path.unlink()
 
-    build_classic_artifacts(
+    build_base_artifacts(
         config,
         dataset_uuid=_DATASET_UUID,
         identifiers_uuid=_IDENTIFIERS_UUID,
@@ -1323,21 +1328,21 @@ def test_classic_build_resumes_completed_spatial_partitions(
             "z_icrs_pc": node_thirty_two_center[2],
         },
     ]
-    _input_root, stage00_dir, stage01_dir = _build_stages(tmp_path, rows)
-    config = ClassicBuildConfig(
-        stage00_output_dir=stage00_dir,
-        stage01_output_dir=stage01_dir,
+    _input_root, routing_dir, preparation_dir = _build_products(tmp_path, rows)
+    config = BaseBuildConfig(
+        routed_dir=routing_dir,
+        prepared_dir=preparation_dir,
         output_path=tmp_path / "stars.octree",
         identifiers_order_path=tmp_path / "identifiers.order",
-        mag_limit=6.5,
+        limiting_magnitude=6.5,
         max_level=2,
-        batch_size=1,
+        batch_rows=1,
         max_open_files=2,
         partition_from_level=1,
         partition_prefix_bits=1,
         star_format_version=1,
     )
-    original = classic_materialization._materialize_partition
+    original = materialization._materialize_partition
     calls = 0
 
     def fail_second_partition(*args, **kwargs):
@@ -1348,52 +1353,56 @@ def test_classic_build_resumes_completed_spatial_partitions(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(
-        classic_materialization,
+        materialization,
         "_materialize_partition",
         fail_second_partition,
     )
     with pytest.raises(RuntimeError, match="simulated partition failure"):
-        build_classic_artifacts(config)
+        build_base_artifacts(config)
 
-    work_dir = stage01_dir / ".classic-intermediates.work"
+    work_dir = preparation_dir / base_build_module.DEFAULT_BUILD_WORK_DIR_NAME
     state = json.loads(
-        (work_dir / "classic-work-state.json").read_text(encoding="utf-8")
+        (work_dir / materialization.MATERIALIZATION_WORK_STATE_NAME).read_text(
+            encoding="utf-8"
+        )
     )
     assert len(state["completed_partitions"]) == 1
     monkeypatch.setattr(
-        classic_materialization,
+        materialization,
         "_materialize_partition",
         original,
     )
     monkeypatch.setattr(
-        classic_materialization,
+        materialization,
         "_normalize_group",
         lambda *_args, **_kwargs: pytest.fail(
-            "completed Stage 01 groups should be reused"
+            "completed Preparation groups should be reused"
         ),
     )
 
-    build_classic_artifacts(
+    build_base_artifacts(
         config,
         dataset_uuid=_DATASET_UUID,
         identifiers_uuid=_IDENTIFIERS_UUID,
     )
 
-    assert (work_dir / "classic-work-state.json").is_file()
+    assert (work_dir / materialization.MATERIALIZATION_WORK_STATE_NAME).is_file()
     assert (work_dir / "partition-cache").is_dir()
     manifest = json.loads(
-        (stage01_dir / "classic-intermediates" / "render-manifest.json").read_text(
-            encoding="utf-8"
-        )
+        (
+            preparation_dir
+            / base_build_module.DEFAULT_MATERIALIZED_DIR_NAME
+            / "render-manifest.json"
+        ).read_text(encoding="utf-8")
     )
     level_two = next(row for row in manifest["levels"] if row["level"] == 2)
     assert [shard["prefix"] for shard in level_two["shards"]] == [0, 1]
 
 
-def test_classic_build_rejects_stage01_without_raw_fields(tmp_path: Path) -> None:
+def test_classic_build_rejects_preparation_without_raw_fields(tmp_path: Path) -> None:
     input_root = tmp_path / "input"
-    stage00_dir = tmp_path / "stage00"
-    stage01_dir = tmp_path / "stage01"
+    routing_dir = tmp_path / "routing"
+    preparation_dir = tmp_path / "preparation"
     rows = [
         {
             "source_id": "legacy",
@@ -1418,38 +1427,38 @@ def test_classic_build_rejects_stage01_without_raw_fields(tmp_path: Path) -> Non
         ),
         shard_dir / "part.parquet",
     )
-    run_stage00(
-        Stage00Config(
-            input_root=input_root,
-            output_dir=stage00_dir,
+    route_contributions(
+        RoutingConfig(
+            input_shards_dir=input_root,
+            routed_dir=routing_dir,
             mag_config=MagLevelConfig(v_mag=6.5),
-            bucket_size=100,
-            batch_size=10,
+            bucket_rows=100,
+            scan_batch_rows=10,
             fragment_target_rows=10,
             compact_after_files=0,
         )
     )
-    run_stage01(
-        Stage01Config(
-            stage00_output_dir=stage00_dir,
-            output_dir=stage01_dir,
-            v_mag=6.5,
-            bucket_size=100,
-            batch_size=10,
+    prepare_contributions(
+        PreparationConfig(
+            routed_dir=routing_dir,
+            prepared_dir=preparation_dir,
+            limiting_magnitude=6.5,
+            bucket_rows=100,
+            batch_rows=10,
             fragment_target_rows=10,
         )
     )
 
-    with pytest.raises(ValueError, match="requires raw Stage 01 fields"):
-        build_classic_artifacts(
-            ClassicBuildConfig(
-                stage00_output_dir=stage00_dir,
-                stage01_output_dir=stage01_dir,
+    with pytest.raises(ValueError, match="requires raw Preparation fields"):
+        build_base_artifacts(
+            BaseBuildConfig(
+                routed_dir=routing_dir,
+                prepared_dir=preparation_dir,
                 output_path=tmp_path / "stars.octree",
                 identifiers_order_path=tmp_path / "identifiers.order",
-                mag_limit=6.5,
+                limiting_magnitude=6.5,
                 max_level=14,
-                batch_size=10,
+                batch_rows=10,
                 max_open_files=4,
                 star_format_version=1,
             )

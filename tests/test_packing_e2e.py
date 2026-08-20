@@ -5,26 +5,26 @@ from uuid import UUID
 
 import pytest
 
-from combine_helpers import (
-    PayloadNode,
-    build_intermediates,
-    build_sidecar_intermediates,
-)
-from foundinspace.octree.combine import (
-    CombinePlan,
+from foundinspace.octree.packing import (
     IndexEmissionStrategy,
-    combine_octree,
+    PackingPlan,
+    pack_octree,
 )
-from foundinspace.octree.combine.records import (
+from foundinspace.octree.packing.records import (
     HEADER_FMT,
     HEADER_SIZE,
     SHARD_HDR_FMT,
     PackedDescriptorFields,
 )
 from foundinspace.octree.reader import IndexNavigator, read_header
+from packing_helpers import (
+    PayloadNode,
+    build_intermediates,
+    build_sidecar_intermediates,
+)
 
 
-def test_combine_octree_is_deterministic(tmp_path) -> None:
+def test_pack_octree_is_deterministic(tmp_path) -> None:
     manifest_path = build_intermediates(
         tmp_path / "intermediates",
         [
@@ -42,17 +42,17 @@ def test_combine_octree_is_deterministic(tmp_path) -> None:
         dataset_uuid=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
     )
 
-    combine_octree(
-        manifest_path, out1, plan=CombinePlan(max_open_files=2), descriptor=descriptor
+    pack_octree(
+        manifest_path, out1, plan=PackingPlan(max_open_files=2), descriptor=descriptor
     )
-    combine_octree(
-        manifest_path, out2, plan=CombinePlan(max_open_files=2), descriptor=descriptor
+    pack_octree(
+        manifest_path, out2, plan=PackingPlan(max_open_files=2), descriptor=descriptor
     )
 
     assert out1.read_bytes() == out2.read_bytes()
 
 
-def test_combine_header_mag_limit_matches_manifest(tmp_path) -> None:
+def test_packing_header_mag_limit_matches_manifest(tmp_path) -> None:
     manifest_path = build_intermediates(
         tmp_path / "intermediates",
         [PayloadNode(level=0, node_id=0, star_count=1, raw_payload=b"root")],
@@ -60,10 +60,10 @@ def test_combine_header_mag_limit_matches_manifest(tmp_path) -> None:
         mag_limit=4.25,
     )
     out = tmp_path / "out.octree"
-    combine_octree(
+    pack_octree(
         manifest_path,
         out,
-        plan=CombinePlan(max_open_files=2),
+        plan=PackingPlan(max_open_files=2),
         descriptor=PackedDescriptorFields(
             artifact_kind="render",
             dataset_uuid=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
@@ -81,7 +81,7 @@ def test_combine_header_mag_limit_matches_manifest(tmp_path) -> None:
         IndexEmissionStrategy.TEMP_PWRITE_BATCHED,
     ],
 )
-def test_combine_v2_writes_v2_shard_and_node_star_count(
+def test_packing_v2_writes_v2_shard_and_node_star_count(
     tmp_path, strategy: IndexEmissionStrategy
 ) -> None:
     manifest_path = build_intermediates(
@@ -90,10 +90,10 @@ def test_combine_v2_writes_v2_shard_and_node_star_count(
         max_level=0,
     )
     out = tmp_path / "out-v2.octree"
-    combine_octree(
+    pack_octree(
         manifest_path,
         out,
-        plan=CombinePlan(
+        plan=PackingPlan(
             max_open_files=2,
             star_format_version=2,
             index_emission_strategy=strategy,
@@ -125,7 +125,7 @@ def test_v1_reader_reports_unavailable_node_star_count(tmp_path) -> None:
         max_level=0,
     )
     out = tmp_path / "out-v1.octree"
-    combine_octree(manifest_path, out, plan=CombinePlan(max_open_files=2))
+    pack_octree(manifest_path, out, plan=PackingPlan(max_open_files=2))
 
     header = read_header(out)
     assert header.version == 1
@@ -147,10 +147,10 @@ def test_manifest_identifier_mismatch_fails_fast(tmp_path) -> None:
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
     with pytest.raises(ValueError, match="Unsupported manifest format"):
-        combine_octree(manifest_path, tmp_path / "out.octree", plan=CombinePlan())
+        pack_octree(manifest_path, tmp_path / "out.octree", plan=PackingPlan())
 
 
-def test_combine_sidecar_writes_descriptor_metadata(tmp_path) -> None:
+def test_packing_sidecar_writes_descriptor_metadata(tmp_path) -> None:
     manifest_path = build_sidecar_intermediates(
         tmp_path / "sidecar-intermediates",
         [
@@ -165,10 +165,10 @@ def test_combine_sidecar_writes_descriptor_metadata(tmp_path) -> None:
         max_level=0,
     )
     out = tmp_path / "meta.octree"
-    combine_octree(
+    pack_octree(
         manifest_path,
         out,
-        plan=CombinePlan(max_open_files=2),
+        plan=PackingPlan(max_open_files=2),
         descriptor=PackedDescriptorFields(
             artifact_kind="sidecar",
             parent_dataset_uuid=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),

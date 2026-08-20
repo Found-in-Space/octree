@@ -4,20 +4,19 @@
 
 `identifiers.order` is part of the base dataset package.
 
-Its job is to preserve the canonical ordered star identities for one render octree dataset so later sidecar families can be rebuilt without reopening earlier pipeline stages.
+Its job is to preserve the canonical ordered star identities for one render octree dataset so later sidecar families can be rebuilt without reopening earlier pipeline products.
 
 ## Product Placement
 
 `identifiers.order` is emitted beside `stars.octree` by packing. Both consume
 the same materialized cell stream, so cell membership and within-cell ordinal
-order cannot diverge. The current compatibility mapping is:
+order cannot diverge. The command mapping is:
 
-- `stage-02`: topology planning, materialization, and packing of
+- `build`: topology planning, materialization, and packing of
   `stars.octree` plus `identifiers.order`;
-- `stage-03`: named sidecars derived from that published pair.
+- `sidecars build`: named sidecars derived from that published pair.
 
-The durable architectural names are `materialize`, `pack`, and `sidecars`, not
-additional numbered stages.
+The durable architectural products are `materialize`, `pack`, and `sidecars`.
 
 ## Primary Mapping
 
@@ -124,7 +123,7 @@ The first implemented sidecar family is `meta`, but the same artifact can suppor
 
 ## Related Docs
 
-- `docs/stages.md`
+- `docs/products.md`
 - `docs/sidecars.md`
 - `docs/identity-lookup-index.md`
 - `docs/roadmap.md`

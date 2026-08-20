@@ -6,19 +6,19 @@ import threading
 
 import pytest
 
-from combine_helpers import PayloadNode, build_intermediates
-from foundinspace.octree.combine.pipeline import (
-    CombinePlan,
+from foundinspace.octree.packing.pipeline import (
     IndexEmissionStrategy,
+    PackingPlan,
     _write_final_shard_index_legacy,
     relocate_payloads_dfs,
     write_final_shard_index,
 )
-from foundinspace.octree.combine.records import (
+from foundinspace.octree.packing.records import (
     SHARD_HDR_FMT,
     SHARD_MAGIC,
     SHARD_NODE_FMT,
 )
+from packing_helpers import PayloadNode, build_intermediates
 
 
 def test_write_final_shard_index_writes_shard_block(tmp_path) -> None:
@@ -36,13 +36,13 @@ def test_write_final_shard_index_writes_shard_block(tmp_path) -> None:
     with open(out, "wb") as fp:
         fp.write(b"\x00" * 64)
         phase_a = relocate_payloads_dfs(
-            manifest_path, fp, plan=CombinePlan(max_open_files=2)
+            manifest_path, fp, plan=PackingPlan(max_open_files=2)
         )
         phase_b = write_final_shard_index(
             manifest_path,
             phase_a.relocation_files,
             fp,
-            plan=CombinePlan(max_open_files=2),
+            plan=PackingPlan(max_open_files=2),
         )
     data = out.read_bytes()
     assert phase_b.index_offset >= phase_a.payload_end_offset
@@ -66,9 +66,9 @@ def test_write_final_shard_index_node_count_limit(monkeypatch, tmp_path) -> None
     out = tmp_path / "out.octree"
     with open(out, "wb") as fp:
         fp.write(b"\x00" * 64)
-        phase_a = relocate_payloads_dfs(manifest_path, fp, plan=CombinePlan())
+        phase_a = relocate_payloads_dfs(manifest_path, fp, plan=PackingPlan())
 
-        import foundinspace.octree.combine.streaming_index as streaming
+        import foundinspace.octree.packing.streaming_index as streaming
 
         monkeypatch.setattr(
             streaming,
@@ -80,7 +80,7 @@ def test_write_final_shard_index_node_count_limit(monkeypatch, tmp_path) -> None
                 manifest_path,
                 phase_a.relocation_files,
                 fp,
-                plan=CombinePlan(),
+                plan=PackingPlan(),
             )
 
 
@@ -96,14 +96,14 @@ def test_missing_relocation_for_payload_node_raises(tmp_path) -> None:
     out = tmp_path / "out.octree"
     with open(out, "wb") as fp:
         fp.write(b"\x00" * 64)
-        relocate_payloads_dfs(manifest_path, fp, plan=CombinePlan())
+        relocate_payloads_dfs(manifest_path, fp, plan=PackingPlan())
 
         with pytest.raises(ValueError, match="Missing relocation entry"):
             write_final_shard_index(
                 manifest_path,
                 (),
                 fp,
-                plan=CombinePlan(),
+                plan=PackingPlan(),
             )
 
 
@@ -122,13 +122,13 @@ def test_shard_node_ordering_is_deterministic_and_path_sorted(tmp_path) -> None:
     with open(out, "wb") as fp:
         fp.write(b"\x00" * 64)
         phase_a = relocate_payloads_dfs(
-            manifest_path, fp, plan=CombinePlan(max_open_files=2)
+            manifest_path, fp, plan=PackingPlan(max_open_files=2)
         )
         phase_b = write_final_shard_index(
             manifest_path,
             phase_a.relocation_files,
             fp,
-            plan=CombinePlan(max_open_files=2),
+            plan=PackingPlan(max_open_files=2),
         )
     data = out.read_bytes()
     shard_hdr = SHARD_HDR_FMT.unpack_from(data, phase_b.index_offset)
@@ -159,17 +159,17 @@ def test_streaming_phase_b_does_not_use_random_lookup(
     out = tmp_path / "out.octree"
     with open(out, "wb") as fp:
         fp.write(b"\x00" * 192)
-        phase_a = relocate_payloads_dfs(manifest_path, fp, plan=CombinePlan())
+        phase_a = relocate_payloads_dfs(manifest_path, fp, plan=PackingPlan())
 
         def forbidden(*_args, **_kwargs):
             raise AssertionError("Phase B performed a random lookup")
 
-        import foundinspace.octree.combine.lookup as lookup
+        import foundinspace.octree.packing.lookup as lookup
 
         monkeypatch.setattr(lookup.IntermediateLookup, "find_payload", forbidden)
         monkeypatch.setattr(lookup.IntermediateLookup, "descendant_exists", forbidden)
         write_final_shard_index(
-            manifest_path, phase_a.relocation_files, fp, plan=CombinePlan()
+            manifest_path, phase_a.relocation_files, fp, plan=PackingPlan()
         )
 
 
@@ -225,7 +225,7 @@ def test_streaming_phase_b_matches_legacy_bytes_on_deep_sparse_fixture(
     )
 
     def compile_index(path, *, legacy: bool) -> None:
-        plan = CombinePlan(
+        plan = PackingPlan(
             max_open_files=2,
             cache_dir=tmp_path
             / ("legacy-cache" if legacy else f"stream-cache-{strategy.value}"),
@@ -254,7 +254,7 @@ def test_payload_only_change_reuses_topology_plan_and_skeletons(
     cache_dir = tmp_path / "durable-cache"
 
     def compile_manifest(manifest_path, output_path) -> None:
-        plan = CombinePlan(max_open_files=2, cache_dir=cache_dir)
+        plan = PackingPlan(max_open_files=2, cache_dir=cache_dir)
         with open(output_path, "wb") as fp:
             fp.write(b"\x00" * 192)
             phase_a = relocate_payloads_dfs(manifest_path, fp, plan=plan)
@@ -279,7 +279,7 @@ def test_payload_only_change_reuses_topology_plan_and_skeletons(
         [PayloadNode(level=6, node_id=7, star_count=1, raw_payload=b"after-longer")],
         max_level=6,
     )
-    import foundinspace.octree.combine.streaming_index as streaming_index
+    import foundinspace.octree.packing.streaming_index as streaming_index
 
     monkeypatch.setattr(
         streaming_index,
@@ -306,7 +306,7 @@ def test_streaming_compiler_cleans_incomplete_temporary_tree(tmp_path) -> None:
         [PayloadNode(level=0, node_id=0, star_count=1, raw_payload=b"root")],
         max_level=0,
     )
-    plan = CombinePlan(cache_dir=cache_dir)
+    plan = PackingPlan(cache_dir=cache_dir)
     with open(tmp_path / "out.bin", "wb") as fp:
         fp.write(b"\x00" * 192)
         phase_a = relocate_payloads_dfs(manifest_path, fp, plan=plan)
@@ -322,7 +322,7 @@ def test_topology_change_replaces_only_intersecting_spatial_pack(
 
     def compile_nodes(directory, nodes, output):
         manifest = build_intermediates(directory, nodes, max_level=6)
-        plan = CombinePlan(max_open_files=2, cache_dir=cache_dir)
+        plan = PackingPlan(max_open_files=2, cache_dir=cache_dir)
         with open(output, "wb") as fp:
             fp.write(b"\x00" * 192)
             phase_a = relocate_payloads_dfs(manifest, fp, plan=plan)
@@ -330,10 +330,10 @@ def test_topology_change_replaces_only_intersecting_spatial_pack(
         return manifest
 
     def active_skeletons(manifest_path):
-        import foundinspace.octree.combine.streaming_index as streaming_index
-        from foundinspace.octree.combine.manifest import read_combine_manifest
+        import foundinspace.octree.packing.streaming_index as streaming_index
+        from foundinspace.octree.packing.manifest import read_packing_manifest
 
-        manifest = read_combine_manifest(manifest_path, deep_validation=False)
+        manifest = read_packing_manifest(manifest_path, deep_validation=False)
         identity = streaming_index._topology_identity(
             manifest,
             cache_dir=cache_dir,
@@ -408,7 +408,7 @@ def test_sparse_skeleton_packs_bound_files_and_underlying_opens(
         for ancestor in range(0, 1 << 12, 32)
     ]
     manifest_path = build_intermediates(tmp_path / "intermediates", nodes, max_level=6)
-    plan = CombinePlan(
+    plan = PackingPlan(
         max_open_files=2,
         cache_dir=cache_dir,
         skeleton_pack_count=pack_count,
@@ -462,7 +462,7 @@ def test_temporary_index_batches_frontier_pwrite_by_parent(
         ],
         max_level=6,
     )
-    plan = CombinePlan(
+    plan = PackingPlan(
         max_open_files=2,
         cache_dir=tmp_path / "cache",
         index_emission_strategy=strategy,
@@ -487,7 +487,7 @@ def test_temporary_index_batches_frontier_pwrite_by_parent(
 def test_pwrite_all_retries_partial_writes(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import foundinspace.octree.combine.streaming_index as streaming_index
+    import foundinspace.octree.packing.streaming_index as streaming_index
 
     path = tmp_path / "partial-pwrite.bin"
     path.write_bytes(b"\x00" * 12)
@@ -510,7 +510,7 @@ def test_pwrite_all_retries_partial_writes(
 def test_temporary_index_is_cleaned_after_pwrite_failure(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import foundinspace.octree.combine.streaming_index as streaming_index
+    import foundinspace.octree.packing.streaming_index as streaming_index
 
     cache_dir = tmp_path / "cache"
     manifest_path = build_intermediates(
@@ -518,7 +518,7 @@ def test_temporary_index_is_cleaned_after_pwrite_failure(
         [PayloadNode(level=6, node_id=0, star_count=1, raw_payload=b"deep")],
         max_level=6,
     )
-    plan = CombinePlan(
+    plan = PackingPlan(
         cache_dir=cache_dir,
         index_emission_strategy=IndexEmissionStrategy.TEMP_PWRITE_BATCHED,
     )
@@ -539,7 +539,7 @@ def test_temporary_index_is_cleaned_after_pwrite_failure(
 
 
 def test_cache_lock_preserves_live_compiler_temporary_tree(tmp_path) -> None:
-    import foundinspace.octree.combine.streaming_index as streaming_index
+    import foundinspace.octree.packing.streaming_index as streaming_index
 
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir()

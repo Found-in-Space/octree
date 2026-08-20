@@ -3,7 +3,8 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass
 
-from ..combine.records import (
+from ..config import MORTON_BITS
+from ..packing.records import (
     FRONTIER_REF_FMT,
     FRONTIER_REF_SIZE,
     HAS_PAYLOAD,
@@ -16,7 +17,6 @@ from ..combine.records import (
     SUPPORTED_STAR_FORMAT_VERSIONS,
     shard_node_format,
 )
-from ..config import MORTON_BITS
 from .header import OctreeHeader
 from .source import OctreeSource, SeekableBinaryReader, open_octree_source
 

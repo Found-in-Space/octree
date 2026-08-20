@@ -11,8 +11,8 @@ from uuid import UUID
 
 from .assembly.formats import INDEX_FILE_HDR, INDEX_RECORD
 from .assembly.identity_encoder import iter_identity_rows
-from .combine.lookup import FixedRecordFile
-from .combine.manifest import read_combine_manifest
+from .packing.lookup import FixedRecordFile
+from .packing.manifest import read_packing_manifest
 
 HEADER_FMT = struct.Struct("<4sHH16s16sQQQQQ")
 HEADER_MAGIC = b"OIOR"
@@ -325,14 +325,14 @@ class _BoundedFileSlice:
         return data
 
 
-def combine_identifiers_order(
+def pack_identifiers_order(
     manifest_path: Path,
     output_path: Path,
     *,
     parent_dataset_uuid: UUID,
     artifact_uuid: UUID,
 ) -> None:
-    manifest = read_combine_manifest(manifest_path, deep_validation=False)
+    manifest = read_packing_manifest(manifest_path, deep_validation=False)
     if manifest.artifact_kind != "identifiers":
         raise ValueError(
             f"Expected identifiers manifest, got {manifest.artifact_kind!r}"

@@ -1,8 +1,7 @@
 # Streaming Octree Pipeline
 
-This document defines the octree build architecture. Numeric stage names
-are compatibility labels only; durable products and commands should be named by
-their purpose.
+This document defines the octree build architecture. Durable products, commands,
+paths, manifests, and state are named by their purpose.
 
 ## Non-negotiable properties
 
@@ -177,8 +176,8 @@ A no-op replacement stops after comparison. A star whose changed fields do not
 affect ordering, topology, or encoded payload should stop at the first matching
 semantic checksum appropriate to those fields.
 
-The current compatibility state still propagates some downstream changes with
-a conservative `clean`/`all` marker, and a changed terminal-map identity can
+The current state still propagates some downstream changes with a conservative
+whole-product marker, and a changed terminal-map identity can
 invalidate v2 materialization globally. Those are dependency-indexing gaps, not
 reasons to abandon immutable contribution or topology reuse.
 
@@ -213,17 +212,15 @@ last published version before its replacement is complete.
 
 ## Purpose-based command model
 
-The intended public vocabulary is:
+The public vocabulary is:
 
 ```text
 route
 prepare
-materialize --profile NAME
-pack --profile NAME
-sidecars
-build --profile NAME
+build
+sidecars build
 ```
 
-Compatibility commands using numeric stage labels may remain during migration,
-but new manifests, modules, configuration, and documentation should use product
-or action names.
+Topology planning, materialization, and packing remain reusable internal
+products beneath `build`. Build policy, including profile selection, belongs in
+the project file rather than command-line overrides.

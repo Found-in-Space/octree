@@ -41,7 +41,7 @@ The glow octree is a **sibling product** of `stars.octree`, not a sidecar or ext
 
 - It consumes the same merged HEALPix parquet input.
 - It uses the same world geometry (`WORLD_CENTER`, `WORLD_HALF_SIZE_PC`).
-- It reuses shared Morton/grid helpers and the final combine infrastructure.
+- It reuses shared Morton/grid helpers and the final packing infrastructure.
 - It produces a separate `glow.octree` file.
 
 It is **not** a sidecar because its spatial structure differs from the star octree. The glow octree uses pure spatial binning (all stars assigned to leaf cells at `max_level`), while `stars.octree` uses magnitude-driven level assignment. The cell sets are therefore different, and sidecar alignment is not possible.
@@ -361,13 +361,13 @@ This pass is bounded-memory: only two adjacent levels need to be in memory at on
 
 Write all cell records (all levels) as intermediate shard files using the same shard format as the star build: one payload file + one index file per shard.
 
-The payload for each cell is the 32-byte `GLOW_PAYLOAD_FMT` record, gzip-compressed for format compatibility with the existing combine pipeline.
+The payload for each cell is the 32-byte `GLOW_PAYLOAD_FMT` record, gzip-compressed for use by the existing packing pipeline.
 
 Shard planning (prefix sharding for deep levels) reuses the same `BuildPlan` parameters as the star pipeline.
 
-### Phase 4 — combine
+### Phase 4 — pack
 
-Reuse the existing combine pipeline (`combine_octree`) to assemble `glow.octree` from the intermediate shards.
+Reuse the existing packing pipeline (`pack_octree`) to assemble `glow.octree` from the intermediate shards.
 
 The final `glow.octree` uses the same file-level structure as `stars.octree`:
 
@@ -382,7 +382,7 @@ The build must remain bounded-memory:
 
 - Phase 1: streaming batches + partial aggregates on disk.
 - Phase 2: one level at a time in memory (occupied cells only, which is a small fraction of the theoretical 8^max_level).
-- Phase 3/4: reuse existing bounded-memory shard and combine machinery.
+- Phase 3/4: reuse existing bounded-memory shard and packing machinery.
 
 ---
 
@@ -430,8 +430,8 @@ Readers distinguish `glow.octree` from `stars.octree` by the descriptor's `artif
 
 ### Code changes required
 
-- `combine/records.py`: add `GLOW_DESCRIPTOR_KIND = 3` and update `_descriptor_kind_code` / `_descriptor_kind_name`.
-- `combine/records.py`: `pack_top_level_header` currently hardcodes `PAYLOAD_RECORD_SIZE = 16`. This must be parameterised so the glow build can pass `payload_record_size = 32`.
+- `packing/records.py`: add `GLOW_DESCRIPTOR_KIND = 3` and update `_descriptor_kind_code` / `_descriptor_kind_name`.
+- `packing/records.py`: `pack_top_level_header` currently hardcodes `PAYLOAD_RECORD_SIZE = 16`. This must be parameterised so the glow build can pass `payload_record_size = 32`.
 
 ---
 
@@ -447,7 +447,7 @@ batch_size = 1_000_000
 
 Required project-file paths:
 
-- `paths.merged_healpix_dir` (same input as Stage 00)
+- `paths.merged_healpix_dir` (same input as Routing)
 - `paths.glow_output_path` (e.g. `"output/glow.octree"`)
 - `paths.glow_intermediate_dir` (e.g. `"output/glow-intermediates"`)
 
@@ -476,10 +476,10 @@ uv run fis-octree glow --project path/to/project.toml
 2. Implement bolometric correction function `BC(Teff)` (polynomial fit).
 3. Implement `teff_to_linear_rgb` (linearise existing `teff_to_rgb` from `pipeline/common/photometry.py`).
 4. Implement mass estimation (log_g tier + mass-luminosity fallback).
-5. Add `GLOW_DESCRIPTOR_KIND` and parameterise `payload_record_size` in `combine/records.py`.
+5. Add `GLOW_DESCRIPTOR_KIND` and parameterise `payload_record_size` in `packing/records.py`.
 6. Implement leaf aggregation pass (streaming, DuckDB-backed).
 7. Implement bottom-up reduction pass.
 8. Write intermediates using existing shard writer.
-9. Assemble final `glow.octree` using existing combine pipeline.
+9. Assemble final `glow.octree` using existing packing pipeline.
 10. Add `fis-octree glow` CLI command and project config.
 11. Add reader/stats support for glow octree inspection.

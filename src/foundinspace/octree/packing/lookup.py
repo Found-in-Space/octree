@@ -8,7 +8,7 @@ from pathlib import Path
 
 from ..assembly.formats import INDEX_FILE_HDR, INDEX_RECORD
 from ..assembly.types import ShardKey
-from .manifest import CombineManifest
+from .manifest import PackingManifest
 from .records import RELOC_HEADER_FMT, RELOC_MAGIC, RELOC_RECORD_FMT
 
 
@@ -185,7 +185,7 @@ class _FixedRecordCache:
 class IntermediateLookup:
     def __init__(
         self,
-        manifest: CombineManifest,
+        manifest: PackingManifest,
         *,
         max_open_files: int = 32,
     ):

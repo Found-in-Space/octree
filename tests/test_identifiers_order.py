@@ -7,18 +7,18 @@ from uuid import UUID
 import pytest
 
 import foundinspace.octree.identifiers_order as identifiers_order_module
-from combine_helpers import PayloadNode, build_identifiers_intermediates
 from foundinspace.octree.identifiers_order import (
     IdentifiersOrderReader,
-    combine_identifiers_order,
+    pack_identifiers_order,
     read_header,
 )
+from packing_helpers import PayloadNode, build_identifiers_intermediates
 
 DATASET_UUID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 ARTIFACT_UUID = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
 
 
-def test_combine_identifiers_order_round_trip(tmp_path) -> None:
+def test_pack_identifiers_order_round_trip(tmp_path) -> None:
     manifest_path = build_identifiers_intermediates(
         tmp_path / "intermediates",
         [
@@ -41,7 +41,7 @@ def test_combine_identifiers_order_round_trip(tmp_path) -> None:
     )
     output_path = tmp_path / "identifiers.order"
 
-    combine_identifiers_order(
+    pack_identifiers_order(
         manifest_path,
         output_path,
         parent_dataset_uuid=DATASET_UUID,
@@ -88,7 +88,7 @@ def test_reader_streams_large_cell_identities_in_small_chunks(
         max_level=0,
     )
     output_path = tmp_path / "identifiers.order"
-    combine_identifiers_order(
+    pack_identifiers_order(
         manifest_path,
         output_path,
         parent_dataset_uuid=DATASET_UUID,
@@ -136,7 +136,7 @@ def test_reader_exposes_bounded_raw_identity_payloads(tmp_path) -> None:
         max_level=0,
     )
     output_path = tmp_path / "identifiers.order"
-    combine_identifiers_order(
+    pack_identifiers_order(
         manifest_path,
         output_path,
         parent_dataset_uuid=DATASET_UUID,

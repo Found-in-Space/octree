@@ -21,13 +21,12 @@ from foundinspace.octree.reader.stats import (
     DEFAULT_SHELL_COALESCE_GAP_BYTES,
     coalesce_payload_ranges,
 )
-from foundinspace.octree.sources.stage00 import (
-    STAGE_STATE_NAME,
+from foundinspace.octree.sources.routing import (
+    PIPELINE_STATE_NAME,
     TREE_MANIFEST_NAME,
     _read_json,
 )
 
-BENCHMARK_FORMAT = "foundinspace.octree.stage03-packing-benchmark/v0"
 DEFAULT_TARGET_VERTICAL_FOV_DEG = 40.0
 DEFAULT_TARGET_ASPECT_RATIO = 16.0 / 9.0
 DEFAULT_TARGET_NEAR_PC = 0.01
@@ -56,9 +55,9 @@ class Point3:
 
 
 @dataclass(frozen=True, slots=True)
-class Stage03BenchmarkConfig:
-    stage00_output_dir: Path
-    stage01_output_dir: Path
+class PackingBenchmarkConfig:
+    routed_dir: Path
+    prepared_dir: Path
     profiles: tuple[str, ...] = PROFILES
     orders: tuple[str, ...] = PACKING_ORDERS
     scenarios: tuple[str, ...] = SCENARIOS
@@ -69,7 +68,7 @@ class Stage03BenchmarkConfig:
     aspect_ratio: float = DEFAULT_TARGET_ASPECT_RATIO
     tile_prefix_depth: int = DEFAULT_TILE_PREFIX_DEPTH
     coalesce_gap_bytes: int = DEFAULT_SHELL_COALESCE_GAP_BYTES
-    batch_size: int = 100_000
+    batch_rows: int = 100_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,26 +92,26 @@ class _Geometry:
     half_size: float
 
 
-def run_stage03_packing_benchmark(config: Stage03BenchmarkConfig) -> dict[str, Any]:
-    """Estimate range-read behavior for candidate Stage 03 packing orders."""
+def run_packing_benchmark(config: PackingBenchmarkConfig) -> dict[str, Any]:
+    """Estimate range-read behavior for candidate packing orders."""
     _validate_config(config)
-    manifest, state = _read_stage_state(config.stage00_output_dir)
+    manifest, state = _read_pipeline_state(config.routed_dir)
     world = _world_from_manifest(manifest)
     limiting_magnitude = (
         world.index_magnitude
         if config.limiting_magnitude is None
         else float(config.limiting_magnitude)
     )
-    stage01_files = _stage01_files(config.stage01_output_dir, state)
+    preparation_files = _preparation_files(config.prepared_dir, state)
 
     results: list[dict[str, Any]] = []
     profile_nodes: dict[str, list[_FinalNode]] = {}
     for profile in config.profiles:
         nodes = list(
             _iter_final_nodes(
-                stage01_files,
+                preparation_files,
                 profile=profile,
-                batch_size=config.batch_size,
+                batch_rows=config.batch_rows,
             )
         )
         profile_nodes[profile] = nodes
@@ -142,9 +141,8 @@ def run_stage03_packing_benchmark(config: Stage03BenchmarkConfig) -> dict[str, A
                 )
 
     return {
-        "format": BENCHMARK_FORMAT,
-        "stage00_output_dir": str(config.stage00_output_dir),
-        "stage01_output_dir": str(config.stage01_output_dir),
+        "routed_dir": str(config.routed_dir),
+        "prepared_dir": str(config.prepared_dir),
         "profiles": list(config.profiles),
         "orders": list(config.orders),
         "scenarios": list(config.scenarios),
@@ -162,11 +160,11 @@ def run_stage03_packing_benchmark(config: Stage03BenchmarkConfig) -> dict[str, A
     }
 
 
-def _validate_config(config: Stage03BenchmarkConfig) -> None:
-    if not config.stage00_output_dir.is_dir():
-        raise NotADirectoryError(f"Not a directory: {config.stage00_output_dir}")
-    if not config.stage01_output_dir.is_dir():
-        raise NotADirectoryError(f"Not a directory: {config.stage01_output_dir}")
+def _validate_config(config: PackingBenchmarkConfig) -> None:
+    if not config.routed_dir.is_dir():
+        raise NotADirectoryError(f"Not a directory: {config.routed_dir}")
+    if not config.prepared_dir.is_dir():
+        raise NotADirectoryError(f"Not a directory: {config.prepared_dir}")
     _validate_choices(config.profiles, PROFILES, "profile")
     _validate_choices(config.orders, PACKING_ORDERS, "order")
     _validate_choices(config.scenarios, SCENARIOS, "scenario")
@@ -178,8 +176,8 @@ def _validate_config(config: Stage03BenchmarkConfig) -> None:
         raise ValueError(f"tile_prefix_depth must be in 0..{MORTON_BITS}")
     if config.coalesce_gap_bytes < 0:
         raise ValueError("coalesce_gap_bytes must be >= 0")
-    if config.batch_size <= 0:
-        raise ValueError("batch_size must be > 0")
+    if config.batch_rows <= 0:
+        raise ValueError("batch_rows must be > 0")
 
 
 def _validate_choices(
@@ -193,51 +191,49 @@ def _validate_choices(
         )
 
 
-def _read_stage_state(
-    stage00_output_dir: Path,
+def _read_pipeline_state(
+    routed_dir: Path,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    manifest_path = stage00_output_dir / TREE_MANIFEST_NAME
-    state_path = stage00_output_dir / STAGE_STATE_NAME
+    manifest_path = routed_dir / TREE_MANIFEST_NAME
+    state_path = routed_dir / PIPELINE_STATE_NAME
     if not manifest_path.is_file():
-        raise FileNotFoundError(f"Missing Stage 00 tree manifest: {manifest_path}")
+        raise FileNotFoundError(f"Missing Routing tree manifest: {manifest_path}")
     if not state_path.is_file():
-        raise FileNotFoundError(f"Missing Stage 00 state: {state_path}")
+        raise FileNotFoundError(f"Missing Routing state: {state_path}")
     manifest = _read_json(manifest_path)
     state = _read_json(state_path)
-    dirty = state.get("dirty", {})
-    if dirty.get("stage01_groups"):
-        raise ValueError("Stage 01 benchmark requires no dirty Stage 01 groups")
-    if dirty.get("deleted_stage00_groups"):
-        raise ValueError("Stage 01 benchmark requires no deleted Stage 00 groups")
-    if not state.get("stage01_groups"):
-        raise ValueError("Stage 01 benchmark requires Stage 01 groups in stage-state")
+    dirty = state["dirty"]["preparation"]
+    if dirty["all"] or dirty["group_keys"] or dirty["deleted_routed_group_keys"]:
+        raise ValueError("Packing benchmark requires Preparation to be current")
+    if not state["products"]["prepared_groups"]:
+        raise ValueError("Packing benchmark requires prepared groups")
     return manifest, state
 
 
 def _world_from_manifest(manifest: dict[str, Any]) -> _World:
     identity = manifest.get("tree_identity")
     if not isinstance(identity, dict):
-        raise ValueError("Stage 00 tree manifest is missing tree_identity")
+        raise ValueError("Routing tree manifest is missing tree_identity")
     center_raw = identity.get("world_center", [0.0, 0.0, 0.0])
     if not isinstance(center_raw, list | tuple) or len(center_raw) != 3:
         raise ValueError("tree_identity.world_center must contain three values")
     return _World(
         center=Point3(float(center_raw[0]), float(center_raw[1]), float(center_raw[2])),
         half_size_pc=float(identity["world_half_size_pc"]),
-        index_magnitude=float(identity["v_mag"]),
+        index_magnitude=float(identity["limiting_magnitude"]),
     )
 
 
-def _stage01_files(stage01_output_dir: Path, state: dict[str, Any]) -> list[Path]:
+def _preparation_files(prepared_dir: Path, state: dict[str, Any]) -> list[Path]:
     files: list[Path] = []
-    for group in state.get("stage01_groups", []):
+    for group in state["products"]["prepared_groups"]:
         for rel_path in group.get("files", []):
-            path = stage01_output_dir / str(rel_path)
+            path = prepared_dir / str(rel_path)
             if not path.is_file():
-                raise FileNotFoundError(f"Missing Stage 01 group file: {path}")
+                raise FileNotFoundError(f"Missing Preparation group file: {path}")
             files.append(path)
     if not files:
-        raise ValueError("Stage 01 benchmark found no Stage 01 parquet files")
+        raise ValueError("Preparation benchmark found no Preparation parquet files")
     return files
 
 
@@ -245,10 +241,10 @@ def _iter_final_nodes(
     files: list[Path],
     *,
     profile: str,
-    batch_size: int,
+    batch_rows: int,
 ) -> Iterator[_FinalNode]:
     cap_level = CLASSIC_MAX_LEVEL if profile == "classic" else MORTON_BITS
-    has_teff = _validate_raw_stage01_schema(files)
+    has_teff = _validate_raw_preparation_schema(files)
     source = _duckdb_read_parquet_source(files)
     final_level_expr = f"CASE WHEN level > {cap_level} THEN {cap_level} ELSE level END"
     teff_expr = "teff" if has_teff else "NULL::DOUBLE AS teff"
@@ -294,7 +290,7 @@ def _iter_final_nodes(
         renders = bytearray()
         star_count = 0
         while True:
-            batch = con.fetchmany(batch_size)
+            batch = con.fetchmany(batch_rows)
             if not batch:
                 break
             parsed_rows: list[tuple[int, int]] = []
@@ -330,7 +326,7 @@ def _iter_final_nodes(
                 missing = [name for name, value in required.items() if value is None]
                 if missing:
                     raise ValueError(
-                        "Stage 03 benchmark input contains null required fields: "
+                        "Sidecars benchmark input contains null required fields: "
                         f"{missing}"
                     )
                 level = int(level_raw)
@@ -398,15 +394,15 @@ def _duckdb_read_parquet_source(files: list[Path]) -> str:
     return "[" + ", ".join(quoted) + "]"
 
 
-def _validate_raw_stage01_schema(files: list[Path]) -> bool:
+def _validate_raw_preparation_schema(files: list[Path]) -> bool:
     has_teff = False
     for path in files:
         names = set(pq.read_schema(path).names)
         missing = sorted(_RAW_RENDER_COLUMNS - names)
         if missing:
             raise ValueError(
-                "Stage 03 benchmark requires raw Stage 01 fields; "
-                f"{path} is missing {missing}. Rebuild Stage 00 and Stage 01."
+                "Sidecars benchmark requires raw Preparation fields; "
+                f"{path} is missing {missing}. Rebuild Routing and Preparation."
             )
         has_teff = has_teff or "teff" in names
     return has_teff

@@ -1,6 +1,6 @@
 # Terminal-packed octree memory testbed
 
-`fis-octree terminal-memory-benchmark` evaluates terminal-packed STAR v2
+`fis-octree benchmark terminal-memory` evaluates terminal-packed STAR v2
 layouts without building or rewriting a STAR v2 artifact. It extracts complete
 subtrees from an existing STAR v1 octree, preserves the natural logical cells
 and magnitude ordering, forms virtual terminal nodes, and replays observer
@@ -24,7 +24,7 @@ the configured waterline.
 Use a sample point and level that bound a complete, tractable subtree:
 
 ```console
-uv run fis-octree terminal-memory-benchmark \
+uv run fis-octree benchmark terminal-memory \
   https://data.foundin.space/c56103e6-ad4c-41f9-be06-048b48ec632b/stars.octree \
   --sample sparse-10k:10000,1,1@9 \
   --waterline 512 \

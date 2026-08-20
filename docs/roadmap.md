@@ -2,8 +2,7 @@
 
 ## Direction
 
-The octree pipeline is moving from numbered compatibility stages to the
-bounded, incremental product flow in
+The octree pipeline follows the bounded, incremental product flow in
 [`streaming-pipeline.md`](streaming-pipeline.md):
 
 ```text
@@ -15,9 +14,9 @@ routed contributions
     -> sidecars
 ```
 
-The current `stage-00` through `stage-03` commands remain compatibility entry
-points. Numeric labels are not the naming scheme for new products, manifests,
-modules, or future commands.
+The public command boundaries are `route`, `prepare`, `build`, and
+`sidecars build`. Topology planning, materialization, and packing are reusable
+internal products beneath `build`.
 
 ## Implemented foundations
 
@@ -31,7 +30,7 @@ modules, or future commands.
   and checkpointed before old versions are removed.
 - Shared bounded run generation and fan-in merging are available for
   materialization.
-- Classic materialization encodes rows relative to their selected final cell
+- Materialization encodes rows relative to their selected final cell
   and checkpoints group runs and spatial partitions.
 - Terminal topology uses immutable per-group and per-level count runs, bounded
   vectorized fan-in merging, sequential bottom-up subtree aggregation, and
@@ -42,7 +41,7 @@ modules, or future commands.
 - The final index compiler uses sorted topology runs and content-addressed,
   spatially packed five-level skeletons. Payload-only changes reuse the topology
   plan without source/index searches.
-- The v1 writer is byte-equivalent to the legacy implementation. Its measured
+- The STAR v1 writer preserves the established binary output. Its measured
   default builds a dedicated scratch index and patches one recorded frontier
   table per parent; a lower-scratch prefix-sum emitter remains available.
 - Complete render/identity pairs have a durable no-op checkpoint with UUID
@@ -95,13 +94,12 @@ The monolithic artifact still requires a complete sequential final rewrite. A
 sharded final container and true partial publication remain a separate format
 decision.
 
-### 5. Purpose-based command migration
+### 5. Production acceptance of the semantic layout
 
-After the remaining dependency contracts stabilize, introduce purpose-based
-commands such as `route`, `prepare`, `materialize`, `pack`, `sidecars`, and
-`build`. Retain the numeric commands as aliases for a documented compatibility
-period. CLI and configuration renaming must not be mixed into topology or
-materialization correctness work.
+Run the first production v2 build from the unversioned semantic project
+template and retain its routing, preparation, build, packing, and sidecar
+reports as the operational baseline. No older project schema or numeric command
+is accepted.
 
 ## Existing artifact requirements
 
@@ -117,8 +115,8 @@ These remain part of every profile:
 ## Related documentation
 
 - [`streaming-pipeline.md`](streaming-pipeline.md)
-- [`staged-pipeline-plan.md`](staged-pipeline-plan.md)
-- [`stages.md`](stages.md)
+- [`pipeline-plan.md`](pipeline-plan.md)
+- [`products.md`](products.md)
 - [`identifiers-order.md`](identifiers-order.md)
 - [`identity-lookup-index.md`](identity-lookup-index.md)
 - [`sidecars.md`](sidecars.md)

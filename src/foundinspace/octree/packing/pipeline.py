@@ -8,7 +8,7 @@ from typing import BinaryIO
 from ..terminal_packing import TerminalMap
 from .dfs import iter_cells_dfs
 from .lookup import FileHandleCache, IntermediateLookup, RelocationLookup
-from .manifest import read_combine_manifest
+from .manifest import read_packing_manifest
 from .records import (
     DESCRIPTOR_SIZE,
     FRONTIER_REF_FMT,
@@ -38,7 +38,7 @@ from .streaming_index import IndexEmissionStrategy, write_streaming_index
 
 
 @dataclass(frozen=True, slots=True)
-class CombinePlan:
+class PackingPlan:
     max_open_files: int = 32
     lookup_cache_records: int = 65536
     retain_relocation_files: bool = False
@@ -90,7 +90,7 @@ class _ShardBuildResult:
     shard_id: int
 
 
-DEFAULT_COMBINE_PLAN = CombinePlan()
+DEFAULT_PACKING_PLAN = PackingPlan()
 
 
 def _format_bytes(n: int) -> str:
@@ -171,22 +171,22 @@ class _RelocAppender:
             )
 
 
-def combine_octree(
+def pack_octree(
     manifest_path: Path,
     output_path: Path,
     *,
-    plan: CombinePlan = DEFAULT_COMBINE_PLAN,
+    plan: PackingPlan = DEFAULT_PACKING_PLAN,
     descriptor: PackedDescriptorFields | None = None,
 ) -> None:
     t0 = time.perf_counter()
     plan.validate()
-    manifest = read_combine_manifest(manifest_path, deep_validation=False)
+    manifest = read_packing_manifest(manifest_path, deep_validation=False)
     if descriptor is None:
         descriptor = PackedDescriptorFields(artifact_kind=manifest.artifact_kind)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     print(
         (
-            f"Combine: starting ({len(manifest.shards)} shard(s), "
+            f"Packing: starting ({len(manifest.shards)} shard(s), "
             f"max_level={manifest.max_level}) -> {output_path}"
         ),
         flush=True,
@@ -194,7 +194,7 @@ def combine_octree(
 
     with open(output_path, "wb") as out_fp:
         phase_a_start = time.perf_counter()
-        print("Combine: Phase A (payload relocation) started.", flush=True)
+        print("Packing: Phase A (payload relocation) started.", flush=True)
         out_fp.write(
             pack_top_level_header(
                 PackedHeaderFields(
@@ -210,7 +210,7 @@ def combine_octree(
         payload_result = relocate_payloads_dfs(manifest_path, out_fp, plan=plan)
         print(
             (
-                "Combine: Phase A complete "
+                "Packing: Phase A complete "
                 f"({len(payload_result.relocation_files)} relocation file(s), "
                 f"payload_end_offset={payload_result.payload_end_offset}, "
                 f"elapsed={time.perf_counter() - phase_a_start:.1f}s)."
@@ -218,7 +218,7 @@ def combine_octree(
             flush=True,
         )
         phase_b_start = time.perf_counter()
-        print("Combine: Phase B (index write) started.", flush=True)
+        print("Packing: Phase B (index write) started.", flush=True)
         index_result = write_final_shard_index(
             manifest_path,
             payload_result.relocation_files,
@@ -227,7 +227,7 @@ def combine_octree(
         )
         print(
             (
-                "Combine: Phase B complete "
+                "Packing: Phase B complete "
                 f"(index_offset={index_result.index_offset}, "
                 f"index_length={index_result.index_length}, "
                 f"elapsed={time.perf_counter() - phase_b_start:.1f}s)."
@@ -236,7 +236,7 @@ def combine_octree(
         )
 
     phase_c_start = time.perf_counter()
-    print("Combine: Phase C (header finalize + cleanup) started.", flush=True)
+    print("Packing: Phase C (header finalize + cleanup) started.", flush=True)
     finalize_octree_header(
         output_path,
         index_offset=index_result.index_offset,
@@ -245,7 +245,7 @@ def combine_octree(
         world_half_size_pc=manifest.world_half_size_pc,
     )
     print(
-        f"Combine: header patched in {time.perf_counter() - phase_c_start:.1f}s.",
+        f"Packing: header patched in {time.perf_counter() - phase_c_start:.1f}s.",
         flush=True,
     )
 
@@ -253,17 +253,17 @@ def combine_octree(
         for p in payload_result.relocation_files:
             p.unlink(missing_ok=True)
         print(
-            f"Combine: removed {len(payload_result.relocation_files)} relocation file(s).",
+            f"Packing: removed {len(payload_result.relocation_files)} relocation file(s).",
             flush=True,
         )
     else:
         print(
-            "Combine: retained relocation files (--retain-relocation-files).",
+            "Packing: retained relocation files (--retain-relocation-files).",
             flush=True,
         )
 
     print(
-        f"Combine: done in {time.perf_counter() - t0:.1f}s.",
+        f"Packing: done in {time.perf_counter() - t0:.1f}s.",
         flush=True,
     )
 
@@ -272,9 +272,9 @@ def relocate_payloads_dfs(
     manifest_path: Path,
     output_fp: BinaryIO,
     *,
-    plan: CombinePlan,
+    plan: PackingPlan,
 ) -> PayloadPassResult:
-    manifest = read_combine_manifest(manifest_path, deep_validation=False)
+    manifest = read_packing_manifest(manifest_path, deep_validation=False)
     shard_by_key = {
         (s.key.level, s.key.prefix_bits, s.key.prefix): s for s in manifest.shards
     }
@@ -317,7 +317,7 @@ def relocate_payloads_dfs(
             ):
                 print(
                     (
-                        "Combine: Phase A progress "
+                        "Packing: Phase A progress "
                         f"cells={copied_cells:,}, "
                         f"bytes={_format_bytes(copied_bytes)}, "
                         f"out_offset={output_fp.tell():,}"
@@ -358,7 +358,7 @@ def relocate_payloads_dfs(
 
     print(
         (
-            "Combine: Phase A final "
+            "Packing: Phase A final "
             f"cells={copied_cells:,}, "
             f"bytes={_format_bytes(copied_bytes)}, "
             f"out_offset={output_fp.tell():,}"
@@ -511,9 +511,9 @@ def write_final_shard_index(
     relocation_files: tuple[Path, ...],
     output_fp: BinaryIO,
     *,
-    plan: CombinePlan,
+    plan: PackingPlan,
 ) -> IndexPassResult:
-    manifest = read_combine_manifest(manifest_path, deep_validation=False)
+    manifest = read_packing_manifest(manifest_path, deep_validation=False)
     result = write_streaming_index(
         manifest,
         relocation_files,
@@ -522,7 +522,7 @@ def write_final_shard_index(
         star_format_version=plan.star_format_version,
         skeleton_pack_count=plan.skeleton_pack_count,
         emission_strategy=IndexEmissionStrategy(plan.index_emission_strategy),
-        cache_dir=plan.cache_dir or (manifest.root_dir / ".combine-index-cache"),
+        cache_dir=plan.cache_dir or (manifest.root_dir / ".packing-index-cache"),
     )
     return IndexPassResult(
         index_offset=result.index_offset,
@@ -535,12 +535,12 @@ def _write_final_shard_index_legacy(
     relocation_files: tuple[Path, ...],
     output_fp: BinaryIO,
     *,
-    plan: CombinePlan,
+    plan: PackingPlan,
 ) -> IndexPassResult:
     """Lookup-based writer retained only as a byte-compatibility test oracle."""
     if plan.star_format_version != STAR_FORMAT_VERSION_V1:
         raise ValueError("The legacy index test oracle only supports STAR v1")
-    manifest = read_combine_manifest(manifest_path)
+    manifest = read_packing_manifest(manifest_path)
     existence = IntermediateLookup(manifest, max_open_files=plan.max_open_files)
     relocation = RelocationLookup(relocation_files, max_open_files=plan.max_open_files)
     writer = _IndexWriter(

@@ -7,39 +7,13 @@ from uuid import UUID
 from click.testing import CliRunner
 
 from foundinspace.octree._cli import cli
+from project_helpers import project_text
 
 
 def _write_project(project_path: Path) -> None:
     root = project_path.parent
     project_path.write_text(
-        f"""
-format_version = 1
-
-[paths]
-merged_healpix_dir = "{root / "merged"}"
-identifiers_map_path = "{root / "identifiers_map.parquet"}"
-stage00_output_dir = "{root / "stage00"}"
-stage01_output_dir = "{root / "stage01"}"
-stage02_output_path = "{root / "stars.octree"}"
-identifiers_order_output_path = "{root / "identifiers.order"}"
-stage03_output_dir = "{root / "stage03"}"
-
-[stage00]
-batch_size = 1000
-v_mag = 6.5
-
-[stage01]
-input_glob = "{root / "stage00" / "**" / "*.parquet"}"
-batch_size = 1000
-deep_shard_from_level = 8
-deep_prefix_bits = 3
-
-[stage02]
-max_open_files = 4
-
-[stage03]
-""".strip()
-        + "\n",
+        project_text(root),
         encoding="utf-8",
     )
 
@@ -96,7 +70,7 @@ def test_visual_duplicates_sidecar_cli_is_explicit_and_optional(
 
     assert result.exit_code == 0, result.output
     config = calls[0]
-    assert config.output_path == tmp_path / "stars.visual-duplicates.octree"
-    assert config.report_path == tmp_path / "stars.visual-duplicates.report.json"
-    assert config.work_dir == tmp_path / ".stars.visual-duplicates.work"
+    assert config.output_path == tmp_path / "sidecars" / "visual-duplicates.octree"
+    assert config.report_path == tmp_path / "sidecars" / "visual-duplicates.report.json"
+    assert config.work_dir == tmp_path / "sidecars-work" / "visual-duplicates"
     assert "Stage" not in result.output

@@ -8,22 +8,23 @@ import pyarrow.parquet as pq
 import pytest
 from click.testing import CliRunner
 
-import foundinspace.octree.sources.stage00 as stage00_module
+import foundinspace.octree.sources.routing as routing_module
 from foundinspace.octree._cli import cli
 from foundinspace.octree.config import MORTON_BITS
 from foundinspace.octree.mag_levels import MagLevelConfig
-from foundinspace.octree.sources.stage00 import (
-    STAGE00_INPUT_FILTER_RAW_CARTESIAN,
-    Stage00Config,
-    run_stage00,
+from foundinspace.octree.sources.routing import (
+    ROUTING_INPUT_MODE_CARTESIAN,
+    RoutingConfig,
+    route_contributions,
 )
+from project_helpers import project_text
 
 
 def _morton_for_node(level: int, node_id: int) -> int:
     return int(node_id) << (3 * (MORTON_BITS - level))
 
 
-def _stage00_table(rows: list[dict], *, shard_id: str) -> pa.Table:
+def _routing_table(rows: list[dict], *, shard_id: str) -> pa.Table:
     return pa.table(
         {
             "source": pa.array([r["source"] for r in rows], type=pa.string()),
@@ -40,7 +41,7 @@ def _stage00_table(rows: list[dict], *, shard_id: str) -> pa.Table:
     )
 
 
-def _write_stage00_pixel(
+def _write_routing_pixel(
     root: Path,
     pixel: str,
     rows: list[dict],
@@ -50,22 +51,22 @@ def _write_stage00_pixel(
     pixel_dir = root / pixel
     pixel_dir.mkdir(parents=True, exist_ok=True)
     pq.write_table(
-        _stage00_table(rows, shard_id=pixel),
+        _routing_table(rows, shard_id=pixel),
         pixel_dir / part_name,
         compression="zstd",
     )
 
 
-def _write_stage00_shard_file(root: Path, shard: str, rows: list[dict]) -> None:
+def _write_routing_shard_file(root: Path, shard: str, rows: list[dict]) -> None:
     root.mkdir(parents=True, exist_ok=True)
     pq.write_table(
-        _stage00_table(rows, shard_id=shard),
+        _routing_table(rows, shard_id=shard),
         root / f"{shard}.parquet",
         compression="zstd",
     )
 
 
-def _write_raw_stage00_pixel(root: Path, pixel: str, rows: list[dict]) -> None:
+def _write_raw_routing_pixel(root: Path, pixel: str, rows: list[dict]) -> None:
     pixel_dir = root / pixel
     pixel_dir.mkdir(parents=True, exist_ok=True)
     pq.write_table(
@@ -95,43 +96,43 @@ def _group_checksums(report: dict) -> dict[tuple[str, str, str], tuple[int, str]
     }
 
 
-def _clear_stage01_dirty(output_dir: Path) -> None:
-    state_path = output_dir / "stage-state.json"
+def _clear_preparation_dirty(output_dir: Path) -> None:
+    state_path = output_dir / "pipeline-state.json"
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    state["dirty"]["stage01_groups"] = []
-    state["dirty"]["deleted_stage00_groups"] = []
-    state["dirty"]["stage01_all"] = False
+    state["dirty"]["preparation"]["group_keys"] = []
+    state["dirty"]["preparation"]["deleted_routed_group_keys"] = []
+    state["dirty"]["preparation"]["all"] = False
     state_path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 
 
-def _stage00_config(
+def _routing_config(
     input_root: Path,
     output_dir: Path,
     *,
     bucket_size: int = 100,
     shard_ids: tuple[str, ...] = (),
     replace_shards: bool = False,
-    input_filter: str = "none",
+    input_mode: str = "pre-routed",
     force: bool = False,
-) -> Stage00Config:
-    return Stage00Config(
-        input_root=input_root,
-        output_dir=output_dir,
+) -> RoutingConfig:
+    return RoutingConfig(
+        input_shards_dir=input_root,
+        routed_dir=output_dir,
         mag_config=MagLevelConfig(v_mag=6.5),
-        bucket_size=bucket_size,
-        batch_size=10,
+        bucket_rows=bucket_size,
+        scan_batch_rows=10,
         fragment_target_rows=10,
         compact_after_files=0,
         shard_ids=shard_ids,
         replace_shards=replace_shards,
-        input_filter=input_filter,
+        input_mode=input_mode,
         force=force,
     )
 
 
-def test_stage00_writes_tree_manifest_and_state(tmp_path: Path) -> None:
+def test_routing_writes_tree_manifest_and_state(tmp_path: Path) -> None:
     input_root = tmp_path / "input"
-    _write_stage00_pixel(
+    _write_routing_pixel(
         input_root,
         "100",
         [
@@ -145,50 +146,47 @@ def test_stage00_writes_tree_manifest_and_state(tmp_path: Path) -> None:
         ],
     )
 
-    out_dir = tmp_path / "stage00"
-    report_path = run_stage00(_stage00_config(input_root, out_dir))
+    out_dir = tmp_path / "routing"
+    report_path = route_contributions(_routing_config(input_root, out_dir))
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
     manifest = json.loads((out_dir / "tree-manifest.json").read_text(encoding="utf-8"))
-    state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
+    state = json.loads((out_dir / "pipeline-state.json").read_text(encoding="utf-8"))
 
-    assert manifest["format"] == "foundinspace.octree.stage-tree/v0"
     assert manifest["tree_identity"] == state["tree_identity"]
     assert (
         manifest["tree_identity"]
         | {
-            "v_mag": 6.5,
-            "bucket_size": 100,
+            "limiting_magnitude": 6.5,
+            "bucket_rows": 100,
             "morton_bits": MORTON_BITS,
-            "row_schema_version": "stage00-row-schema/v3",
+            "row_schema_version": "routing-row-schema/v3",
         }
         == manifest["tree_identity"]
     )
-    assert state["format"] == "foundinspace.octree.stage-state/v0"
-    assert report["input_filter"] == "none"
+    assert report["input_mode"] == "pre-routed"
     assert report["rows_after_filter"] == report["rows_in"]
-    assert state["input_filter"] == "none"
+    assert state["input_mode"] == "pre-routed"
     assert state["input_shards"][0]["shard_id"] == "100"
     assert state["input_shards"][0]["source_files"][0]["path"] == "100/part.parquet"
-    assert [group["key"] for group in state["stage00_groups"]] == [
+    assert [group["key"] for group in state["products"]["routed_groups"]] == [
         group["key"] for group in report["groups"]
     ]
     assert (
-        state["stage00_groups"][0]["checksum"]
+        state["products"]["routed_groups"][0]["checksum"]
         == report["groups"][0]["content_checksum"]
     )
-    assert state["dirty"]["stage01_all"] is True
-    assert state["dirty"]["stage01_groups"] == []
-    assert state["dirty"]["deleted_stage00_groups"] == []
-    assert state["dirty"]["stage03"] == {"mode": "clean"}
-    assert state["stage00_build"]["status"] == "complete"
+    assert state["dirty"]["preparation"]["all"] is True
+    assert state["dirty"]["preparation"]["group_keys"] == []
+    assert state["dirty"]["preparation"]["deleted_routed_group_keys"] == []
+    assert state["builds"]["routing"]["status"] == "complete"
 
 
-def test_stage00_fails_hard_without_required_routing_columns(
+def test_routing_fails_hard_without_required_routing_columns(
     tmp_path: Path,
 ) -> None:
     input_root = tmp_path / "input"
-    _write_raw_stage00_pixel(
+    _write_raw_routing_pixel(
         input_root,
         "100",
         [
@@ -202,22 +200,22 @@ def test_stage00_fails_hard_without_required_routing_columns(
             }
         ],
     )
-    out_dir = tmp_path / "stage00"
-    config = _stage00_config(input_root, out_dir)
+    out_dir = tmp_path / "routing"
+    config = _routing_config(input_root, out_dir)
 
     with pytest.raises(ValueError, match="missing required routing columns"):
-        run_stage00(config)
-    state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
-    assert state["stage00_build"]["status"] == "in_progress"
-    assert state["stage00_build"]["completed_shards"] == []
-    assert (out_dir / ".stage00-transaction.json").is_file()
+        route_contributions(config)
+    state = json.loads((out_dir / "pipeline-state.json").read_text(encoding="utf-8"))
+    assert state["builds"]["routing"]["status"] == "in_progress"
+    assert state["builds"]["routing"]["completed_shards"] == []
+    assert (out_dir / ".routing-transaction.json").is_file()
 
 
-def test_stage00_explicit_raw_filter_preserves_row_count_and_records_filter(
+def test_routing_explicit_raw_filter_preserves_row_count_and_records_filter(
     tmp_path: Path,
 ) -> None:
     input_root = tmp_path / "input"
-    _write_raw_stage00_pixel(
+    _write_raw_routing_pixel(
         input_root,
         "100",
         [
@@ -241,13 +239,13 @@ def test_stage00_explicit_raw_filter_preserves_row_count_and_records_filter(
             },
         ],
     )
-    out_dir = tmp_path / "stage00"
+    out_dir = tmp_path / "routing"
 
-    report_path = run_stage00(
-        _stage00_config(
+    report_path = route_contributions(
+        _routing_config(
             input_root,
             out_dir,
-            input_filter=STAGE00_INPUT_FILTER_RAW_CARTESIAN,
+            input_mode=ROUTING_INPUT_MODE_CARTESIAN,
         )
     )
 
@@ -255,13 +253,11 @@ def test_stage00_explicit_raw_filter_preserves_row_count_and_records_filter(
     manifest = json.loads((out_dir / "tree-manifest.json").read_text(encoding="utf-8"))
     fragment = next((out_dir / "tree").glob("*.parquet"))
     table = pq.read_table(fragment)
-    assert report["input_filter"] == STAGE00_INPUT_FILTER_RAW_CARTESIAN
+    assert report["input_mode"] == ROUTING_INPUT_MODE_CARTESIAN
     assert report["rows_in"] == 2
     assert report["rows_after_filter"] == 2
     assert report["rows_current"] == 2
-    assert (
-        manifest["tree_identity"]["input_filter"] == STAGE00_INPUT_FILTER_RAW_CARTESIAN
-    )
+    assert manifest["tree_identity"]["input_mode"] == ROUTING_INPUT_MODE_CARTESIAN
     assert {
         "x_icrs_pc",
         "y_icrs_pc",
@@ -292,12 +288,12 @@ def test_stage00_explicit_raw_filter_preserves_row_count_and_records_filter(
     ]
 
 
-def test_stage00_fails_if_input_filter_changes_row_count(
+def test_routing_fails_if_input_mode_changes_row_count(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     input_root = tmp_path / "input"
-    _write_stage00_pixel(
+    _write_routing_pixel(
         input_root,
         "100",
         [
@@ -318,20 +314,20 @@ def test_stage00_fails_if_input_filter_changes_row_count(
         ],
     )
 
-    def drop_one_row(table: pa.Table, _config: Stage00Config) -> pa.Table:
+    def drop_one_row(table: pa.Table, _config: RoutingConfig) -> pa.Table:
         return table.slice(0, len(table) - 1)
 
-    monkeypatch.setattr(stage00_module, "_apply_input_filter", drop_one_row)
+    monkeypatch.setattr(routing_module, "_apply_input_mode", drop_one_row)
 
     with pytest.raises(ValueError, match="changed row count"):
-        run_stage00(_stage00_config(input_root, tmp_path / "stage00"))
+        route_contributions(_routing_config(input_root, tmp_path / "routing"))
 
 
-def test_stage00_rewrites_packed_files_when_node_becomes_lower_mag_limited(
+def test_routing_rewrites_packed_files_when_node_becomes_lower_mag_limited(
     tmp_path: Path,
 ) -> None:
     input_root = tmp_path / "input"
-    _write_stage00_pixel(
+    _write_routing_pixel(
         input_root,
         "123",
         [
@@ -351,7 +347,7 @@ def test_stage00_rewrites_packed_files_when_node_becomes_lower_mag_limited(
             },
         ],
     )
-    _write_stage00_pixel(
+    _write_routing_pixel(
         input_root,
         "124",
         [
@@ -372,14 +368,14 @@ def test_stage00_rewrites_packed_files_when_node_becomes_lower_mag_limited(
         ],
     )
 
-    out_dir = tmp_path / "stage00"
-    report_path = run_stage00(
-        Stage00Config(
-            input_root=input_root,
-            output_dir=out_dir,
+    out_dir = tmp_path / "routing"
+    report_path = route_contributions(
+        RoutingConfig(
+            input_shards_dir=input_root,
+            routed_dir=out_dir,
             mag_config=MagLevelConfig(v_mag=6.5),
-            bucket_size=3,
-            batch_size=10,
+            bucket_rows=3,
+            scan_batch_rows=10,
         )
     )
 
@@ -414,9 +410,9 @@ def test_stage00_rewrites_packed_files_when_node_becomes_lower_mag_limited(
         assert row["file_count"] == len(row["files"])
 
 
-def test_stage00_accepts_root_level_parquet_shards(tmp_path: Path) -> None:
+def test_routing_accepts_root_level_parquet_shards(tmp_path: Path) -> None:
     input_root = tmp_path / "input"
-    _write_stage00_shard_file(
+    _write_routing_shard_file(
         input_root,
         "batch-001",
         [
@@ -437,14 +433,14 @@ def test_stage00_accepts_root_level_parquet_shards(tmp_path: Path) -> None:
         ],
     )
 
-    out_dir = tmp_path / "stage00"
-    report_path = run_stage00(
-        Stage00Config(
-            input_root=input_root,
-            output_dir=out_dir,
+    out_dir = tmp_path / "routing"
+    report_path = route_contributions(
+        RoutingConfig(
+            input_shards_dir=input_root,
+            routed_dir=out_dir,
             mag_config=MagLevelConfig(v_mag=6.5),
-            bucket_size=100,
-            batch_size=10,
+            bucket_rows=100,
+            scan_batch_rows=10,
         )
     )
 
@@ -456,9 +452,9 @@ def test_stage00_accepts_root_level_parquet_shards(tmp_path: Path) -> None:
     assert _group_checksums(report).keys() == {("", "batch-001", "pack")}
 
 
-def test_stage00_cli_accepts_shard_option(tmp_path: Path) -> None:
+def test_routing_cli_accepts_shard_option(tmp_path: Path) -> None:
     input_root = tmp_path / "input"
-    _write_stage00_shard_file(
+    _write_routing_shard_file(
         input_root,
         "batch-001",
         [
@@ -472,58 +468,28 @@ def test_stage00_cli_accepts_shard_option(tmp_path: Path) -> None:
         ],
     )
     project_path = tmp_path / "project.toml"
-    out_dir = tmp_path / "stage00"
+    out_dir = tmp_path / "routing"
     project_path.write_text(
-        f"""
-format_version = 1
-
-[paths]
-merged_healpix_dir = "{input_root.as_posix()}"
-identifiers_map_path = "identifiers.parquet"
-stage00_output_dir = "{out_dir.as_posix()}"
-stage01_output_dir = "stage01"
-stage02_output_path = "stars.octree"
-identifiers_order_output_path = "identifiers.order"
-stage03_output_dir = "stage03"
-
-[stage00]
-batch_size = 10
-v_mag = 6.5
-bucket_size = 100
-fragment_target_rows = 100
-max_open_writers = 8
-compact_after_files = 0
-
-[stage01]
-input_glob = "stage00/**/*.parquet"
-batch_size = 100
-deep_shard_from_level = 99
-deep_prefix_bits = 3
-
-[stage02]
-max_open_files = 32
-
-[stage03]
-
-[[stage03.sidecars]]
-name = "meta"
-fields = []
-""".lstrip(),
+        project_text(
+            tmp_path,
+            input_shards_dir=input_root,
+            routed_dir=out_dir,
+        ),
         encoding="utf-8",
     )
 
     result = CliRunner().invoke(
         cli,
-        ["stage-00", "--project", str(project_path), "--shard", "batch-001"],
+        ["route", "--project", str(project_path), "--shard", "batch-001"],
     )
 
     assert result.exit_code == 0
     assert "input_shards=1" in result.output
-    report = json.loads((out_dir / "stage00-report.json").read_text(encoding="utf-8"))
+    report = json.loads((out_dir / "routing-report.json").read_text(encoding="utf-8"))
     assert report["processed_input_shards"] == ["batch-001"]
 
 
-def test_stage00_group_checksums_do_not_depend_on_fragment_boundaries(
+def test_routing_group_checksums_do_not_depend_on_fragment_boundaries(
     tmp_path: Path,
 ) -> None:
     input_root = tmp_path / "input"
@@ -537,26 +503,26 @@ def test_stage00_group_checksums_do_not_depend_on_fragment_boundaries(
         }
         for idx in range(5)
     ]
-    _write_stage00_pixel(input_root, "200", rows)
+    _write_routing_pixel(input_root, "200", rows)
 
-    compact_report_path = run_stage00(
-        Stage00Config(
-            input_root=input_root,
-            output_dir=tmp_path / "compact",
+    compact_report_path = route_contributions(
+        RoutingConfig(
+            input_shards_dir=input_root,
+            routed_dir=tmp_path / "compact",
             mag_config=MagLevelConfig(v_mag=6.5),
-            bucket_size=100,
-            batch_size=10,
+            bucket_rows=100,
+            scan_batch_rows=10,
             fragment_target_rows=10,
             compact_after_files=0,
         )
     )
-    split_report_path = run_stage00(
-        Stage00Config(
-            input_root=input_root,
-            output_dir=tmp_path / "split",
+    split_report_path = route_contributions(
+        RoutingConfig(
+            input_shards_dir=input_root,
+            routed_dir=tmp_path / "split",
             mag_config=MagLevelConfig(v_mag=6.5),
-            bucket_size=100,
-            batch_size=10,
+            bucket_rows=100,
+            scan_batch_rows=10,
             fragment_target_rows=2,
             compact_after_files=0,
         )
@@ -569,11 +535,11 @@ def test_stage00_group_checksums_do_not_depend_on_fragment_boundaries(
     assert _group_checksums(compact_report) == _group_checksums(split_report)
 
 
-def test_stage00_rewrites_nested_octant_files_without_partition_columns(
+def test_routing_rewrites_nested_octant_files_without_partition_columns(
     tmp_path: Path,
 ) -> None:
     input_root = tmp_path / "input"
-    _write_stage00_pixel(
+    _write_routing_pixel(
         input_root,
         "448",
         [
@@ -588,14 +554,14 @@ def test_stage00_rewrites_nested_octant_files_without_partition_columns(
         ],
     )
 
-    out_dir = tmp_path / "stage00"
-    report_path = run_stage00(
-        Stage00Config(
-            input_root=input_root,
-            output_dir=out_dir,
+    out_dir = tmp_path / "routing"
+    report_path = route_contributions(
+        RoutingConfig(
+            input_shards_dir=input_root,
+            routed_dir=out_dir,
             mag_config=MagLevelConfig(v_mag=6.5),
-            bucket_size=2,
-            batch_size=10,
+            bucket_rows=2,
+            scan_batch_rows=10,
         )
     )
 
@@ -610,9 +576,9 @@ def test_stage00_rewrites_nested_octant_files_without_partition_columns(
     )
 
 
-def test_stage00_rolls_fragments_by_target_rows(tmp_path: Path) -> None:
+def test_routing_rolls_fragments_by_target_rows(tmp_path: Path) -> None:
     input_root = tmp_path / "input"
-    _write_stage00_pixel(
+    _write_routing_pixel(
         input_root,
         "200",
         [
@@ -627,14 +593,14 @@ def test_stage00_rolls_fragments_by_target_rows(tmp_path: Path) -> None:
         ],
     )
 
-    out_dir = tmp_path / "stage00"
-    report_path = run_stage00(
-        Stage00Config(
-            input_root=input_root,
-            output_dir=out_dir,
+    out_dir = tmp_path / "routing"
+    report_path = route_contributions(
+        RoutingConfig(
+            input_shards_dir=input_root,
+            routed_dir=out_dir,
             mag_config=MagLevelConfig(v_mag=6.5),
-            bucket_size=100,
-            batch_size=10,
+            bucket_rows=100,
+            scan_batch_rows=10,
             fragment_target_rows=2,
             compact_after_files=0,
         )
@@ -646,7 +612,7 @@ def test_stage00_rolls_fragments_by_target_rows(tmp_path: Path) -> None:
     assert [pq.ParquetFile(path).metadata.num_rows for path in files] == [2, 2, 1]
 
 
-def test_stage00_normalizes_legacy_quality_flags_schema_drift(
+def test_routing_normalizes_legacy_quality_flags_schema_drift(
     tmp_path: Path,
 ) -> None:
     input_root = tmp_path / "input"
@@ -669,17 +635,17 @@ def test_stage00_normalizes_legacy_quality_flags_schema_drift(
         pixel_dir / "part-1.parquet",
     )
 
-    out_dir = tmp_path / "stage00"
-    report_path = run_stage00(
-        Stage00Config(
-            input_root=input_root,
-            output_dir=out_dir,
+    out_dir = tmp_path / "routing"
+    report_path = route_contributions(
+        RoutingConfig(
+            input_shards_dir=input_root,
+            routed_dir=out_dir,
             mag_config=MagLevelConfig(v_mag=6.5),
-            bucket_size=100,
-            batch_size=10,
+            bucket_rows=100,
+            scan_batch_rows=10,
             fragment_target_rows=10,
             compact_after_files=0,
-            input_filter=STAGE00_INPUT_FILTER_RAW_CARTESIAN,
+            input_mode=ROUTING_INPUT_MODE_CARTESIAN,
         )
     )
 
@@ -689,7 +655,7 @@ def test_stage00_normalizes_legacy_quality_flags_schema_drift(
     assert pq.read_schema(fragment).field("quality_flags").type == pa.uint16()
 
 
-def test_stage00_rejects_out_of_range_legacy_quality_flags(tmp_path: Path) -> None:
+def test_routing_rejects_out_of_range_legacy_quality_flags(tmp_path: Path) -> None:
     input_root = tmp_path / "input"
     pixel_dir = input_root / "202"
     pixel_dir.mkdir(parents=True)
@@ -708,18 +674,18 @@ def test_stage00_rejects_out_of_range_legacy_quality_flags(tmp_path: Path) -> No
     )
 
     with pytest.raises(ValueError, match="cannot safely normalize.*quality_flags"):
-        run_stage00(
-            Stage00Config(
-                input_root=input_root,
-                output_dir=tmp_path / "stage00",
+        route_contributions(
+            RoutingConfig(
+                input_shards_dir=input_root,
+                routed_dir=tmp_path / "routing",
                 mag_config=MagLevelConfig(v_mag=6.5),
-                bucket_size=100,
-                batch_size=10,
+                bucket_rows=100,
+                scan_batch_rows=10,
             )
         )
 
 
-def test_stage00_still_rejects_unrelated_schema_drift(tmp_path: Path) -> None:
+def test_routing_still_rejects_unrelated_schema_drift(tmp_path: Path) -> None:
     input_root = tmp_path / "input"
     pixel_dir = input_root / "202"
     pixel_dir.mkdir(parents=True)
@@ -741,18 +707,18 @@ def test_stage00_still_rejects_unrelated_schema_drift(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="schema changed"):
-        run_stage00(
-            Stage00Config(
-                input_root=input_root,
-                output_dir=tmp_path / "stage00",
+        route_contributions(
+            RoutingConfig(
+                input_shards_dir=input_root,
+                routed_dir=tmp_path / "routing",
                 mag_config=MagLevelConfig(v_mag=6.5),
-                bucket_size=100,
-                batch_size=10,
+                bucket_rows=100,
+                scan_batch_rows=10,
             )
         )
 
 
-def test_stage00_compacts_repeated_small_fragments_after_lru_churn(
+def test_routing_compacts_repeated_small_fragments_after_lru_churn(
     tmp_path: Path,
 ) -> None:
     input_root = tmp_path / "input"
@@ -786,9 +752,9 @@ def test_stage00_compacts_repeated_small_fragments_after_lru_churn(
             "mag_abs": 8.2,
         },
     ]
-    _write_stage00_pixel(input_root, "201", first_part, part_name="part-0.parquet")
+    _write_routing_pixel(input_root, "201", first_part, part_name="part-0.parquet")
     for part_idx in range(1, 3):
-        _write_stage00_pixel(
+        _write_routing_pixel(
             input_root,
             "201",
             [
@@ -810,14 +776,14 @@ def test_stage00_compacts_repeated_small_fragments_after_lru_churn(
             part_name=f"part-{part_idx}.parquet",
         )
 
-    out_dir = tmp_path / "stage00"
-    report_path = run_stage00(
-        Stage00Config(
-            input_root=input_root,
-            output_dir=out_dir,
+    out_dir = tmp_path / "routing"
+    report_path = route_contributions(
+        RoutingConfig(
+            input_shards_dir=input_root,
+            routed_dir=out_dir,
             mag_config=MagLevelConfig(v_mag=6.5),
-            bucket_size=4,
-            batch_size=10,
+            bucket_rows=4,
+            scan_batch_rows=10,
             fragment_target_rows=10,
             max_open_writers=1,
             compact_after_files=2,
@@ -835,11 +801,11 @@ def test_stage00_compacts_repeated_small_fragments_after_lru_churn(
     assert len(list((tree / "o=1").glob("shard-201-pack-*.parquet"))) == 1
 
 
-def test_stage00_replace_unchanged_shard_marks_no_dirty_groups(
+def test_routing_replace_unchanged_shard_marks_no_dirty_groups(
     tmp_path: Path,
 ) -> None:
     input_root = tmp_path / "input"
-    _write_stage00_pixel(
+    _write_routing_pixel(
         input_root,
         "100",
         [
@@ -852,7 +818,7 @@ def test_stage00_replace_unchanged_shard_marks_no_dirty_groups(
             }
         ],
     )
-    _write_stage00_pixel(
+    _write_routing_pixel(
         input_root,
         "101",
         [
@@ -865,16 +831,16 @@ def test_stage00_replace_unchanged_shard_marks_no_dirty_groups(
             }
         ],
     )
-    out_dir = tmp_path / "stage00"
-    run_stage00(_stage00_config(input_root, out_dir))
-    _clear_stage01_dirty(out_dir)
+    out_dir = tmp_path / "routing"
+    route_contributions(_routing_config(input_root, out_dir))
+    _clear_preparation_dirty(out_dir)
     unrelated_files = sorted(
         path.relative_to(out_dir).as_posix()
         for path in (out_dir / "tree").glob("shard-101-pack-*.parquet")
     )
 
-    report_path = run_stage00(
-        _stage00_config(
+    report_path = route_contributions(
+        _routing_config(
             input_root,
             out_dir,
             shard_ids=("100",),
@@ -883,14 +849,14 @@ def test_stage00_replace_unchanged_shard_marks_no_dirty_groups(
     )
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
+    state = json.loads((out_dir / "pipeline-state.json").read_text(encoding="utf-8"))
     assert report["replacement_mode"] is True
     assert report["processed_input_shards"] == ["100"]
     assert report["changed_group_count"] == 0
     assert report["unchanged_group_count"] == 1
     assert report["deleted_group_count"] == 0
-    assert state["dirty"]["stage01_groups"] == []
-    assert state["dirty"]["deleted_stage00_groups"] == []
+    assert state["dirty"]["preparation"]["group_keys"] == []
+    assert state["dirty"]["preparation"]["deleted_routed_group_keys"] == []
     assert (
         sorted(
             path.relative_to(out_dir).as_posix()
@@ -900,11 +866,11 @@ def test_stage00_replace_unchanged_shard_marks_no_dirty_groups(
     )
 
 
-def test_stage00_replace_changed_shard_marks_changed_group(
+def test_routing_replace_changed_shard_marks_changed_group(
     tmp_path: Path,
 ) -> None:
     input_root = tmp_path / "input"
-    _write_stage00_pixel(
+    _write_routing_pixel(
         input_root,
         "100",
         [
@@ -917,9 +883,9 @@ def test_stage00_replace_changed_shard_marks_changed_group(
             }
         ],
     )
-    out_dir = tmp_path / "stage00"
-    run_stage00(_stage00_config(input_root, out_dir))
-    _write_stage00_pixel(
+    out_dir = tmp_path / "routing"
+    route_contributions(_routing_config(input_root, out_dir))
+    _write_routing_pixel(
         input_root,
         "100",
         [
@@ -933,8 +899,8 @@ def test_stage00_replace_changed_shard_marks_changed_group(
         ],
     )
 
-    report_path = run_stage00(
-        _stage00_config(
+    report_path = route_contributions(
+        _routing_config(
             input_root,
             out_dir,
             shard_ids=("100",),
@@ -943,14 +909,14 @@ def test_stage00_replace_changed_shard_marks_changed_group(
     )
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
+    state = json.loads((out_dir / "pipeline-state.json").read_text(encoding="utf-8"))
     assert report["changed_group_count"] == 1
     assert report["unchanged_group_count"] == 0
     assert report["deleted_group_count"] == 0
-    assert state["dirty"]["stage01_groups"] == ["|100|pack"]
+    assert state["dirty"]["preparation"]["group_keys"] == ["|100|pack"]
 
 
-def test_stage00_replace_one_row_reuses_unchanged_groups_from_same_shard(
+def test_routing_replace_one_row_reuses_unchanged_groups_from_same_shard(
     tmp_path: Path,
 ) -> None:
     input_root = tmp_path / "input"
@@ -970,15 +936,17 @@ def test_stage00_replace_one_row_reuses_unchanged_groups_from_same_shard(
             "mag_abs": 7.1,
         },
     ]
-    _write_stage00_pixel(input_root, "100", original_rows)
-    out_dir = tmp_path / "stage00"
-    run_stage00(_stage00_config(input_root, out_dir, bucket_size=2))
-    _clear_stage01_dirty(out_dir)
+    _write_routing_pixel(input_root, "100", original_rows)
+    out_dir = tmp_path / "routing"
+    route_contributions(_routing_config(input_root, out_dir, bucket_size=2))
+    _clear_preparation_dirty(out_dir)
 
     before_state = json.loads(
-        (out_dir / "stage-state.json").read_text(encoding="utf-8")
+        (out_dir / "pipeline-state.json").read_text(encoding="utf-8")
     )
-    before_groups = {group["key"]: group for group in before_state["stage00_groups"]}
+    before_groups = {
+        group["key"]: group for group in before_state["products"]["routed_groups"]
+    }
     unchanged_key = "o=1|100|pack"
     changed_key = "o=0|100|pack"
     assert set(before_groups) == {changed_key, unchanged_key}
@@ -995,9 +963,9 @@ def test_stage00_replace_one_row_reuses_unchanged_groups_from_same_shard(
 
     replacement_rows = [dict(row) for row in original_rows]
     replacement_rows[0]["source_id"] = "changed-after"
-    _write_stage00_pixel(input_root, "100", replacement_rows)
-    report_path = run_stage00(
-        _stage00_config(
+    _write_routing_pixel(input_root, "100", replacement_rows)
+    report_path = route_contributions(
+        _routing_config(
             input_root,
             out_dir,
             bucket_size=2,
@@ -1007,13 +975,17 @@ def test_stage00_replace_one_row_reuses_unchanged_groups_from_same_shard(
     )
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    after_state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
-    after_groups = {group["key"]: group for group in after_state["stage00_groups"]}
+    after_state = json.loads(
+        (out_dir / "pipeline-state.json").read_text(encoding="utf-8")
+    )
+    after_groups = {
+        group["key"]: group for group in after_state["products"]["routed_groups"]
+    }
     assert report["changed_group_count"] == 1
     assert report["unchanged_group_count"] == 1
     assert report["deleted_group_count"] == 0
-    assert after_state["dirty"]["stage01_groups"] == [changed_key]
-    assert after_state["dirty"]["deleted_stage00_groups"] == []
+    assert after_state["dirty"]["preparation"]["group_keys"] == [changed_key]
+    assert after_state["dirty"]["preparation"]["deleted_routed_group_keys"] == []
 
     assert after_groups[unchanged_key] == before_groups[unchanged_key]
     assert [
@@ -1026,10 +998,10 @@ def test_stage00_replace_one_row_reuses_unchanged_groups_from_same_shard(
         != before_groups[changed_key]["content_checksum"]
     )
     assert all(not path.exists() for path in old_changed_paths)
-    assert not (out_dir / ".stage00-transaction.json").exists()
+    assert not (out_dir / ".routing-transaction.json").exists()
 
 
-def test_stage00_replace_recovers_uncommitted_candidates(
+def test_routing_replace_recovers_uncommitted_candidates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1041,58 +1013,61 @@ def test_stage00_replace_recovers_uncommitted_candidates(
         "level": 1,
         "mag_abs": 7.0,
     }
-    _write_stage00_pixel(input_root, "100", [initial_row])
-    out_dir = tmp_path / "stage00"
-    run_stage00(_stage00_config(input_root, out_dir))
+    _write_routing_pixel(input_root, "100", [initial_row])
+    out_dir = tmp_path / "routing"
+    route_contributions(_routing_config(input_root, out_dir))
     before_state = json.loads(
-        (out_dir / "stage-state.json").read_text(encoding="utf-8")
+        (out_dir / "pipeline-state.json").read_text(encoding="utf-8")
     )
     published_paths = [
-        out_dir / value for value in before_state["stage00_groups"][0]["files"]
+        out_dir / value
+        for value in before_state["products"]["routed_groups"][0]["files"]
     ]
 
     replacement_row = dict(initial_row)
     replacement_row["source_id"] = "after"
-    _write_stage00_pixel(input_root, "100", [replacement_row])
-    original = stage00_module._replacement_group_reports
+    _write_routing_pixel(input_root, "100", [replacement_row])
+    original = routing_module._replacement_group_reports
 
     def interrupt_candidate_comparison(*args, **kwargs):
         raise RuntimeError("candidate comparison interrupted")
 
     monkeypatch.setattr(
-        stage00_module,
+        routing_module,
         "_replacement_group_reports",
         interrupt_candidate_comparison,
     )
-    config = _stage00_config(
+    config = _routing_config(
         input_root,
         out_dir,
         shard_ids=("100",),
         replace_shards=True,
     )
     with pytest.raises(RuntimeError, match="candidate comparison interrupted"):
-        run_stage00(config)
+        route_contributions(config)
 
     assert (
-        json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
+        json.loads((out_dir / "pipeline-state.json").read_text(encoding="utf-8"))
         == before_state
     )
     assert all(path.is_file() for path in published_paths)
-    assert (out_dir / ".stage00-transaction.json").is_file()
+    assert (out_dir / ".routing-transaction.json").is_file()
 
-    monkeypatch.setattr(stage00_module, "_replacement_group_reports", original)
-    run_stage00(config)
+    monkeypatch.setattr(routing_module, "_replacement_group_reports", original)
+    route_contributions(config)
 
-    after_state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
+    after_state = json.loads(
+        (out_dir / "pipeline-state.json").read_text(encoding="utf-8")
+    )
     assert (
-        after_state["stage00_groups"][0]["content_checksum"]
-        != before_state["stage00_groups"][0]["content_checksum"]
+        after_state["products"]["routed_groups"][0]["content_checksum"]
+        != before_state["products"]["routed_groups"][0]["content_checksum"]
     )
     assert all(not path.exists() for path in published_paths)
-    assert not (out_dir / ".stage00-transaction.json").exists()
+    assert not (out_dir / ".routing-transaction.json").exists()
 
 
-def test_stage00_replace_records_deleted_group(tmp_path: Path) -> None:
+def test_routing_replace_records_deleted_group(tmp_path: Path) -> None:
     input_root = tmp_path / "input"
     root_row = {
         "source": "manual",
@@ -1101,7 +1076,7 @@ def test_stage00_replace_records_deleted_group(tmp_path: Path) -> None:
         "level": 0,
         "mag_abs": 1.0,
     }
-    _write_stage00_pixel(
+    _write_routing_pixel(
         input_root,
         "200",
         [
@@ -1115,13 +1090,13 @@ def test_stage00_replace_records_deleted_group(tmp_path: Path) -> None:
             },
         ],
     )
-    out_dir = tmp_path / "stage00"
-    run_stage00(_stage00_config(input_root, out_dir, bucket_size=1))
-    _clear_stage01_dirty(out_dir)
-    _write_stage00_pixel(input_root, "200", [root_row])
+    out_dir = tmp_path / "routing"
+    route_contributions(_routing_config(input_root, out_dir, bucket_size=1))
+    _clear_preparation_dirty(out_dir)
+    _write_routing_pixel(input_root, "200", [root_row])
 
-    report_path = run_stage00(
-        _stage00_config(
+    report_path = route_contributions(
+        _routing_config(
             input_root,
             out_dir,
             bucket_size=1,
@@ -1131,19 +1106,19 @@ def test_stage00_replace_records_deleted_group(tmp_path: Path) -> None:
     )
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
+    state = json.loads((out_dir / "pipeline-state.json").read_text(encoding="utf-8"))
     assert report["changed_group_count"] == 0
     assert report["unchanged_group_count"] == 1
     assert report["deleted_group_count"] == 1
-    assert state["dirty"]["stage01_groups"] == []
-    assert state["dirty"]["deleted_stage00_groups"] == ["o=0|200|lim"]
+    assert state["dirty"]["preparation"]["group_keys"] == []
+    assert state["dirty"]["preparation"]["deleted_routed_group_keys"] == ["o=0|200|lim"]
 
 
-def test_stage00_replace_rejects_invalid_modes_and_identity_mismatch(
+def test_routing_replace_rejects_invalid_modes_and_identity_mismatch(
     tmp_path: Path,
 ) -> None:
     input_root = tmp_path / "input"
-    _write_stage00_pixel(
+    _write_routing_pixel(
         input_root,
         "100",
         [
@@ -1156,13 +1131,13 @@ def test_stage00_replace_rejects_invalid_modes_and_identity_mismatch(
             }
         ],
     )
-    out_dir = tmp_path / "stage00"
+    out_dir = tmp_path / "routing"
 
     with pytest.raises(ValueError, match="requires one or more --shard"):
-        run_stage00(_stage00_config(input_root, out_dir, replace_shards=True))
+        route_contributions(_routing_config(input_root, out_dir, replace_shards=True))
     with pytest.raises(ValueError, match="cannot be used with --force"):
-        run_stage00(
-            _stage00_config(
+        route_contributions(
+            _routing_config(
                 input_root,
                 out_dir,
                 shard_ids=("100",),
@@ -1171,8 +1146,8 @@ def test_stage00_replace_rejects_invalid_modes_and_identity_mismatch(
             )
         )
     with pytest.raises(FileNotFoundError, match="tree manifest"):
-        run_stage00(
-            _stage00_config(
+        route_contributions(
+            _routing_config(
                 input_root,
                 out_dir,
                 shard_ids=("100",),
@@ -1180,10 +1155,10 @@ def test_stage00_replace_rejects_invalid_modes_and_identity_mismatch(
             )
         )
 
-    run_stage00(_stage00_config(input_root, out_dir, bucket_size=100))
+    route_contributions(_routing_config(input_root, out_dir, bucket_size=100))
     with pytest.raises(ValueError, match="tree identity"):
-        run_stage00(
-            _stage00_config(
+        route_contributions(
+            _routing_config(
                 input_root,
                 out_dir,
                 bucket_size=99,
@@ -1193,12 +1168,12 @@ def test_stage00_replace_rejects_invalid_modes_and_identity_mismatch(
         )
 
 
-def test_stage00_resumes_after_uncommitted_shard_split(
+def test_routing_resumes_after_uncommitted_shard_split(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     input_root = tmp_path / "input"
-    _write_stage00_pixel(
+    _write_routing_pixel(
         input_root,
         "100",
         [
@@ -1211,7 +1186,7 @@ def test_stage00_resumes_after_uncommitted_shard_split(
             }
         ],
     )
-    _write_stage00_pixel(
+    _write_routing_pixel(
         input_root,
         "101",
         [
@@ -1224,9 +1199,9 @@ def test_stage00_resumes_after_uncommitted_shard_split(
             }
         ],
     )
-    out_dir = tmp_path / "stage00"
-    config = _stage00_config(input_root, out_dir, bucket_size=2)
-    original = stage00_module._process_input_shards
+    out_dir = tmp_path / "routing"
+    config = _routing_config(input_root, out_dir, bucket_size=2)
+    original = routing_module._process_input_shards
     failed = False
 
     def fail_after_second_shard(*args, **kwargs):
@@ -1239,39 +1214,39 @@ def test_stage00_resumes_after_uncommitted_shard_split(
         return result
 
     monkeypatch.setattr(
-        stage00_module,
+        routing_module,
         "_process_input_shards",
         fail_after_second_shard,
     )
     with pytest.raises(RuntimeError, match="simulated interruption"):
-        run_stage00(config)
+        route_contributions(config)
 
-    state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
-    assert state["stage00_build"]["completed_shards"] == ["100"]
-    committed_path = out_dir / state["stage00_groups"][0]["files"][0]
+    state = json.loads((out_dir / "pipeline-state.json").read_text(encoding="utf-8"))
+    assert state["builds"]["routing"]["completed_shards"] == ["100"]
+    committed_path = out_dir / state["products"]["routed_groups"][0]["files"][0]
     assert committed_path.is_file()
-    assert (out_dir / ".stage00-transaction.json").is_file()
+    assert (out_dir / ".routing-transaction.json").is_file()
 
-    monkeypatch.setattr(stage00_module, "_process_input_shards", original)
-    report_path = run_stage00(config)
+    monkeypatch.setattr(routing_module, "_process_input_shards", original)
+    report_path = route_contributions(config)
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
+    state = json.loads((out_dir / "pipeline-state.json").read_text(encoding="utf-8"))
     assert report["rows_current"] == 2
     assert report["lower_mag_limited_nodes"] == 1
-    assert state["stage00_build"]["status"] == "complete"
-    assert state["stage00_build"]["completed_shards"] == ["100", "101"]
-    assert not (out_dir / ".stage00-transaction.json").exists()
+    assert state["builds"]["routing"]["status"] == "complete"
+    assert state["builds"]["routing"]["completed_shards"] == ["100", "101"]
+    assert not (out_dir / ".routing-transaction.json").exists()
     assert not committed_path.exists()
 
 
-def test_stage00_resumes_group_checksums(
+def test_routing_resumes_group_checksums(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     input_root = tmp_path / "input"
     for shard_id, node_id in (("100", 0), ("101", 1)):
-        _write_stage00_pixel(
+        _write_routing_pixel(
             input_root,
             shard_id,
             [
@@ -1284,9 +1259,9 @@ def test_stage00_resumes_group_checksums(
                 }
             ],
         )
-    out_dir = tmp_path / "stage00"
-    config = _stage00_config(input_root, out_dir)
-    original = stage00_module._stage00_group_checksum
+    out_dir = tmp_path / "routing"
+    config = _routing_config(input_root, out_dir)
+    original = routing_module._routing_group_checksum
     calls = 0
 
     def fail_on_second_group(paths):
@@ -1297,16 +1272,16 @@ def test_stage00_resumes_group_checksums(
         return original(paths)
 
     monkeypatch.setattr(
-        stage00_module,
-        "_stage00_group_checksum",
+        routing_module,
+        "_routing_group_checksum",
         fail_on_second_group,
     )
     with pytest.raises(RuntimeError, match="checksum interruption"):
-        run_stage00(config)
+        route_contributions(config)
 
-    state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
-    assert state["stage00_build"]["status"] == "checksumming"
-    checkpoints = list((out_dir / ".stage00-checksums").glob("*.json"))
+    state = json.loads((out_dir / "pipeline-state.json").read_text(encoding="utf-8"))
+    assert state["builds"]["routing"]["status"] == "checksumming"
+    checkpoints = list((out_dir / ".routing-checksums").glob("*.json"))
     assert len(checkpoints) == 1
 
     resumed_calls = 0
@@ -1317,28 +1292,26 @@ def test_stage00_resumes_group_checksums(
         return original(paths)
 
     monkeypatch.setattr(
-        stage00_module,
-        "_stage00_group_checksum",
+        routing_module,
+        "_routing_group_checksum",
         count_resumed_group,
     )
-    run_stage00(config)
+    route_contributions(config)
 
-    state = json.loads((out_dir / "stage-state.json").read_text(encoding="utf-8"))
+    state = json.loads((out_dir / "pipeline-state.json").read_text(encoding="utf-8"))
     assert resumed_calls == 1
-    assert state["stage00_build"]["status"] == "complete"
-    assert all("content_checksum" in group for group in state["stage00_groups"])
+    assert state["builds"]["routing"]["status"] == "complete"
+    assert all(
+        "content_checksum" in group for group in state["products"]["routed_groups"]
+    )
 
 
-def test_stage00_help_contains_packed_options() -> None:
+def test_route_help_contains_selection_and_replacement_options() -> None:
     runner = CliRunner()
-    result = runner.invoke(cli, ["stage-00", "--help"])
+    result = runner.invoke(cli, ["route", "--help"])
     assert result.exit_code == 0
-    assert "--bucket-size" in result.output
-    assert "--fragment-target-rows" in result.output
-    assert "--max-open-writers" in result.output
-    assert "--compact-after-files" in result.output
-    assert "--input-filter" in result.output
+    assert "--project" in result.output
     assert "--shard" in result.output
     assert "--replace-shards" in result.output
-    assert "--healpix" in result.output
-    assert "adaptive Stage 00 staging buckets" in result.output
+    assert "--max-shards" in result.output
+    assert "adaptive contribution buckets" in result.output

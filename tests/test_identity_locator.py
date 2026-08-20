@@ -10,15 +10,8 @@ from uuid import UUID
 import pytest
 from click.testing import CliRunner
 
-from combine_helpers import (
-    PayloadNode,
-    build_identifiers_intermediates,
-    build_intermediates,
-)
 from foundinspace.octree._cli import cli
-from foundinspace.octree.combine import CombinePlan, combine_octree
-from foundinspace.octree.combine.records import PackedDescriptorFields
-from foundinspace.octree.identifiers_order import combine_identifiers_order
+from foundinspace.octree.identifiers_order import pack_identifiers_order
 from foundinspace.octree.identity_locator import (
     IdentityLocatorBenchmarkConfig,
     IdentityLocatorBuildConfig,
@@ -43,6 +36,14 @@ from foundinspace.octree.identity_locator.leaf import (
     encode_compact_leaf,
     parse_compact_leaf,
 )
+from foundinspace.octree.packing import PackingPlan, pack_octree
+from foundinspace.octree.packing.records import PackedDescriptorFields
+from packing_helpers import (
+    PayloadNode,
+    build_identifiers_intermediates,
+    build_intermediates,
+)
+from project_helpers import project_text
 
 DATASET_UUID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 ORDER_UUID = UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
@@ -76,16 +77,16 @@ def _build_dataset(
     )
     render_path = root / "stars.octree"
     order_path = root / "identifiers.order"
-    combine_octree(
+    pack_octree(
         render_manifest,
         render_path,
-        plan=CombinePlan(max_open_files=2),
+        plan=PackingPlan(max_open_files=2),
         descriptor=PackedDescriptorFields(
             artifact_kind="render",
             dataset_uuid=DATASET_UUID,
         ),
     )
-    combine_identifiers_order(
+    pack_identifiers_order(
         identifiers_manifest,
         order_path,
         parent_dataset_uuid=order_parent_uuid,
@@ -121,34 +122,11 @@ def _config(
 def _write_project(project_path: Path, render_path: Path, order_path: Path) -> None:
     root = project_path.parent
     project_path.write_text(
-        f"""
-format_version = 1
-
-[paths]
-merged_healpix_dir = "{root / "merged"}"
-identifiers_map_path = "{root / "identifiers-map.parquet"}"
-stage00_output_dir = "{root / "stage00"}"
-stage01_output_dir = "{root / "stage01"}"
-stage02_output_path = "{render_path}"
-identifiers_order_output_path = "{order_path}"
-stage03_output_dir = "{root / "stage03"}"
-
-[stage00]
-batch_size = 1000
-v_mag = 6.5
-
-[stage01]
-input_glob = "{root / "stage00" / "**" / "*.parquet"}"
-batch_size = 1000
-deep_shard_from_level = 8
-deep_prefix_bits = 3
-
-[stage02]
-max_open_files = 4
-
-[stage03]
-""".strip()
-        + "\n",
+        project_text(
+            root,
+            render_output_path=render_path,
+            identifiers_order_output_path=order_path,
+        ),
         encoding="utf-8",
     )
 

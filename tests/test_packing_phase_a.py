@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import gzip
 
-from combine_helpers import PayloadNode, build_intermediates
-from foundinspace.octree.combine.dfs import iter_cells_dfs
-from foundinspace.octree.combine.lookup import FixedRecordFile
-from foundinspace.octree.combine.pipeline import CombinePlan, relocate_payloads_dfs
-from foundinspace.octree.combine.records import (
+from foundinspace.octree.packing.dfs import iter_cells_dfs
+from foundinspace.octree.packing.lookup import FixedRecordFile
+from foundinspace.octree.packing.pipeline import PackingPlan, relocate_payloads_dfs
+from foundinspace.octree.packing.records import (
     RELOC_HEADER_FMT,
     RELOC_MAGIC,
     RELOC_RECORD_FMT,
 )
+from packing_helpers import PayloadNode, build_intermediates
 
 
 def test_iter_cells_dfs_order(tmp_path) -> None:
@@ -40,7 +40,7 @@ def test_relocate_payloads_writes_payloads_and_relocation(tmp_path) -> None:
     with open(out, "wb") as fp:
         fp.write(b"\x00" * 64)
         result = relocate_payloads_dfs(
-            manifest_path, fp, plan=CombinePlan(max_open_files=2)
+            manifest_path, fp, plan=PackingPlan(max_open_files=2)
         )
 
     payload_bytes = out.read_bytes()[64 : result.payload_end_offset]
