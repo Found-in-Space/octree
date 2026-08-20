@@ -6,88 +6,113 @@ from typing import Any
 
 import tomllib
 
-from .config import DEFAULT_DEEP_SHARD_FROM_LEVEL, DEFAULT_MAG_VIS, DEFAULT_MAX_LEVEL
+from .config import (
+    DEFAULT_CLASSIC_MAX_LEVEL,
+    DEFAULT_CLASSIC_PARTITION_FROM_LEVEL,
+    DEFAULT_CLASSIC_PARTITION_PREFIX_BITS,
+    DEFAULT_DEEP_SHARD_FROM_LEVEL,
+    DEFAULT_MAG_VIS,
+    DEFAULT_TERMINAL_WATERLINE,
+    MORTON_BITS,
+)
 
-FORMAT_VERSION = 1
-_DEFAULT_MERGED_HEALPIX_DIR = "../data/processed/merged/healpix"
+_DEFAULT_INPUT_SHARDS_DIR = "../data/processed/merged/healpix"
 _DEFAULT_IDENTIFIERS_MAP_PATH = "../data/processed/identifiers_map.parquet"
-_DEFAULT_STAGE00_OUTPUT_DIR = "artifacts/stage00"
-_DEFAULT_STAGE01_OUTPUT_DIR = "artifacts/stage01"
-_DEFAULT_STAGE02_OUTPUT_PATH = "artifacts/stars.octree"
-_DEFAULT_IDENTIFIERS_ORDER_OUTPUT_PATH = "artifacts/identifiers.order"
-_DEFAULT_STAGE03_OUTPUT_DIR = "artifacts/stage03"
+_DEFAULT_ROUTED_DIR = "octree/routed"
+_DEFAULT_PREPARED_DIR = "octree/prepared"
+_DEFAULT_MATERIALIZED_DIR = "octree/materialized"
+_DEFAULT_BUILD_WORK_DIR = "octree/work"
+_DEFAULT_RENDER_OUTPUT_PATH = "products/stars-v2.octree"
+_DEFAULT_IDENTIFIERS_ORDER_OUTPUT_PATH = "products/identifiers-v2.order"
+_DEFAULT_SIDECARS_OUTPUT_DIR = "products/sidecars"
+_DEFAULT_SIDECARS_WORK_DIR = "octree/sidecars-work"
 
-_PATH_KEYS = {
-    "merged_healpix_dir",
-    "identifiers_map_path",
-    "stage00_output_dir",
-    "stage01_output_dir",
-    "stage02_output_path",
-    "identifiers_order_output_path",
-    "stage03_output_dir",
-}
-_STAGE00_KEYS = {"batch_size", "v_mag", "max_level"}
-_STAGE01_KEYS = {
-    "input_glob",
-    "batch_size",
-    "deep_shard_from_level",
-    "deep_prefix_bits",
-}
-_STAGE02_KEYS = {"max_open_files"}
-_STAGE03_KEYS = {"sidecars"}
-_STAGE03_SIDECAR_KEYS = {"name", "fields"}
+_ROUTING_INPUT_MODES = {"cartesian", "pre-routed"}
+_PROFILE_NAMES = {"classic", "terminal-packed"}
+_INDEX_EMISSION_STRATEGIES = {"temp-pwrite-batched", "forward"}
 
 
 @dataclass(frozen=True, slots=True)
 class ProjectPaths:
-    merged_healpix_dir: Path
+    input_shards_dir: Path
     identifiers_map_path: Path
-    stage00_output_dir: Path
-    stage01_output_dir: Path
-    stage02_output_path: Path
+    routed_dir: Path
+    prepared_dir: Path
+    materialized_dir: Path
+    build_work_dir: Path
+    render_output_path: Path
     identifiers_order_output_path: Path
-    stage03_output_dir: Path
+    sidecars_output_dir: Path
+    sidecars_work_dir: Path
 
 
 @dataclass(frozen=True, slots=True)
-class Stage00ProjectConfig:
-    batch_size: int
-    v_mag: float
-    max_level: int
+class DatasetProjectConfig:
+    limiting_magnitude: float
 
 
 @dataclass(frozen=True, slots=True)
-class Stage01ProjectConfig:
-    input_glob: str
-    batch_size: int
-    deep_shard_from_level: int
-    deep_prefix_bits: int
-
-
-@dataclass(frozen=True, slots=True)
-class Stage02ProjectConfig:
+class ExecutionProjectConfig:
+    batch_rows: int
     max_open_files: int
 
 
 @dataclass(frozen=True, slots=True)
-class SidecarProjectConfig:
+class RoutingProjectConfig:
+    input_mode: str
+    scan_batch_rows: int
+    bucket_rows: int
+    fragment_target_rows: int
+    max_open_writers: int
+    compact_after_files: int
+
+
+@dataclass(frozen=True, slots=True)
+class MaterializationProjectConfig:
+    partition_from_level: int
+    partition_prefix_bits: int
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileProjectConfig:
+    name: str
+    max_level: int
+    terminal_waterline: int | None
+
+    @property
+    def star_format_version(self) -> int:
+        return 2 if self.name == "terminal-packed" else 1
+
+
+@dataclass(frozen=True, slots=True)
+class PackingProjectConfig:
+    index_emission_strategy: str
+
+
+@dataclass(frozen=True, slots=True)
+class SidecarFamilyConfig:
     name: str
     fields: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class Stage03ProjectConfig:
-    sidecars: tuple[SidecarProjectConfig, ...]
+class SidecarsProjectConfig:
+    shard_from_level: int
+    shard_prefix_bits: int
+    families: tuple[SidecarFamilyConfig, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class OctreeProject:
     project_path: Path
     paths: ProjectPaths
-    stage00: Stage00ProjectConfig
-    stage01: Stage01ProjectConfig
-    stage02: Stage02ProjectConfig
-    stage03: Stage03ProjectConfig
+    dataset: DatasetProjectConfig
+    execution: ExecutionProjectConfig
+    routing: RoutingProjectConfig
+    materialization: MaterializationProjectConfig
+    profile: ProfileProjectConfig
+    packing: PackingProjectConfig
+    sidecars: SidecarsProjectConfig
 
 
 def _reject_env_expansion(value: str, *, field_name: str) -> None:
@@ -122,31 +147,25 @@ def _require_str(raw: dict[str, Any], key: str) -> str:
     value = raw.get(key)
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{key} must be a non-empty string")
-    return value
+    return value.strip()
 
 
 def _resolve_path(project_dir: Path, value: str, *, field_name: str) -> Path:
     _reject_env_expansion(value, field_name=field_name)
     raw_path = Path(value)
-    if raw_path.is_absolute():
-        return raw_path
-    return project_dir / raw_path
+    return raw_path if raw_path.is_absolute() else project_dir / raw_path
 
 
-def _resolve_glob(project_dir: Path, value: str, *, field_name: str) -> str:
-    _reject_env_expansion(value, field_name=field_name)
-    raw_path = Path(value)
-    if raw_path.is_absolute():
-        return raw_path.as_posix()
-    return (project_dir / raw_path).as_posix()
-
-
-def _reject_unknown_keys(
-    raw: dict[str, Any], *, allowed: set[str], table_name: str
-) -> None:
-    unknown = sorted(set(raw) - allowed)
-    if unknown:
-        raise ValueError(f"Unknown key(s) in [{table_name}]: {', '.join(unknown)}")
+def _project_path(
+    project_dir: Path,
+    paths_raw: dict[str, Any],
+    key: str,
+) -> Path:
+    return _resolve_path(
+        project_dir,
+        _require_str(paths_raw, key),
+        field_name=f"paths.{key}",
+    )
 
 
 def load_project(project_path: Path) -> OctreeProject:
@@ -154,168 +173,201 @@ def load_project(project_path: Path) -> OctreeProject:
     with resolved_project_path.open("rb") as fp:
         raw = tomllib.load(fp)
 
-    format_version = raw.get("format_version")
-    if format_version != FORMAT_VERSION:
-        raise ValueError(
-            f"format_version must be {FORMAT_VERSION}, got {format_version!r}"
-        )
-
     project_dir = resolved_project_path.parent
     paths_raw = _require_table(raw, "paths")
-    stage00_raw = _require_table(raw, "stage00")
-    stage01_raw = _require_table(raw, "stage01")
-    stage02_raw = _require_table(raw, "stage02")
-    stage03_raw = _require_table(raw, "stage03")
-
-    _reject_unknown_keys(paths_raw, allowed=_PATH_KEYS, table_name="paths")
-    _reject_unknown_keys(stage00_raw, allowed=_STAGE00_KEYS, table_name="stage00")
-    _reject_unknown_keys(stage01_raw, allowed=_STAGE01_KEYS, table_name="stage01")
-    _reject_unknown_keys(stage02_raw, allowed=_STAGE02_KEYS, table_name="stage02")
-    _reject_unknown_keys(stage03_raw, allowed=_STAGE03_KEYS, table_name="stage03")
+    dataset_raw = _require_table(raw, "dataset")
+    execution_raw = _require_table(raw, "execution")
+    routing_raw = _require_table(raw, "routing")
+    materialization_raw = _require_table(raw, "materialization")
+    profile_raw = _require_table(raw, "profile")
+    packing_raw = _require_table(raw, "packing")
+    sidecars_raw = _require_table(raw, "sidecars")
 
     paths = ProjectPaths(
-        merged_healpix_dir=_resolve_path(
-            project_dir,
-            _require_str(paths_raw, "merged_healpix_dir"),
-            field_name="paths.merged_healpix_dir",
+        input_shards_dir=_project_path(project_dir, paths_raw, "input_shards_dir"),
+        identifiers_map_path=_project_path(
+            project_dir, paths_raw, "identifiers_map_path"
         ),
-        identifiers_map_path=_resolve_path(
-            project_dir,
-            _require_str(paths_raw, "identifiers_map_path"),
-            field_name="paths.identifiers_map_path",
+        routed_dir=_project_path(project_dir, paths_raw, "routed_dir"),
+        prepared_dir=_project_path(project_dir, paths_raw, "prepared_dir"),
+        materialized_dir=_project_path(project_dir, paths_raw, "materialized_dir"),
+        build_work_dir=_project_path(project_dir, paths_raw, "build_work_dir"),
+        render_output_path=_project_path(project_dir, paths_raw, "render_output_path"),
+        identifiers_order_output_path=_project_path(
+            project_dir, paths_raw, "identifiers_order_output_path"
         ),
-        stage00_output_dir=_resolve_path(
-            project_dir,
-            _require_str(paths_raw, "stage00_output_dir"),
-            field_name="paths.stage00_output_dir",
+        sidecars_output_dir=_project_path(
+            project_dir, paths_raw, "sidecars_output_dir"
         ),
-        stage01_output_dir=_resolve_path(
-            project_dir,
-            _require_str(paths_raw, "stage01_output_dir"),
-            field_name="paths.stage01_output_dir",
-        ),
-        stage02_output_path=_resolve_path(
-            project_dir,
-            _require_str(paths_raw, "stage02_output_path"),
-            field_name="paths.stage02_output_path",
-        ),
-        identifiers_order_output_path=_resolve_path(
-            project_dir,
-            _require_str(paths_raw, "identifiers_order_output_path"),
-            field_name="paths.identifiers_order_output_path",
-        ),
-        stage03_output_dir=_resolve_path(
-            project_dir,
-            _require_str(paths_raw, "stage03_output_dir"),
-            field_name="paths.stage03_output_dir",
-        ),
+        sidecars_work_dir=_project_path(project_dir, paths_raw, "sidecars_work_dir"),
     )
 
-    stage00 = Stage00ProjectConfig(
-        batch_size=_require_int(stage00_raw, "batch_size"),
-        v_mag=_require_float(stage00_raw, "v_mag"),
-        max_level=_require_int(stage00_raw, "max_level"),
+    dataset = DatasetProjectConfig(
+        limiting_magnitude=_require_float(dataset_raw, "limiting_magnitude")
     )
-    if stage00.batch_size <= 0:
-        raise ValueError("stage00.batch_size must be > 0")
-    if stage00.max_level < 0:
-        raise ValueError("stage00.max_level must be >= 0")
-
-    stage01 = Stage01ProjectConfig(
-        input_glob=_resolve_glob(
-            project_dir,
-            _require_str(stage01_raw, "input_glob"),
-            field_name="stage01.input_glob",
-        ),
-        batch_size=_require_int(stage01_raw, "batch_size"),
-        deep_shard_from_level=_require_int(stage01_raw, "deep_shard_from_level"),
-        deep_prefix_bits=_require_int(stage01_raw, "deep_prefix_bits"),
+    execution = ExecutionProjectConfig(
+        batch_rows=_require_int(execution_raw, "batch_rows"),
+        max_open_files=_require_int(execution_raw, "max_open_files"),
     )
-    if stage01.batch_size <= 0:
-        raise ValueError("stage01.batch_size must be > 0")
-    if stage01.deep_shard_from_level < 0:
-        raise ValueError("stage01.deep_shard_from_level must be >= 0")
-    if stage01.deep_prefix_bits < 0:
-        raise ValueError("stage01.deep_prefix_bits must be >= 0")
+    if execution.batch_rows <= 0:
+        raise ValueError("execution.batch_rows must be > 0")
+    if execution.max_open_files <= 0:
+        raise ValueError("execution.max_open_files must be > 0")
 
-    stage02 = Stage02ProjectConfig(
-        max_open_files=_require_int(stage02_raw, "max_open_files"),
+    routing = RoutingProjectConfig(
+        input_mode=_require_str(routing_raw, "input_mode"),
+        scan_batch_rows=_require_int(routing_raw, "scan_batch_rows"),
+        bucket_rows=_require_int(routing_raw, "bucket_rows"),
+        fragment_target_rows=_require_int(routing_raw, "fragment_target_rows"),
+        max_open_writers=_require_int(routing_raw, "max_open_writers"),
+        compact_after_files=_require_int(routing_raw, "compact_after_files"),
     )
-    if stage02.max_open_files <= 0:
-        raise ValueError("stage02.max_open_files must be > 0")
-
-    sidecars_raw = stage03_raw.get("sidecars", [])
-    if not isinstance(sidecars_raw, list):
-        raise ValueError("stage03.sidecars must be an array of tables")
-    seen_names: set[str] = set()
-    sidecars: list[SidecarProjectConfig] = []
-    for idx, sidecar_raw in enumerate(sidecars_raw):
-        if not isinstance(sidecar_raw, dict):
-            raise ValueError(f"stage03.sidecars[{idx}] must be a table")
-        _reject_unknown_keys(
-            sidecar_raw,
-            allowed=_STAGE03_SIDECAR_KEYS,
-            table_name=f"stage03.sidecars[{idx}]",
+    if routing.input_mode not in _ROUTING_INPUT_MODES:
+        raise ValueError(
+            "routing.input_mode must be one of "
+            f"{sorted(_ROUTING_INPUT_MODES)}, got {routing.input_mode!r}"
         )
-        name = _require_str(sidecar_raw, "name").strip()
+    for field_name in (
+        "scan_batch_rows",
+        "bucket_rows",
+        "fragment_target_rows",
+        "max_open_writers",
+    ):
+        if getattr(routing, field_name) <= 0:
+            raise ValueError(f"routing.{field_name} must be > 0")
+    if routing.compact_after_files < 0:
+        raise ValueError("routing.compact_after_files must be >= 0")
+
+    materialization = MaterializationProjectConfig(
+        partition_from_level=_require_int(materialization_raw, "partition_from_level"),
+        partition_prefix_bits=_require_int(
+            materialization_raw, "partition_prefix_bits"
+        ),
+    )
+    if materialization.partition_from_level < 0:
+        raise ValueError("materialization.partition_from_level must be >= 0")
+    if materialization.partition_prefix_bits < 0:
+        raise ValueError("materialization.partition_prefix_bits must be >= 0")
+
+    profile_name = _require_str(profile_raw, "name")
+    if profile_name not in _PROFILE_NAMES:
+        raise ValueError(
+            f"profile.name must be one of {sorted(_PROFILE_NAMES)}, got {profile_name!r}"
+        )
+    max_level = _require_int(profile_raw, "max_level")
+    if max_level < 0 or max_level > MORTON_BITS:
+        raise ValueError(f"profile.max_level must be in 0..{MORTON_BITS}")
+    terminal_waterline = (
+        _require_int(profile_raw, "terminal_waterline")
+        if profile_name == "terminal-packed"
+        else None
+    )
+    if terminal_waterline is not None and terminal_waterline <= 0:
+        raise ValueError("profile.terminal_waterline must be > 0")
+    profile = ProfileProjectConfig(
+        name=profile_name,
+        max_level=max_level,
+        terminal_waterline=terminal_waterline,
+    )
+
+    packing = PackingProjectConfig(
+        index_emission_strategy=_require_str(packing_raw, "index_emission_strategy")
+    )
+    if packing.index_emission_strategy not in _INDEX_EMISSION_STRATEGIES:
+        raise ValueError(
+            "packing.index_emission_strategy must be one of "
+            f"{sorted(_INDEX_EMISSION_STRATEGIES)}, "
+            f"got {packing.index_emission_strategy!r}"
+        )
+
+    shard_from_level = _require_int(sidecars_raw, "shard_from_level")
+    shard_prefix_bits = _require_int(sidecars_raw, "shard_prefix_bits")
+    if shard_from_level < 0:
+        raise ValueError("sidecars.shard_from_level must be >= 0")
+    if shard_prefix_bits < 0:
+        raise ValueError("sidecars.shard_prefix_bits must be >= 0")
+    families_raw = sidecars_raw.get("families", [])
+    if not isinstance(families_raw, list):
+        raise ValueError("sidecars.families must be an array of tables")
+    seen_names: set[str] = set()
+    families: list[SidecarFamilyConfig] = []
+    for idx, family_raw in enumerate(families_raw):
+        if not isinstance(family_raw, dict):
+            raise ValueError(f"sidecars.families[{idx}] must be a table")
+        name = _require_str(family_raw, "name")
         if name in seen_names:
-            raise ValueError(f"Duplicate stage03 sidecar name: {name}")
+            raise ValueError(f"Duplicate sidecar family name: {name}")
         seen_names.add(name)
-        fields_raw = sidecar_raw.get("fields", [])
+        fields_raw = family_raw.get("fields", [])
         if not isinstance(fields_raw, list) or not all(
-            isinstance(v, str) and v.strip() for v in fields_raw
+            isinstance(value, str) and value.strip() for value in fields_raw
         ):
             raise ValueError(
-                f"stage03.sidecars[{idx}].fields must be a list of non-empty strings"
+                f"sidecars.families[{idx}].fields must be a list of non-empty strings"
             )
-        sidecars.append(
-            SidecarProjectConfig(
+        families.append(
+            SidecarFamilyConfig(
                 name=name,
-                fields=tuple(v.strip() for v in fields_raw),
+                fields=tuple(value.strip() for value in fields_raw),
             )
         )
+    sidecars = SidecarsProjectConfig(
+        shard_from_level=shard_from_level,
+        shard_prefix_bits=shard_prefix_bits,
+        families=tuple(families),
+    )
 
     return OctreeProject(
         project_path=resolved_project_path,
         paths=paths,
-        stage00=stage00,
-        stage01=stage01,
-        stage02=stage02,
-        stage03=Stage03ProjectConfig(sidecars=tuple(sidecars)),
+        dataset=dataset,
+        execution=execution,
+        routing=routing,
+        materialization=materialization,
+        profile=profile,
+        packing=packing,
+        sidecars=sidecars,
     )
 
 
 def render_project_template() -> str:
-    stage00_output_dir = _DEFAULT_STAGE00_OUTPUT_DIR
-    stage01_output_dir = _DEFAULT_STAGE01_OUTPUT_DIR
-    stage02_output_path = _DEFAULT_STAGE02_OUTPUT_PATH
-    identifiers_order_output_path = _DEFAULT_IDENTIFIERS_ORDER_OUTPUT_PATH
-    stage03_output_dir = _DEFAULT_STAGE03_OUTPUT_DIR
-    stage00_input_glob = f"{stage00_output_dir}/**/*.parquet"
-
     return (
-        f"format_version = {FORMAT_VERSION}\n\n"
         "[paths]\n"
-        f'merged_healpix_dir = "{_DEFAULT_MERGED_HEALPIX_DIR}"\n'
+        f'input_shards_dir = "{_DEFAULT_INPUT_SHARDS_DIR}"\n'
         f'identifiers_map_path = "{_DEFAULT_IDENTIFIERS_MAP_PATH}"\n'
-        f'stage00_output_dir = "{stage00_output_dir}"\n'
-        f'stage01_output_dir = "{stage01_output_dir}"\n'
-        f'stage02_output_path = "{stage02_output_path}"\n'
-        f'identifiers_order_output_path = "{identifiers_order_output_path}"\n'
-        f'stage03_output_dir = "{stage03_output_dir}"\n\n'
-        "[stage00]\n"
-        "batch_size = 1000000\n"
-        f"v_mag = {DEFAULT_MAG_VIS}\n"
-        f"max_level = {DEFAULT_MAX_LEVEL}\n\n"
-        "[stage01]\n"
-        f'input_glob = "{stage00_input_glob}"\n'
-        "batch_size = 100000\n"
-        f"deep_shard_from_level = {DEFAULT_DEEP_SHARD_FROM_LEVEL}\n"
-        "deep_prefix_bits = 3\n\n"
-        "[stage02]\n"
+        f'routed_dir = "{_DEFAULT_ROUTED_DIR}"\n'
+        f'prepared_dir = "{_DEFAULT_PREPARED_DIR}"\n'
+        f'materialized_dir = "{_DEFAULT_MATERIALIZED_DIR}"\n'
+        f'build_work_dir = "{_DEFAULT_BUILD_WORK_DIR}"\n'
+        f'render_output_path = "{_DEFAULT_RENDER_OUTPUT_PATH}"\n'
+        f'identifiers_order_output_path = "{_DEFAULT_IDENTIFIERS_ORDER_OUTPUT_PATH}"\n'
+        f'sidecars_output_dir = "{_DEFAULT_SIDECARS_OUTPUT_DIR}"\n'
+        f'sidecars_work_dir = "{_DEFAULT_SIDECARS_WORK_DIR}"\n\n'
+        "[dataset]\n"
+        f"limiting_magnitude = {DEFAULT_MAG_VIS}\n\n"
+        "[execution]\n"
+        "batch_rows = 100000\n"
         "max_open_files = 32\n\n"
-        "[stage03]\n\n"
-        "[[stage03.sidecars]]\n"
+        "[routing]\n"
+        'input_mode = "cartesian"\n'
+        "scan_batch_rows = 1000000\n"
+        "bucket_rows = 1000000\n"
+        "fragment_target_rows = 100000\n"
+        "max_open_writers = 128\n"
+        "compact_after_files = 64\n\n"
+        "[materialization]\n"
+        f"partition_from_level = {DEFAULT_CLASSIC_PARTITION_FROM_LEVEL}\n"
+        f"partition_prefix_bits = {DEFAULT_CLASSIC_PARTITION_PREFIX_BITS}\n\n"
+        "[profile]\n"
+        'name = "terminal-packed"\n'
+        f"max_level = {DEFAULT_CLASSIC_MAX_LEVEL}\n"
+        f"terminal_waterline = {DEFAULT_TERMINAL_WATERLINE}\n\n"
+        "[packing]\n"
+        'index_emission_strategy = "temp-pwrite-batched"\n\n'
+        "[sidecars]\n"
+        f"shard_from_level = {DEFAULT_DEEP_SHARD_FROM_LEVEL}\n"
+        "shard_prefix_bits = 3\n\n"
+        "[[sidecars.families]]\n"
         'name = "meta"\n'
         "fields = []\n"
     )

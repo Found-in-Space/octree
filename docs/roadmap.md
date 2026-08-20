@@ -1,76 +1,122 @@
 # Octree Roadmap
 
-## Status
+## Direction
 
-The clean-break Stage 02 / Stage 03 architecture is now implemented.
+The octree pipeline follows the bounded, incremental product flow in
+[`streaming-pipeline.md`](streaming-pipeline.md):
 
-The current pipeline is:
+```text
+routed contributions
+    -> sorted contributions + cell summaries
+    -> profile topology
+    -> materialized buckets
+    -> packed artifacts
+    -> sidecars
+```
 
-- Stage 00: enriched parquet
-- Stage 01: render intermediates plus identifiers-order intermediates
-- Stage 02: `stars.octree` plus `identifiers.order`
-- Stage 03: named sidecar families
+The public command boundaries are `route`, `prepare`, `build`, and
+`sidecars build`. Topology planning, materialization, and packing are reusable
+internal products beneath `build`.
 
-The current format also includes UUID-backed descriptor metadata:
+## Implemented foundations
 
-- render octrees carry `dataset_uuid`
-- sidecars carry `parent_dataset_uuid`, `sidecar_uuid`, and `sidecar_kind`
-- `identifiers.order` carries `parent_dataset_uuid` plus its own artifact UUID
+- Input shards remain independently replaceable at
+  `(staging bucket, input shard id, kind)` granularity.
+- Routing uses semantic contribution checksums, per-shard publication journals,
+  and resumable group checkpoints.
+- Preparation performs deterministic local sorting with a bounded Arrow fast
+  path and DuckDB external sorting for oversized groups.
+- Sorted fragments are immutable, input/policy-addressed, atomically published,
+  and checkpointed before old versions are removed.
+- Shared bounded run generation and fan-in merging are available for
+  materialization.
+- Materialization encodes rows relative to their selected final cell
+  and checkpoints group runs and spatial partitions.
+- Terminal topology uses immutable per-group and per-level count runs, bounded
+  vectorized fan-in merging, sequential bottom-up subtree aggregation, and
+  atomic restart checkpoints. SQLite is no longer part of this catalogue-scale
+  path.
+- Classic and terminal-packed outputs share materialization and packing
+  machinery. A count-equivalent source change can reuse terminal topology.
+- The final index compiler uses sorted topology runs and content-addressed,
+  spatially packed five-level skeletons. Payload-only changes reuse the topology
+  plan without source/index searches.
+- The STAR v1 writer preserves the established binary output. Its measured
+  default builds a dedicated scratch index and patches one recorded frontier
+  table per parent; a lower-scratch prefix-sum emitter remains available.
+- Complete render/identity pairs have a durable no-op checkpoint with UUID
+  reuse, atomic publication, and concurrency-safe cleanup.
+- `stars.octree`, `identifiers.order`, and sidecars carry UUID-backed parent
+  identities.
+- Sidecars are independent, schema-bearing artifacts; `meta` is the first
+  implemented family.
 
-## Implemented Requirements
+DuckDB is retained where its vectorized external sort or aggregation is the
+measured best execution engine. The architectural constraint is bounded,
+deterministic, sequential processing—not a blanket database ban. Mutable
+catalogue-scale row stores and random indexed update designs still require
+strong performance evidence.
 
-### Render Dataset Identity
+## Next milestones
 
-Render octrees now expose `dataset_uuid` in the mandatory descriptor block written immediately after the STAR header.
+### 1. Complete dependency-directed summaries
 
-### Sidecar Parent Matching
+Preparation still needs durable per-natural-cell counts and field-specific
+semantic checksums that the shared state can merge sequentially. These products
+will replace the conservative downstream `clean`/`all` marker and allow a
+one-star edit to stop at an unchanged cell identity rather than merely at an
+unchanged routed or sorted group.
 
-Sidecars now expose `parent_dataset_uuid`.
+### 2. Partition terminal topology invalidation
 
-Readers and stats helpers should reject a sidecar when that UUID does not match the active render dataset.
+The streamed terminal-count and selection implementation is complete, but a
+genuine terminal-map change currently has a global identity. Publish spatial
+terminal-map partitions plus bounded ancestor summaries so only changed
+branches invalidate dependent v2 materialization.
 
-### Sidecar Version Identity
+### 3. Refine materialized dependency manifests
 
-Sidecars now expose `sidecar_uuid`.
+Classic and terminal-packed builds already share bounded run generation,
+fan-in merging, encoding, and spatial partition caches. The next step is to
+connect those partitions to the field-specific cell and topology identities so
+the dependency closure is exact for payload-only, identity-only, and topology
+changes.
 
-Rebuilding a sidecar family for the same render dataset produces a new `sidecar_uuid`.
+### 4. Production-accept index packing
 
-### Named Sidecar Registry
+The new v1 index writer is complete and fixture-tested across dense and sparse
+topologies. Record its wall time, CPU time, temporary I/O, write counts, file
+handles, and RSS on the next controlled large build. The selected batched
+emitter trades one index-sized scratch file for fewer writes; the `forward`
+emitter is the operational fallback when scratch capacity is constrained.
 
-Stage 03 now builds sidecars by family name via `[[stage03.sidecars]]`.
+The monolithic artifact still requires a complete sequential final rewrite. A
+sharded final container and true partial publication remain a separate format
+decision.
 
-`meta` is the first implemented family.
+### 5. Production acceptance of the semantic layout
 
-### Foundational Identifiers / Order Artifact
+Run the first production v2 build from the unversioned semantic project
+template and retain its routing, preparation, build, packing, and sidecar
+reports as the operational baseline. No older project schema or numeric command
+is accepted.
 
-Stage 02 now emits `identifiers.order` as part of the base dataset package.
+## Existing artifact requirements
 
-Its primary mapping is:
+These remain part of every profile:
 
-- `(level, node_id) -> ordered list of canonical star identities`
+- render octrees expose `dataset_uuid`;
+- `identifiers.order` carries the matching parent dataset UUID and its own
+  artifact UUID;
+- sidecars expose `parent_dataset_uuid`, `sidecar_uuid`, and embedded schema
+  metadata; and
+- readers reject mismatched render, identity, and sidecar artifacts.
 
-### Explicit Project Configuration
+## Related documentation
 
-Operational build commands now require an explicit project file and reject removed legacy keys such as:
-
-- `stage01.sidecar_fields`
-- `stage02.manifest_path`
-- `stage02.meta_mode`
-- `stage02.meta_output_path`
-
-## Remaining Future Work
-
-The new architecture creates room for later extensions without changing the clean stage boundary:
-
-- more Stage 03 sidecar families beyond `meta`
-- reverse lookup artifacts derived from `identifiers.order`
-- richer provenance metadata for published manifests
-- additional reader helpers for sidecar discovery beyond explicit `--meta-octree`
-
-## Related Docs
-
-- `docs/stage-01.md`
-- `docs/stage-02.md`
-- `docs/stage-03.md`
-- `docs/identifiers-order.md`
-- `docs/sidecars.md`
+- [`streaming-pipeline.md`](streaming-pipeline.md)
+- [`pipeline-plan.md`](pipeline-plan.md)
+- [`products.md`](products.md)
+- [`identifiers-order.md`](identifiers-order.md)
+- [`identity-lookup-index.md`](identity-lookup-index.md)
+- [`sidecars.md`](sidecars.md)

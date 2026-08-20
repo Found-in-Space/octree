@@ -8,13 +8,8 @@ from uuid import UUID
 import pytest
 
 import foundinspace.octree.reader.source as reader_source
-from combine_helpers import (
-    PayloadNode,
-    build_intermediates,
-    build_sidecar_intermediates,
-)
-from foundinspace.octree.combine import CombinePlan, combine_octree
-from foundinspace.octree.combine.records import (
+from foundinspace.octree.packing import PackingPlan, pack_octree
+from foundinspace.octree.packing.records import (
     DESCRIPTOR_SIZE,
     HEADER_SIZE,
     SHARD_MAGIC,
@@ -26,6 +21,11 @@ from foundinspace.octree.combine.records import (
 from foundinspace.octree.reader import NodeEntry, OctreeReader, Point, read_header
 from foundinspace.octree.reader.index import GridCoord
 from foundinspace.octree.reader.stats import collect_stats
+from packing_helpers import (
+    PayloadNode,
+    build_intermediates,
+    build_sidecar_intermediates,
+)
 
 STAR_RECORD_FMT = struct.Struct("<fffhBB")
 DATASET_UUID = UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
@@ -69,10 +69,10 @@ def _build_small_octree(tmp_path: Path) -> Path:
         mag_limit=6.5,
     )
     output = tmp_path / "stars.octree"
-    combine_octree(
+    pack_octree(
         manifest_path,
         output,
-        plan=CombinePlan(max_open_files=2),
+        plan=PackingPlan(max_open_files=2),
         descriptor=PackedDescriptorFields(
             artifact_kind="render",
             dataset_uuid=DATASET_UUID,
@@ -119,19 +119,19 @@ def _build_small_octree_with_meta(tmp_path: Path) -> tuple[Path, Path]:
     )
     render_output = tmp_path / "stars.octree"
     meta_output = tmp_path / "stars.meta.octree"
-    combine_octree(
+    pack_octree(
         render_manifest_path,
         render_output,
-        plan=CombinePlan(max_open_files=2),
+        plan=PackingPlan(max_open_files=2),
         descriptor=PackedDescriptorFields(
             artifact_kind="render",
             dataset_uuid=DATASET_UUID,
         ),
     )
-    combine_octree(
+    pack_octree(
         sidecar_manifest_path,
         meta_output,
-        plan=CombinePlan(max_open_files=2),
+        plan=PackingPlan(max_open_files=2),
         descriptor=PackedDescriptorFields(
             artifact_kind="sidecar",
             parent_dataset_uuid=DATASET_UUID,

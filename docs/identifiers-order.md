@@ -2,18 +2,21 @@
 
 ## Status
 
-`identifiers.order` is part of the implemented Stage 02 base dataset package.
+`identifiers.order` is part of the base dataset package.
 
-Its job is to preserve the canonical ordered star identities for one render octree dataset so later sidecar families can be rebuilt without reopening earlier pipeline stages.
+Its job is to preserve the canonical ordered star identities for one render octree dataset so later sidecar families can be rebuilt without reopening earlier pipeline products.
 
-## Stage Placement
+## Product Placement
 
-The current pipeline is:
+`identifiers.order` is emitted beside `stars.octree` by packing. Both consume
+the same materialized cell stream, so cell membership and within-cell ordinal
+order cannot diverge. The command mapping is:
 
-- Stage 00: row enrichment parquet
-- Stage 01: render intermediates plus identifiers-order intermediates
-- Stage 02: final `stars.octree` plus final `identifiers.order`
-- Stage 03: named sidecar families and derived indices
+- `build`: topology planning, materialization, and packing of
+  `stars.octree` plus `identifiers.order`;
+- `sidecars build`: named sidecars derived from that published pair.
+
+The durable architectural products are `materialize`, `pack`, and `sidecars`.
 
 ## Primary Mapping
 
@@ -27,6 +30,11 @@ Each star identity is the canonical pair:
 - `source_id`
 
 This is a forward mapping optimized for sidecar generation rather than reverse lookup.
+
+The proposed range-addressable reverse mapping is specified separately in
+[`identity-lookup-index.md`](identity-lookup-index.md). It maps exact canonical
+identities back to cell records and render ordinals without requiring a client
+to download or scan this complete artifact.
 
 ## Binary Layout
 
@@ -73,16 +81,16 @@ Each record stores:
 
 ### Payload Encoding
 
-Each payload blob stores exactly one cell’s ordered canonical identities.
+Each payload blob stores exactly one cell's ordered canonical identities, gzip-compressed.
 
-For each star:
+The uncompressed content encodes each star as:
 
 1. `u16` length of `source`
 2. UTF-8 bytes of `source`
 3. `u16` length of `source_id`
 4. UTF-8 bytes of `source_id`
 
-The final `identifiers.order` payload section stores these rows in compact binary form.
+This matches the per-cell gzip compression used by `stars.octree` and sidecar octrees.
 
 ## Why It Exists
 
@@ -91,7 +99,8 @@ This artifact lets the base dataset package be archived as:
 - `stars.octree`
 - `identifiers.order`
 
-Stage 03 can then rebuild sidecars from that package plus fresh enrichment inputs, without depending on Stage 00 or Stage 01 outputs.
+The sidecar product can then rebuild enrichment artifacts from that package plus
+fresh enrichment inputs, without reopening routed or sorted catalogue products.
 
 ## Validation And Cache Identity
 
@@ -110,11 +119,11 @@ Consumers and builders must treat `parent_dataset_uuid` as the primary compatibi
 
 It is a foundational companion artifact for the render dataset.
 
-The first implemented Stage 03 family is `meta`, but the same artifact can support additional sidecar families later.
+The first implemented sidecar family is `meta`, but the same artifact can support additional sidecar families later.
 
 ## Related Docs
 
-- `docs/stage-02.md`
-- `docs/stage-03.md`
+- `docs/products.md`
 - `docs/sidecars.md`
+- `docs/identity-lookup-index.md`
 - `docs/roadmap.md`

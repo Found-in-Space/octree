@@ -3,14 +3,16 @@ from __future__ import annotations
 import gzip
 import shutil
 import struct
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 from uuid import UUID
 
 from .assembly.formats import INDEX_FILE_HDR, INDEX_RECORD
-from .assembly.identity_encoder import decode_identity_rows
-from .combine.lookup import FixedRecordFile
-from .combine.manifest import read_combine_manifest
+from .assembly.identity_encoder import iter_identity_rows
+from .packing.lookup import FixedRecordFile
+from .packing.manifest import read_packing_manifest
 
 HEADER_FMT = struct.Struct("<4sHH16s16sQQQQQ")
 HEADER_MAGIC = b"OIOR"
@@ -18,6 +20,8 @@ HEADER_VERSION = 1
 HEADER_SIZE = HEADER_FMT.size
 DIRECTORY_RECORD_FMT = struct.Struct("<H2xQIQQ")
 DIRECTORY_RECORD_SIZE = DIRECTORY_RECORD_FMT.size
+IDENTITY_COMPRESSED_READ_BYTES = 64 * 1024
+IDENTITY_UNCOMPRESSED_CELL_LIMIT_BYTES = 64 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,9 +69,7 @@ def _pack_header(
     )
 
 
-def read_header(path: Path) -> IdentifiersOrderHeader:
-    with open(path, "rb") as fp:
-        raw = fp.read(HEADER_SIZE)
+def unpack_header(raw: bytes) -> IdentifiersOrderHeader:
     if len(raw) != HEADER_SIZE:
         raise ValueError("Identifiers/order file too small for header")
     (
@@ -100,14 +102,22 @@ def read_header(path: Path) -> IdentifiersOrderHeader:
     )
 
 
+def read_header(path: Path) -> IdentifiersOrderHeader:
+    with open(path, "rb") as fp:
+        raw = fp.read(HEADER_SIZE)
+    return unpack_header(raw)
+
+
 class IdentifiersOrderReader:
     def __init__(self, path: Path):
         self._path = Path(path)
         self.header = read_header(self._path)
-        self._fp = open(self._path, "rb")  # noqa: SIM115
+        self._directory_fp = open(self._path, "rb")  # noqa: SIM115
+        self._payload_fp = open(self._path, "rb")  # noqa: SIM115
 
     def close(self) -> None:
-        self._fp.close()
+        self._directory_fp.close()
+        self._payload_fp.close()
 
     def __enter__(self) -> IdentifiersOrderReader:
         return self
@@ -115,45 +125,214 @@ class IdentifiersOrderReader:
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
-    def iter_cells(self):
-        self._fp.seek(self.header.directory_offset)
-        for idx in range(self.header.record_count):
-            raw = self._fp.read(DIRECTORY_RECORD_SIZE)
+    def iter_cell_identities(
+        self,
+    ) -> Iterator[tuple[IdentifiersOrderRecord, Iterator[tuple[str, str]]]]:
+        """Yield each cell with a bounded, single-use identity iterator.
+
+        The identity iterator must be consumed before requesting the next cell.
+        Any unconsumed identities are drained when iteration advances so the
+        next payload always starts at a validated cell boundary.
+        """
+        for record in self._iter_directory_records():
+            identities = self._iter_record_identities(record)
+            yield record, identities
+            # Keep advancing safe even if a caller deliberately stops reading
+            # the current cell early.
+            for _identity in identities:
+                pass
+
+    def iter_cells(
+        self,
+    ) -> Iterator[tuple[IdentifiersOrderRecord, list[tuple[str, str]]]]:
+        """Compatibility API that materializes each cell's identity list."""
+        for record, identities in self.iter_cell_identities():
+            yield record, list(identities)
+
+    def iter_cell_identity_payloads(
+        self,
+        *,
+        max_uncompressed_bytes: int = IDENTITY_UNCOMPRESSED_CELL_LIMIT_BYTES,
+        start_record: int = 0,
+    ) -> Iterator[tuple[IdentifiersOrderRecord, bytes]]:
+        """Yield bounded uncompressed identity payloads without decoding rows.
+
+        This is intended for vectorized or compiled scanners that can avoid
+        constructing one Python tuple per rendered star. The limit is applied
+        independently to every cell and protects callers from malformed or
+        unexpectedly large gzip members.
+        """
+        if max_uncompressed_bytes <= 0:
+            raise ValueError("Identity payload memory bound must be > 0")
+        for record in self._iter_directory_records(start_record=start_record):
+            yield (
+                record,
+                self._read_record_payload(
+                    record,
+                    max_uncompressed_bytes=max_uncompressed_bytes,
+                ),
+            )
+
+    def iter_indexed_cell_identity_payloads(
+        self,
+        *,
+        max_uncompressed_bytes: int = IDENTITY_UNCOMPRESSED_CELL_LIMIT_BYTES,
+        start_record: int = 0,
+    ) -> Iterator[tuple[int, IdentifiersOrderRecord, bytes]]:
+        """Yield directory record indexes with bounded uncompressed payloads."""
+        if max_uncompressed_bytes <= 0:
+            raise ValueError("Identity payload memory bound must be > 0")
+        for record_index, record in enumerate(
+            self._iter_directory_records(start_record=start_record),
+            start=start_record,
+        ):
+            yield (
+                record_index,
+                record,
+                self._read_record_payload(
+                    record,
+                    max_uncompressed_bytes=max_uncompressed_bytes,
+                ),
+            )
+
+    def read_directory_record(self, record_index: int) -> IdentifiersOrderRecord:
+        """Read one fixed-width directory record by zero-based index."""
+        if record_index < 0 or record_index >= self.header.record_count:
+            raise IndexError(record_index)
+        self._directory_fp.seek(
+            self.header.directory_offset + record_index * DIRECTORY_RECORD_SIZE
+        )
+        raw = self._directory_fp.read(DIRECTORY_RECORD_SIZE)
+        if len(raw) != DIRECTORY_RECORD_SIZE:
+            raise ValueError("Identifiers/order directory truncated")
+        level, node_id, star_count, payload_offset, payload_length = (
+            DIRECTORY_RECORD_FMT.unpack(raw)
+        )
+        return IdentifiersOrderRecord(
+            level=level,
+            node_id=node_id,
+            star_count=star_count,
+            payload_offset=payload_offset,
+            payload_length=payload_length,
+        )
+
+    def _iter_directory_records(
+        self,
+        *,
+        start_record: int = 0,
+    ) -> Iterator[IdentifiersOrderRecord]:
+        if start_record < 0 or start_record > self.header.record_count:
+            raise ValueError("Identifiers/order start record is out of range")
+        self._directory_fp.seek(
+            self.header.directory_offset + start_record * DIRECTORY_RECORD_SIZE
+        )
+        for _idx in range(start_record, self.header.record_count):
+            raw = self._directory_fp.read(DIRECTORY_RECORD_SIZE)
             if len(raw) != DIRECTORY_RECORD_SIZE:
                 raise ValueError("Identifiers/order directory truncated")
             level, node_id, star_count, payload_offset, payload_length = (
                 DIRECTORY_RECORD_FMT.unpack(raw)
             )
-            payload_abs = self.header.payload_offset + payload_offset
-            self._fp.seek(payload_abs)
-            payload = self._fp.read(payload_length)
-            if len(payload) != payload_length:
-                raise ValueError("Identifiers/order payload truncated")
-            identities = decode_identity_rows(payload, star_count=star_count)
-            yield (
-                IdentifiersOrderRecord(
-                    level=level,
-                    node_id=node_id,
-                    star_count=star_count,
-                    payload_offset=payload_offset,
-                    payload_length=payload_length,
-                ),
-                identities,
+            yield IdentifiersOrderRecord(
+                level=level,
+                node_id=node_id,
+                star_count=star_count,
+                payload_offset=payload_offset,
+                payload_length=payload_length,
             )
-            next_dir_offset = (
-                self.header.directory_offset + (idx + 1) * DIRECTORY_RECORD_SIZE
+
+    def _read_record_payload(
+        self,
+        record: IdentifiersOrderRecord,
+        *,
+        max_uncompressed_bytes: int,
+    ) -> bytes:
+        payload_abs = self.header.payload_offset + record.payload_offset
+        self._payload_fp.seek(payload_abs)
+        compressed = _BoundedFileSlice(
+            self._payload_fp,
+            length=record.payload_length,
+            max_read_bytes=IDENTITY_COMPRESSED_READ_BYTES,
+        )
+        raw = bytearray()
+        with gzip.GzipFile(
+            filename="",
+            fileobj=compressed,
+            mode="rb",
+        ) as decompressed:
+            while chunk := decompressed.read(IDENTITY_COMPRESSED_READ_BYTES):
+                if len(raw) + len(chunk) > max_uncompressed_bytes:
+                    raise ValueError(
+                        "Identifiers/order cell exceeds the uncompressed "
+                        f"memory bound of {max_uncompressed_bytes} bytes: "
+                        f"({record.level}, {record.node_id})"
+                    )
+                raw.extend(chunk)
+        if compressed.remaining:
+            raise ValueError("Identifiers/order payload has trailing compressed bytes")
+        return bytes(raw)
+
+    def _iter_record_identities(
+        self,
+        record: IdentifiersOrderRecord,
+    ) -> Iterator[tuple[str, str]]:
+        payload_abs = self.header.payload_offset + record.payload_offset
+        self._payload_fp.seek(payload_abs)
+        compressed = _BoundedFileSlice(
+            self._payload_fp,
+            length=record.payload_length,
+            max_read_bytes=IDENTITY_COMPRESSED_READ_BYTES,
+        )
+        with gzip.GzipFile(
+            filename="",
+            fileobj=compressed,
+            mode="rb",
+        ) as decompressed:
+            yield from iter_identity_rows(
+                decompressed,
+                star_count=record.star_count,
             )
-            self._fp.seek(next_dir_offset)
+        if compressed.remaining:
+            raise ValueError("Identifiers/order payload has trailing compressed bytes")
 
 
-def combine_identifiers_order(
+class _BoundedFileSlice:
+    """Sequential read-only view over one compressed payload range."""
+
+    def __init__(
+        self,
+        source: BinaryIO,
+        *,
+        length: int,
+        max_read_bytes: int,
+    ) -> None:
+        if length < 0:
+            raise ValueError("Identifiers/order payload length must be >= 0")
+        if max_read_bytes <= 0:
+            raise ValueError("Identifiers/order read bound must be > 0")
+        self._source = source
+        self.remaining = length
+        self._max_read_bytes = max_read_bytes
+
+    def read(self, size: int = -1) -> bytes:
+        if self.remaining == 0:
+            return b""
+        if size is None or size < 0:
+            size = self._max_read_bytes
+        take = min(size, self.remaining, self._max_read_bytes)
+        data = self._source.read(take)
+        self.remaining -= len(data)
+        return data
+
+
+def pack_identifiers_order(
     manifest_path: Path,
     output_path: Path,
     *,
     parent_dataset_uuid: UUID,
     artifact_uuid: UUID,
 ) -> None:
-    manifest = read_combine_manifest(manifest_path)
+    manifest = read_packing_manifest(manifest_path, deep_validation=False)
     if manifest.artifact_kind != "identifiers":
         raise ValueError(
             f"Expected identifiers manifest, got {manifest.artifact_kind!r}"
@@ -185,17 +364,16 @@ def combine_identifiers_order(
                                 raise ValueError(
                                     f"Truncated identifiers intermediate payload for node {node_id}"
                                 )
-                            raw = gzip.decompress(compressed)
                             dir_fp.write(
                                 DIRECTORY_RECORD_FMT.pack(
                                     shard.key.level,
                                     int(node_id),
                                     int(star_count),
                                     int(payload_fp.tell()),
-                                    len(raw),
+                                    len(compressed),
                                 )
                             )
-                            payload_fp.write(raw)
+                            payload_fp.write(compressed)
                             record_count += 1
                 finally:
                     index_file.close()

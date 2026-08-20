@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Read a `stars.octree` file produced by stage-02 and execute bounded spatial queries against it.
+Read a packaged `stars.octree` file and execute bounded spatial queries against it.
 
 The reader must:
 
@@ -58,14 +58,14 @@ The reader is split into four layers with clear responsibilities and no circular
 │              File header                         │  STAR header parsing, bootstrap fields
 │         foundinspace.octree.reader.header         │
 ├──────────────────────────────────────────────────┤
-│          Binary record constants                 │  shared with combine pipeline
-│       foundinspace.octree.combine.records         │
+│          Binary record constants                 │  shared with packing pipeline
+│       foundinspace.octree.packing.records         │
 └──────────────────────────────────────────────────┘
 ```
 
 ### Dependency rule
 
-Each layer may import from layers below it and from `combine.records` for binary constants. No layer may import from the write pipeline modules (`assembly`, `combine.pipeline`, `combine.dfs`).
+Each layer may import from layers below it and from `packing.records` for binary constants. No layer may import from the write pipeline modules (`assembly`, `packing.pipeline`, `packing.dfs`).
 
 ---
 
@@ -99,9 +99,9 @@ def read_header(path: Path) -> OctreeHeader:
     """
 ```
 
-This function opens the file, reads 64 bytes, unpacks via `HEADER_FMT` from `combine.records`, probes 4 bytes at `index_offset` to confirm `OSHR` magic, and returns an `OctreeHeader`. It does not hold the file open.
+This function opens the file, reads 64 bytes, unpacks via `HEADER_FMT` from `packing.records`, probes 4 bytes at `index_offset` to confirm `OSHR` magic, and returns an `OctreeHeader`. It does not hold the file open.
 
-`HEADER_FMT` tuple-to-field mapping (from `pack_top_level_header` in `combine.records`):
+`HEADER_FMT` tuple-to-field mapping (from `pack_top_level_header` in `packing.records`):
 
 | Index | Field |
 |-------|-------|
@@ -157,6 +157,7 @@ class NodeEntry:
     child_mask: int            # bit o set => child exists in octant o
     payload_offset: int        # absolute file offset, 0 if no payload
     payload_length: int        # compressed bytes, 0 if no payload
+    star_count: int | None     # v2 payload records; unavailable for v1
 
     @property
     def is_leaf(self) -> bool:
@@ -165,6 +166,10 @@ class NodeEntry:
     @property
     def has_payload(self) -> bool:
         """True when HAS_PAYLOAD flag is set and payload_length > 0."""
+
+    @property
+    def is_terminal(self) -> bool:
+        """True when the STAR v2 terminal flag is set."""
 
     def aabb_distance(self, point: Point) -> float:
         """Minimum Euclidean distance from point to this node's AABB."""
@@ -211,7 +216,7 @@ half_size = world_half_size / n
 center.x = world_center.x + (2 × (gx + 0.5) − n) × half_size
 ```
 
-Grid coordinates `(gx, gy, gz)` are decoded from the node's `local_path` relative to the shard's `parent_global_depth` and `parent_grid_{x,y,z}`, using the octant bit convention already used by the combine pipeline.
+Grid coordinates `(gx, gy, gz)` are decoded from the node's `local_path` relative to the shard's `parent_global_depth` and `parent_grid_{x,y,z}`, using the octant bit convention already used by the packing pipeline.
 
 Octant bit convention (per octant value `o`):
 
@@ -241,17 +246,28 @@ The navigator must implement:
      - node_table_offset, frontier_table_offset, payload_base_offset
    - Reader uses at minimum: `node_count`, `parent_global_depth`, `parent_grid_*`, `entry_nodes`, `first_frontier_index`, `node_table_offset`, `frontier_table_offset`.
 
-2. **Node reading** — read one 20-byte `SHARD_NODE` record at `node_table_offset + (node_index − 1) × 20`.
-   - Format: `SHARD_NODE_FMT = "<HHBBBBQI"` (`SHARD_NODE_SIZE = 20`)
+2. **Node reading** — dispatch from the matching STAR/shard version.
+   - v1 format: `"<HHBBBBQI"` (20 bytes)
+   - v2 format: `"<HHBBBBQII"` (24 bytes)
    - Field order:
      - `first_child: u16`
      - `local_path: u16`
      - `child_mask: u8`
      - `local_depth: u8`
      - `flags: u8`
-     - `reserved: u8`
+     - `brightest_level: u8` (zero/reserved in v1; absolute level in v2)
      - `payload_offset: u64`
      - `payload_length: u32`
+     - `star_count: u32` (v2 only)
+
+   In v2, the byte after `flags` is unconditionally the exact absolute
+   subtree-brightest natural magnitude level. Readers return it directly and
+   validate `node_level <= brightest_level <= 21`. Header flags remain zero;
+   there is no capability or legacy delta encoding. The structural flags remain
+   unchanged.
+
+   The reader rejects a shard whose version does not match the STAR header.
+   See [`star-v2.md`](star-v2.md) for count and terminal semantics.
 
 3. **Intra-shard child resolution** — for a non-frontier node, the child at octant `o` is at node index `first_child + popcount(child_mask & ((1 << o) − 1))`.
 
@@ -470,7 +486,7 @@ src/foundinspace/octree/
 
 ## Shared constants
 
-The reader imports binary layout constants from the existing `combine.records` module:
+The reader imports binary layout constants from the existing `packing.records` module:
 
 - `HEADER_FMT`, `HEADER_SIZE`, `HEADER_MAGIC`
 - `SHARD_HDR_FMT`, `SHARD_HDR_SIZE`, `SHARD_MAGIC`
@@ -524,4 +540,4 @@ Unit tests should cover:
 
 4. **AABB distance** — verify `NodeEntry.aabb_distance` for points inside, on the boundary, and outside the box.
 
-5. **End-to-end** — build a small octree via the write pipeline (stages 00–02 with a tiny test catalog), then read it back with `OctreeReader` and verify both queries return expected stars. This test already has infrastructure in `tests/test_combine_e2e.py`.
+5. **End-to-end** — route, prepare, and build a tiny test catalogue, then read it back with `OctreeReader` and verify both queries return expected stars. This test already has infrastructure in `tests/test_packing_e2e.py`.

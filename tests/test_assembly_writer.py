@@ -129,6 +129,47 @@ class TestIntermediateShardWriter:
                 offset, length = rec[1], rec[2]
                 assert offset + length <= payload_size
 
+    def test_generated_cell_streams_payload(self, tmp_path):
+        shard = ShardKey(level=5, prefix_bits=0, prefix=0)
+        writer = IntermediateShardWriter(shard, tmp_path)
+        writer.write_generated_cell(
+            key=CellKey(level=5, node_id=10),
+            star_count=2,
+            write_payload=lambda target: target.write(b"streamed"),
+        )
+        result = writer.close()
+
+        assert result is not None
+        assert (tmp_path / result["payload_path"]).read_bytes() == b"streamed"
+        with open(tmp_path / result["index_path"], "rb") as f:
+            f.read(INDEX_FILE_HDR.size)
+            record = INDEX_RECORD.unpack(f.read(INDEX_RECORD.size))
+        assert record[1:4] == (0, len(b"streamed"), 2)
+
+    def test_generated_cell_rolls_back_partial_payload(self, tmp_path):
+        shard = ShardKey(level=5, prefix_bits=0, prefix=0)
+        writer = IntermediateShardWriter(shard, tmp_path)
+
+        def fail_after_write(target):
+            target.write(b"partial")
+            raise RuntimeError("failed")
+
+        with pytest.raises(RuntimeError, match="failed"):
+            writer.write_generated_cell(
+                key=CellKey(level=5, node_id=10),
+                star_count=1,
+                write_payload=fail_after_write,
+            )
+        writer.write_generated_cell(
+            key=CellKey(level=5, node_id=10),
+            star_count=1,
+            write_payload=lambda target: target.write(b"complete"),
+        )
+        result = writer.close()
+
+        assert result is not None
+        assert (tmp_path / result["payload_path"]).read_bytes() == b"complete"
+
     def test_empty_shard_cleanup(self, tmp_path):
         shard = ShardKey(level=3, prefix_bits=0, prefix=0)
         writer = IntermediateShardWriter(shard, tmp_path)

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
+import struct
 from collections.abc import Callable
 from pathlib import Path
+from typing import BinaryIO
 
 from .formats import (
     DEFAULT_FLAGS,
@@ -11,7 +14,7 @@ from .formats import (
     INDEX_RECORD,
     INDEX_VERSION,
 )
-from .types import EncodedCell, ShardKey
+from .types import CellKey, EncodedCell, ShardKey
 
 
 def _shard_base_name(shard: ShardKey) -> str:
@@ -66,6 +69,7 @@ class IntermediateShardWriter:
         self._shard = shard
         self._out_dir = out_dir
         self._record_count = 0
+        self._topology_digest = hashlib.sha256()
         self._last_node_id: int | None = None
         self._closed = False
         self._index_magic = index_magic if index_magic is not None else INDEX_MAGIC
@@ -99,35 +103,97 @@ class IntermediateShardWriter:
         )
 
     def write_cell(self, cell: EncodedCell) -> None:
-        if cell.key.level != self._shard.level:
+        self._validate_cell_key(cell.key)
+        payload_offset = self._payload_fp.tell()
+        self._payload_fp.write(cell.payload)
+        self._write_index_record(
+            key=cell.key,
+            payload_offset=payload_offset,
+            payload_length=len(cell.payload),
+            star_count=cell.star_count,
+        )
+
+    def write_cell_payload_file(
+        self,
+        *,
+        key: CellKey,
+        payload_path: Path,
+        star_count: int,
+    ) -> None:
+        self._validate_cell_key(key)
+        payload_offset = self._payload_fp.tell()
+        payload_length = 0
+        with open(payload_path, "rb") as source:
+            while chunk := source.read(1 << 20):
+                self._payload_fp.write(chunk)
+                payload_length += len(chunk)
+        self._write_index_record(
+            key=key,
+            payload_offset=payload_offset,
+            payload_length=payload_length,
+            star_count=star_count,
+        )
+
+    def write_generated_cell(
+        self,
+        *,
+        key: CellKey,
+        star_count: int,
+        write_payload: Callable[[BinaryIO], None],
+    ) -> None:
+        """Write a cell payload directly to the shard output stream."""
+        self._validate_cell_key(key)
+        payload_offset = self._payload_fp.tell()
+        try:
+            write_payload(self._payload_fp)
+        except BaseException:
+            self._payload_fp.seek(payload_offset)
+            self._payload_fp.truncate()
+            raise
+        payload_length = self._payload_fp.tell() - payload_offset
+        self._write_index_record(
+            key=key,
+            payload_offset=payload_offset,
+            payload_length=payload_length,
+            star_count=star_count,
+        )
+
+    def _validate_cell_key(self, key: CellKey) -> None:
+        if key.level != self._shard.level:
             raise ValueError(
-                f"Level mismatch: cell level {cell.key.level} != "
+                f"Level mismatch: cell level {key.level} != "
                 f"shard level {self._shard.level}"
             )
-        if not belongs_to_shard(cell.key.node_id, self._shard):
+        if not belongs_to_shard(key.node_id, self._shard):
             raise ValueError(
-                f"node_id {cell.key.node_id} does not belong to shard "
+                f"node_id {key.node_id} does not belong to shard "
                 f"({self._shard.level}, p{self._shard.prefix_bits}, "
                 f"{self._shard.prefix})"
             )
-        if self._last_node_id is not None and cell.key.node_id <= self._last_node_id:
+        if self._last_node_id is not None and key.node_id <= self._last_node_id:
             raise ValueError(
-                f"Non-monotonic node_id: {cell.key.node_id} <= {self._last_node_id}"
+                f"Non-monotonic node_id: {key.node_id} <= {self._last_node_id}"
             )
 
-        payload_offset = self._payload_fp.tell()
-        self._payload_fp.write(cell.payload)
-
+    def _write_index_record(
+        self,
+        *,
+        key: CellKey,
+        payload_offset: int,
+        payload_length: int,
+        star_count: int,
+    ) -> None:
+        self._topology_digest.update(struct.pack("<Q", int(key.node_id)))
         self._index_fp.write(
             INDEX_RECORD.pack(
-                cell.key.node_id,
+                key.node_id,
                 payload_offset,
-                len(cell.payload),
-                cell.star_count,
+                payload_length,
+                star_count,
             )
         )
         self._record_count += 1
-        self._last_node_id = cell.key.node_id
+        self._last_node_id = key.node_id
 
     def close(self) -> dict | None:
         if self._closed:
@@ -155,6 +221,7 @@ class IntermediateShardWriter:
             self._manifest_index_key: index_name,
             self._manifest_payload_key: payload_name,
             "record_count": self._record_count,
+            "topology_checksum": f"sha256:{self._topology_digest.hexdigest()}",
         }
 
     def abort(self) -> None:
