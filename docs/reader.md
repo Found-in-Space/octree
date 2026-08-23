@@ -1,4 +1,13 @@
-# Octree Reader — Specification
+# Octree Reader — Implementation Design
+
+**Status:** Target implementation design
+
+**Normative dependency:** [`octree-spec.md`](octree-spec.md)
+
+This document defines the Python reader's structure and API. The canonical
+magnitude-assignment, loading, completeness, and compatibility rules live in
+`octree-spec.md`; that specification takes precedence if this implementation
+design becomes stale.
 
 ## Purpose
 
@@ -18,12 +27,21 @@ The reader must:
 
 ### 1. Visible stars from a point
 
-Given a viewpoint in world coordinates and a limiting apparent magnitude, return all stars whose apparent magnitude at that viewpoint is at or below the limit.
+Given a viewpoint in world coordinates and a limiting apparent magnitude,
+return all stars whose apparent magnitude at that viewpoint is at or below the
+limit. An exhaustive call defaults to loader factor `q=2`. A caller may select
+`1 <= q < 2` only when approximate or progressively refined results are
+acceptable.
 
-This is the "shell loader" query. It uses the octree's magnitude-based level structure to prune: a node at level L has half-size H(L), and its load radius is `H(L) × 10^((m_app − m_index) / 5)` where `m_index` is the file's `mag_limit`. If the minimum distance from the viewpoint to the node's AABB exceeds the load radius, the entire subtree is skipped.
+The query uses the brightest natural level `B` represented by each node or
+subtree. Its node-selection radius is
+`q H(B) × 10^((m_app − m_index) / 5)`, where `m_index` is the file's
+`mag_limit`. STAR v2 supplies `B` as `brightest_level`; STAR v1 uses physical
+node level as a conservative fallback. The exact contract and trade-offs are in
+[`octree-spec.md`](octree-spec.md).
 
 ```
-stars_brighter_than(point, limiting_magnitude) → Iterator[Star]
+stars_brighter_than(point, limiting_magnitude, load_factor=2.0) → Iterator[Star]
 ```
 
 ### 2. Nearby stars from a point
@@ -85,7 +103,7 @@ class OctreeHeader:
     world_half_size: float        # parsecs
     payload_record_size: int      # bytes per quantized star record (currently 16)
     max_level: int
-    mag_limit: float              # apparent-magnitude cutoff used during build
+    mag_limit: float              # m_index: natural magnitude-assignment basis
 ```
 
 ### `read_header`
@@ -375,12 +393,15 @@ class OctreeReader:
         self,
         point: Point,
         limiting_magnitude: float,
+        *,
+        load_factor: float = 2.0,
     ) -> Iterator[Star]:
         """Yield stars visible from point at or below limiting_magnitude.
 
-        Uses shell-based pruning: for each node at level L,
-        load_radius = half_size × 10^((limiting_magnitude − mag_limit) / 5).
-        Skips subtrees whose AABB distance from point exceeds load_radius.
+        Uses the octree-spec node predicate with 1 <= load_factor <= 2.
+        load_factor=2 is exhaustive; smaller values are deliberate quality
+        trade-offs. STAR v2 uses brightest_level and STAR v1 falls back to the
+        emitted node level.
         For each payload-bearing node within range, decompresses the payload
         and yields stars whose apparent magnitude at point ≤ limiting_magnitude.
         """
@@ -405,8 +426,14 @@ Both queries follow the same pattern:
 1. Iterate `root_entries()` from the navigator.
 2. For each root entry, push onto a stack.
 3. Pop from stack; compute the pruning predicate:
-   - `stars_brighter_than`: `node.aabb_distance(point) > load_radius` where `load_radius = node.half_size × 10^((m_app − m_index) / 5)`
-   - `stars_within_distance`: `node.aabb_distance(point) > distance_pc`
+   - `stars_brighter_than`:
+     1. choose `B = node.brightest_level` for v2 or `B = node.level` for v1;
+     2. derive `H(B) = world_half_size / 2^B`;
+     3. compute `load_radius = load_factor × H(B) × 10^((m_app − m_index) / 5)`;
+     4. prune when `node.aabb_distance(point) >= load_radius`, using the
+        conservative floating-boundary handling required by `octree-spec.md`.
+   - `stars_within_distance`: prune when
+     `node.aabb_distance(point) > distance_pc`.
 4. If pruned, skip.
 5. If the node has a payload, decode it and yield qualifying stars.
 6. Push all children (octants 0–7 via `get_child`) onto the stack.
@@ -434,6 +461,7 @@ fis-octree stats <OCTREE_PATH> [OPTIONS]
 |--------|---------|-------------|
 | `--point X,Y,Z` | `0,0,0` | Query origin in parsecs (ICRS) |
 | `--magnitude` | `6.5` | Limiting apparent magnitude for the visibility query |
+| `--load-factor` | `2.0` | Visibility loader quality `q`; 2.0 is complete and smaller values are approximate |
 | `--radius` | `10.0` | Search radius in parsecs for the proximity query |
 
 ### Output
@@ -459,6 +487,9 @@ The `stats` command runs both queries from the given point and prints:
 
 `stats` implementation note:
 
+- The summary must report `load_factor` and the corresponding geometric
+  completeness threshold so approximate runs cannot be mistaken for exact
+  query results.
 - For the visible-stars table, "Stars loaded" means all stars decoded from payload-bearing nodes that pass node-level pruning.
 - "Stars rendered" means stars that also pass the per-star apparent-magnitude filter.
 - To compute both values and per-level byte counts, the command should drive traversal with `IndexNavigator + decode_payload` directly rather than using only the public filtered iterator.
@@ -540,4 +571,10 @@ Unit tests should cover:
 
 4. **AABB distance** — verify `NodeEntry.aabb_distance` for points inside, on the boundary, and outside the box.
 
-5. **End-to-end** — route, prepare, and build a tiny test catalogue, then read it back with `OctreeReader` and verify both queries return expected stars. This test already has infrastructure in `tests/test_packing_e2e.py`.
+5. **Magnitude quality** — verify `load_factor=2` is exhaustive, smaller factors
+   have the completeness thresholds specified by `octree-spec.md`, and v2
+   terminal traversal derives its bound from `brightest_level`.
+
+6. **End-to-end** — route, prepare, and build a tiny test catalogue, then read
+   it back with `OctreeReader` and verify both queries return expected stars.
+   This test already has infrastructure in `tests/test_packing_e2e.py`.

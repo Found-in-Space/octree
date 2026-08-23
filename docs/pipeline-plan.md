@@ -6,6 +6,9 @@ small part of an upstream catalogue changes, reuse every routed, prepared,
 topology, materialized, and packed result whose relevant semantic content did
 not change.
 
+The full-width natural-assignment contract that forms part of tree identity is
+defined in [`octree-spec.md`](octree-spec.md).
+
 ## Current status
 
 Implemented or available on the current work branch:
@@ -346,7 +349,8 @@ canonical natural-cell semantics:
 
 - source dataset and schema identity;
 - coordinate frame, origin, bounds, and Morton depth;
-- magnitude-to-level policy;
+- magnitude-to-natural-level policy, including the full-width assignment
+  contract;
 - staging split policy; and
 - canonical contribution ordering version.
 

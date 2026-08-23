@@ -8,6 +8,9 @@ The central requirement is selective reuse: changing one star in one upstream
 shard must not rewrite a routed contribution, sorted group, topology partition,
 or materialized bucket whose relevant semantic checksum is unchanged.
 
+This document defines pipeline products. The magnitude-to-natural-level and
+loader contracts are defined separately in [`octree-spec.md`](octree-spec.md).
+
 ## Product flow
 
 ```text
@@ -51,7 +54,8 @@ A tree identity manifest protects build-defining semantics. It should include:
 
 - coordinate frame and coordinate convention;
 - world origin, bounds, and Morton bit depth;
-- magnitude-to-natural-level configuration;
+- magnitude-to-natural-level configuration, including the full-width assignment
+  policy defined by `octree-spec.md`;
 - staging bucket size and routing policy;
 - source and row-schema identities;
 - canonical ordering policy; and

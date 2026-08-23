@@ -123,6 +123,7 @@ The first implemented sidecar family is `meta`, but the same artifact can suppor
 
 ## Related Docs
 
+- `docs/octree-spec.md`
 - `docs/products.md`
 - `docs/sidecars.md`
 - `docs/identity-lookup-index.md`

@@ -1,192 +1,287 @@
-# Magnitude packing and node-loading policy
+# Decision record: full-width magnitude assignment and loader quality
 
-**Status:** Accepted  
-**Decision:** Use full-width magnitude packing. Treat the loader radius as a
-separate runtime quality/completeness control.
+**Status:** Accepted
 
-This decision record defines the geometry contract, the measurements that led
-to the decision, and the boundary between octree packing and client loading. It
-also clarifies why both the original deployment and the later half-width change
-can be mathematically coherent while having very different performance.
+**Writer decision:** Assign natural magnitude bands by full cell width.
 
-## Executive summary
+**Loader decision:** Treat node-selection radius as a separate runtime quality
+and completeness control.
 
-The original artefacts evaluated in this discussion use **full-width packing**:
-at octree level `L`, a star's visibility radius at the index magnitude is less
-than the cell's full width, `2H(L)`, and at least its half-width, `H(L)`.
+The normative writer and loader contracts are defined in
+[`octree-spec.md`](octree-spec.md). This record preserves the alternatives,
+measurements, reasoning, and migration consequences behind that specification.
 
-The original fast loader queried only one half-width, `H(L)`. That deliberately
-selected at most the nearest `2 x 2 x 2` cells in ordinary positions, but it was
-not complete for the brighter half of the packed band. In the measured Orion
-sample it loaded 46,305 stars and delivered 96.8% of the stars visible at
-magnitude 6.5. The omitted 3.2% were not absent from the catalogue: their nodes
-became eligible slightly too late as the observer approached.
+## 1. Decision summary
 
-The later builder implementation uses **half-width packing**. This makes the
-one-half-width query complete, but moves almost every magnitude band one level
-coarser. The selected cells are twice as wide and eight times the volume for the
-same stellar band. In the Orion simulation this reduced the complete query from
-176 payload nodes to 91, but increased decoded stars from 90,449 to 203,095.
+Writing and loading solve different problems and make different trade-offs.
 
-Both layouts are valid when paired with their matching loader rule. The defect
-was treating full-width-packed data as though one half-width were a complete
-query. We are retaining full-width packing because its finer cells allow the
-runtime to choose between a small fast core, a complete outer shell, or any
-measured point between them. Half-width packing fixes that choice into the
-artefact and pays substantially more star overfetch.
-
-## Geometry and terminology
-
-For index limiting magnitude `m_index`, a star of absolute magnitude `M` has
-visibility radius:
+The writer chooses durable spatial granularity. Full-width natural assignment
+places a star at level `N` when its index visibility radius lies between that
+cell's half-width and full width:
 
 ```text
-R(M) = 10 ^ ((m_index - M + 5) / 5) parsecs
+H(N) <= R_index < 2H(N)
 ```
 
-For a root half-width `H(0)`, a level-`L` cell has:
+This keeps magnitude bands in finer spatial cells. A half-width assignment would
+move almost every band one level coarser, making cells twice as wide and eight
+times the volume for the same stars.
+
+The loader chooses transient completeness and work. On the full-width artifact,
+it selects nodes with:
 
 ```text
-H(L) = H(0) / 2^L       # half-width
-W(L) = 2H(L)            # full width
+load_radius = q H(B) scale
 ```
 
-One octree level therefore represents:
+where `B` is the brightest natural level represented by the node or subtree and
+`1 <= q <= 2`. `q=1` is a fast approximate core, while `q=2` is the complete
+immediate-neighbour shell. Intermediate values provide progressive refinement.
+
+The earlier defect was not the full-width artifact. It was presenting the
+one-half-width loader as an exhaustive query over that artifact. Keeping the
+writer fine-grained and making loader quality explicit preserves both fast
+first-image behavior and complete results.
+
+## 2. Context
+
+For index limiting magnitude `m_index`, a star of absolute magnitude `M` has:
+
+```text
+R_index(M) = 10 ^ ((m_index - M + 5) / 5) parsecs
+```
+
+For root half-width `H(0)`:
+
+```text
+H(L) = H(0) / 2^L
+W(L) = 2H(L)
+```
+
+One octree level represents:
 
 ```text
 5 log10(2) = 1.505149978 magnitudes
 ```
 
-“Full-width” and “half-width” in this note describe the largest visibility
-radius encoded in a cell relative to that cell's geometry. They do not describe
-the diameter of a star's visibility sphere.
+The original published artifacts evaluated here used full-width natural
+assignment. The original fast loader selected only one half-width. That loader
+was inexpensive but incomplete for the brighter part of each natural band away
+from favorable lattice alignments.
 
-| Packing contract | Visibility radii stored at level `L` | Complete AABB query radius | Ordinary geometric bound per level |
+A later writer change instead used half-width assignment. This made a
+one-half-width loader complete, but moved the cost into every artifact and every
+client by coarsening the spatial cells.
+
+Both writer/loader pairings are mathematically coherent:
+
+| Writer assignment | Natural-band radii at level `N` | Complete loader radius | Ordinary geometric bound |
 | --- | --- | --- | --- |
-| Full width | `H(L) <= R < 2H(L)` | `2H(L)` | current cell plus all immediate neighbours; up to 27 |
-| Half width | `H(L)/2 <= R < H(L)` | `H(L)` | nearest `2 x 2 x 2`; up to 8 |
+| Full width | `H(N) <= R < 2H(N)` | `2H(N)` | Immediate-neighbour ring; up to 27 cells |
+| Half width | `H(N)/2 <= R < H(N)` | `H(N)` | Nearest `2 x 2 x 2`; up to 8 cells |
 
-An exact upper-threshold star belongs to the adjacent coarser band. This makes
-the upper bound strict and preserves the cell-count guarantee. Implementations
-should use a conservative floating-point boundary without duplicating stars.
+The decision is based on the combined cost of writing and loading, not on
+geometric node count alone.
 
-The bounds are geometric, not promises that every candidate has a payload.
-Sparse levels contain fewer payload nodes. Positions exactly on a cell plane,
-edge, or corner can also reduce the number of distinct cells; the origin, for
-example, lies on the shared corner of eight cells at each populated non-root
-level.
+## 3. Writer alternatives and trade-offs
 
-## The two valid contracts
+### 3.1 Full-width natural assignment — accepted
 
-### Full-width packing
-
-The original band construction assigns a star to the level satisfying:
+The writer assigns the natural level satisfying:
 
 ```text
-H(L) <= R(M) < 2H(L)
+H(N) <= R_index(M) < 2H(N)
 ```
 
-The exhaustive node predicate at the index magnitude is therefore:
+An exact upper-threshold star belongs to the adjacent coarser band. Writers must
+handle floating and render-quantization boundaries conservatively so the
+encoded magnitude remains consistent with the assigned natural level.
+
+Advantages:
+
+- cells are one level finer for nearly every magnitude band;
+- selected payloads cover one eighth the volume of the half-width alternative;
+- loaders retain a cheap `q=1` core;
+- loaders can progressively expand toward completeness; and
+- exact loading does not require rebuilding the artifact.
+
+Costs:
+
+- a complete query can inspect up to the current cell and all immediate
+  neighbours at an ordinary level;
+- exact loading may decode many outer-shell candidates that fail the per-star
+  visibility test; and
+- loader APIs must distinguish approximate quality from complete results.
+
+### 3.2 Half-width natural assignment — rejected
+
+The alternative writer assigns:
 
 ```text
-distanceToAABB(observer, node) < 2H(L)
+H(N)/2 <= R_index(M) < H(N)
 ```
 
-If a node fails that predicate, even its brightest permitted star at the
-observer-facing AABB boundary is not visible. No payload inspection is needed.
+This makes a one-half-width node query exhaustive. The geometric candidate set
+is bounded by the nearest `2 x 2 x 2` cells.
 
-A query using only `H(L)` is a useful approximation, not the full contract. It
-selects the current cell and the nearest neighbour in each axis. A visible star
-is omitted only when both conditions hold:
+The cost is durable coarsening. For the same magnitude band, emitted cells are
+twice the linear size and eight times the volume. More geometric candidates are
+occupied, and each selected payload tends to contain substantially more stars
+that fail the exact visibility test.
 
-1. it belongs to the brighter part of the level band and has `R > H(L)`; and
-2. its node lies in the shell `H(L) < distanceToAABB < R`.
+Half-width assignment is attractive if the only objective is a hard eight-cell
+bound. It is rejected because it fixes that loader choice into the artifact and
+removes the finer-grained quality options.
 
-This is why an omitted star is normally loaded late on approach and unloaded
-early on departure. It is not permanently missing. The effect is unrelated to
-stellar colour or type: it follows absolute magnitude and observer/node
-geometry. The samples contained omissions across many octree levels, although
-most were close to the 6.5 apparent-magnitude limit and consequently subtle.
+### 3.3 Raising the private placement magnitude — rejected
 
-### Half-width packing
+Using 7.0 or 7.5 for placement while retaining 6.5 as the normal display limit
+moves some stars to coarser levels and reduces omissions from a one-half-width
+loader. It is a safety margin, not a completeness guarantee.
 
-The later builder change assigns the same stars one level coarser:
+An exact one-level shift from 6.5 is:
 
 ```text
-H(L)/2 <= R(M) < H(L)
+6.5 + 5 log10(2) = 8.005149978
 ```
 
-The one-half-width predicate is now exhaustive:
+This alternative would also give the serialized `mag_limit` two meanings: the
+public index magnitude and a private writer margin. The accepted contract keeps
+`mag_limit` equal to the actual natural-assignment basis and exposes loader
+quality directly.
+
+### 3.4 Profile coarsening remains independent
+
+Classic level capping and STAR v2 terminal packing happen after natural
+assignment. They can reduce node, index, and request overhead by assigning
+natural cells to a coarser emitted payload node.
+
+That creates a different trade-off from magnitude assignment: profile
+coarsening may reduce structural work while increasing the spatial breadth and
+decoded size of a payload. It must not change the natural band. STAR v2's
+`brightest_level` preserves the bound needed to load a coarsened subtree safely.
+
+## 4. Loader alternatives and trade-offs
+
+For display magnitude `m_display`:
 
 ```text
-distanceToAABB(observer, node) < H(L)
+scale = 10 ^ ((m_display - m_index) / 5)
+load_radius = q H(B) scale
 ```
 
-This is the simplest contract if the only goal is a hard eight-cell bound.
-However, each selected node is twice the linear size, and therefore eight times
-the volume, of its full-width counterpart for the same magnitude band. The
-number of geometric candidates remains bounded by eight, but more of those
-coarse cells are payload-bearing and every selected payload tends to contain
-many more irrelevant stars.
+where `B` is the brightest natural level represented by the candidate node or
+subtree.
 
-This explains why payload-node counts can rise slightly after the coarser
-repack even though the query does not inspect more geometric cells: a larger
-cell is more likely to be occupied. More importantly, the star count per loaded
-payload rises sharply.
+### 4.1 Fast core: `q=1`
 
-## Measurements
+At the index magnitude, this selects at most the nearest `2 x 2 x 2` cells in an
+ordinary position. It is the smallest useful working set and is appropriate for
+a fast initial image or a deliberately constrained client.
 
-The following measurements used the public STAR v1 `c56103` artefact at an
-apparent-magnitude limit of 6.5. “Fast full” is the deployed full-width packing
-queried to `H`; “complete full” queries the same artefact to `2H`; “complete
-half” simulates reassigning the same catalogue one level coarser and queries to
-`H`.
+It is not complete for the brighter portion of a full-width natural band. A
+visible star is omitted only when both conditions hold:
 
-“Logical nodes” passed the geometric predicate, “payload nodes” actually held
-stars, “stars loaded” were decoded candidates, and “visible” passed the exact
-per-star apparent-magnitude test.
+1. its visibility radius is greater than one half-width; and
+2. its node lies in the shell between the core radius and the star's exact
+   visibility radius.
+
+Such a star is normally loaded late on approach and unloaded early on departure.
+It is not absent from the artifact.
+
+### 4.2 Progressive shell: `1 < q < 2`
+
+Intermediate values recover progressively more of the outer shell. For a
+display limit `m_display`, the selected node set is complete through:
+
+```text
+m_complete = m_display + 5 log10(q / 2)
+```
+
+At a display limit of 6.5, `q=1.59` is complete through approximately 6.0 and
+`q=1.78` through approximately 6.25.
+
+This is the principal benefit of the accepted writer policy: the loader can
+trade network, decode, upload, and memory cost against a known completeness
+threshold without changing the artifact.
+
+### 4.3 Complete shell: `q=2`
+
+This selects the complete immediate-neighbour shell for a normal full-width
+natural band. Exact APIs must use this policy by default, then apply the exact
+per-star apparent-magnitude filter after decoding.
+
+The trade-off is candidate amplification. Many newly decoded outer-shell stars
+can be just outside the requested apparent-magnitude limit. Completeness is
+therefore more expensive than the number of recovered stars alone suggests.
+
+### 4.4 Priority, batching, and memory
+
+After the node predicate is correct, the loader still controls when and how
+eligible data becomes resident. It should load the `q=1` core first and rank the
+outer shell by expected visual benefit.
+
+For nonzero AABB distance, a conservative best possible apparent magnitude is:
+
+```text
+m_best = m_index + 5 log10(distanceToAABB / (2H(B)))
+```
+
+STAR v2 adds `star_count`, so a client can combine visual benefit with decoded
+cost. Request coalescing, concurrency, cancellation, upload scheduling, and
+cache admission are loader trade-offs. They are not reasons to coarsen natural
+magnitude assignment in the writer.
+
+## 5. Measurements
+
+The measurements below used the public
+[`c56103e6` STAR v1 artifact](https://data.foundin.space/c56103e6-ad4c-41f9-be06-048b48ec632b/stars.octree).
+
+The apparent-magnitude limit was 6.5. “Fast full” uses the published full-width
+artifact with `q=1`. “Complete full” uses the same artifact with `q=2`.
+“Complete half” simulates moving the same catalogue one natural level coarser
+and querying with one half-width.
+
+“Logical nodes” pass the geometric predicate, “payload nodes” contain stars,
+“stars loaded” are decoded candidates, and “visible” pass the exact per-star
+apparent-magnitude test. These counts are decision evidence, not conformance
+thresholds.
 
 | Observer (pc) | Strategy | Logical nodes | Payload nodes | Stars loaded | Visible | Visible but missed |
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Sun `(0, 0, 0)` | Fast full, `H` | 113 | 82 | 63,582 | 13,552 | 0 |
-|  | Complete full, `2H` | 113 | 82 | 63,582 | 13,552 | 0 |
-|  | Complete half, `H` | 113 | 95 | 257,441 | 13,552 | 0 |
-| Orion `(50, 400, -40)` | Fast full, `H` | 109 | 78 | 46,305 | 9,517 | 317 (3.22%) |
-|  | Complete full, `2H` | 238 | 176 | 90,449 | 9,834 | 0 |
-|  | Complete half, `H` | 109 | 91 | 203,095 | 9,834 | 0 |
-| Generic `(123.4, 567.8, -910.1)` | Fast full, `H` | 102 | 71 | 13,680 | 2,103 | 114 (5.14%) |
-|  | Complete full, `2H` | 257 | 192 | 33,663 | 2,217 | 0 |
-|  | Complete half, `H` | 102 | 84 | 87,149 | 2,217 | 0 |
+| Sun `(0, 0, 0)` | Fast full, `q=1` | 113 | 82 | 63,582 | 13,552 | 0 |
+|  | Complete full, `q=2` | 113 | 82 | 63,582 | 13,552 | 0 |
+|  | Complete half | 113 | 95 | 257,441 | 13,552 | 0 |
+| Orion `(50, 400, -40)` | Fast full, `q=1` | 109 | 78 | 46,305 | 9,517 | 317 (3.22%) |
+|  | Complete full, `q=2` | 238 | 176 | 90,449 | 9,834 | 0 |
+|  | Complete half | 109 | 91 | 203,095 | 9,834 | 0 |
+| Generic `(123.4, 567.8, -910.1)` | Fast full, `q=1` | 102 | 71 | 13,680 | 2,103 | 114 (5.14%) |
+|  | Complete full, `q=2` | 257 | 192 | 33,663 | 2,217 | 0 |
+|  | Complete half | 102 | 84 | 87,149 | 2,217 | 0 |
 
-The percentages are samples, not a global error rate. In particular, the often
-quoted 3% is the Orion result, not a property of the format. The origin happened
-to have no omission because its alignment with the octree lattice made the
-`H` and strict `2H` candidate sets equal.
+The percentages are samples, not a global error rate. The origin happened to
+have no omission because its alignment with the octree lattice made the strict
+`q=1` and `q=2` candidate sets equal.
 
-The Orion full-width comparison also shows why simply changing the existing
-loader to exhaustive mode was expensive: it loaded another 44,144 candidates
-to recover 317 visible stars, so only 0.72% of the extra decoded stars affected
-the image. The half-width repack was more expensive again: it loaded 203,095
-stars, 4.39 times the original fast working set and 2.25 times the complete
-full-width working set, to render the same 9,834 stars.
+At Orion, complete loading of the full-width artifact decoded another 44,144
+candidates to recover 317 visible stars; 0.72% of the additional candidates
+affected the result. The half-width simulation decoded 203,095 stars: 4.39
+times the fast working set and 2.25 times the complete full-width working set to
+render the same 9,834 stars.
 
-The omitted Orion stars in this artefact had apparent magnitudes from 5.398 to
-6.5, with a median of 6.279. About 82% were fainter than magnitude 6.0 and 56.5%
-were between 6.25 and 6.5. They occurred at levels 8, 9, 11, 12, 13, and 14, so
-they were neither exclusively faint red dwarfs nor a terminal-level anomaly.
+The omitted Orion stars had apparent magnitudes from 5.398 to 6.5, with a median
+of 6.279. About 82% were fainter than 6.0, and 56.5% were between 6.25 and 6.5.
+They occurred at natural levels 8, 9, 11, 12, 13, and 14. The effect follows
+magnitude and observer/node geometry rather than stellar colour, type, or a
+single terminal level.
 
-A separate same-Stage-0 comparison of an earlier local STAR v1 and STAR v2 pair
-found the same 483 omitted stars in both formats at the Orion position. Their
-natural-level distribution was 2, 23, 313, 2, 13, 115, 4, and 11 stars at levels
-7 through 14 respectively. The absolute count differs from the public artefact
-because the catalogue builds differ; the equality within the paired build
-demonstrates that STAR v2 terminal packing did not cause the omission.
+A separate same-input comparison of an earlier local STAR v1 and STAR v2 pair
+found the same 483 omissions at Orion under the `q=1` loader. Their natural-level
+distribution was 2, 23, 313, 2, 13, 115, 4, and 11 stars at levels 7 through 14.
+The equal result within that paired build demonstrates that STAR v2 terminal
+packing did not cause the omission.
 
-### Raising the packing magnitude
-
-We also evaluated using 7.0 or 7.5 as the placement basis while retaining 6.5
-as the normal display/query limit. This moves some stars to coarser levels and
-reduces omissions, but it is a compromise rather than a geometric guarantee.
+### Placement-margin measurements
 
 | Placement basis | Sun: payloads / loaded / missed | Orion: payloads / loaded / missed | Generic: payloads / loaded / missed |
 | ---: | ---: | ---: | ---: |
@@ -195,134 +290,87 @@ reduces omissions, but it is a compromise rather than a geometric guarantee.
 | 7.5 | 91 / 167,368 / 0 | 87 / 128,179 / 17 | 80 / 49,195 / 2 |
 | 8.00515, exact half | 95 / 257,441 / 0 | 91 / 203,095 / 0 | 84 / 87,149 / 0 |
 
-The exact one-level shift is not 8.1. It is:
+The intermediate margins reduce omissions by accepting progressively coarser
+payloads. Only the exact one-level shift provides the half-width completeness
+guarantee, at the measured payload-overfetch cost.
 
-```text
-6.5 + 5 log10(2) = 8.005149978
-```
+## 6. STAR v1 and STAR v2
 
-Using a different private placement basis also creates two meanings for the
-single `mag_limit` currently serialized in the STAR header. Full-width packing
-with an explicit loader policy is clearer and avoids encoding a UI safety margin
-into every artefact.
+Magnitude-to-natural-level assignment is independent of the STAR container
+version. STAR v2 changes terminal topology and metadata; it neither creates nor
+repairs a mismatch between full-width writing and a one-half-width loader.
 
-## Decision and runtime control
+STAR v2 provides:
 
-Full-width packing is the canonical production contract. For display magnitude
-`m_display`, define:
+- `brightest_level`, the exact brightest natural band in a node's complete
+  subtree;
+- `star_count`, the records in the node's payload; and
+- `IS_TERMINAL`, marking a collapsed terminal payload.
 
-```text
-scale = 10 ^ ((m_display - m_index) / 5)
-loadRadius = q H(L) scale
-```
+For a v2 node, loader bounds and priority use `brightest_level`, not the coarser
+physical terminal half-width. The metadata is a band bound rather than the exact
+minimum absolute magnitude in the payload. Adding exact content-based metadata
+would be a separate format decision justified by client measurements.
 
-where `q` is an explicit loader quality parameter:
+## 7. Consequences and migration
 
-| `q` | Behaviour at the index magnitude |
-| ---: | --- |
-| `1` | Fast core; up to 8 cells per ordinary level; intentionally approximate |
-| `1 < q < 2` | Tunable shell; recovers progressively fainter boundary stars |
-| `2` | Complete for the packed band; up to 27 cells per ordinary level |
+### Writer consequences
 
-For a UI limit `m_display`, the apparent magnitude through which the node set is
-geometrically complete is:
+- Full-width assignment is the canonical meaning of a conforming artifact.
+- Natural assignment is part of tree and routing identity.
+- A half-width artifact must be rebuilt from newly routed and prepared data.
+- Profile materialization, `stars.octree`, and `identifiers.order` must also be
+  rebuilt because cell membership and ordinal order can change.
+- The upstream merged catalogue and upstream identity source remain reusable.
+- Format versions do not need a width-policy flag because half-width assignment
+  is nonconforming rather than an alternate production mode.
 
-```text
-m_complete = m_display + 5 log10(q / 2)
-```
+### Loader consequences
 
-At a UI limit of 6.5, `q=1` is complete through approximately 4.995, `q=1.59`
-through 6.0, `q=1.78` through 6.25, and `q=2` through 6.5. This provides a
-meaningful quality control without rebuilding or loading the entire outer shell
-at once.
+- `q` is explicit and restricted to the documented quality range.
+- An exhaustive API such as `stars_brighter_than` defaults to `q=2`.
+- Performance clients may deliberately use `q<2` and should expose or document
+  the resulting completeness threshold.
+- STAR v2 traversal uses `brightest_level`; STAR v1 uses physical node level as
+  a conservative fallback.
+- Core-first scheduling and shell priority are runtime policies.
 
-The recommended progressive policy is:
+### Publication consequences
 
-1. load the `q=1` core first;
-2. rank nodes in the shell `H < distanceToAABB < 2H` by visual benefit; and
-3. expand toward `q=2` as the frame, network, decode, and memory budgets allow.
+Full- and half-width artifacts cannot be distinguished from `mag_limit` and
+STAR version alone. During migration, publication metadata or dataset UUID must
+identify legacy half-width builds. A dataset must not be declared conforming to
+the baseline until its natural assignment and dependent artifacts have been
+rebuilt.
 
-For a normal full-width node, a conservative best possible apparent magnitude
-can be estimated without reading the payload:
+## 8. Responsibility boundary
 
-```text
-m_best = m_index + 5 log10(distanceToAABB / (2H))
-```
+The writer owns:
 
-Nodes with the smallest `m_best` have the greatest chance of contributing a
-bright visible star and should be prioritised. Handle zero AABB distance as an
-immediate/core node rather than evaluating the logarithm.
+- magnitude-to-natural-level assignment;
+- profile mapping and node topology;
+- terminal aggregation and serialized priority metadata;
+- render and identity ordinal alignment; and
+- physical payload order.
 
-## STAR v1, STAR v2, and responsibility boundaries
+The loader owns:
 
-Magnitude packing is independent of the STAR container version. STAR v2
-improves terminal-subtree packing; it does not by itself correct or cause the
-`H` versus `2H` selector mismatch.
-
-STAR v2 does provide useful loader metadata:
-
-- `brightest_level` gives the brightest natural magnitude band in a node's
-  complete subtree;
-- `star_count` gives the number of stars in the payload; and
-- `IS_TERMINAL` identifies a collapsed terminal payload.
-
-For a v2 terminal or ancestor, derive the conservative visibility bound from
-`brightest_level`, not from the coarser physical terminal-node half-width. Under
-the full-width contract, natural level `B` has `R_max = 2H(B)`. This supports
-safe pruning and benefit-per-star prioritisation. It is still a band bound, not
-the exact minimum absolute magnitude in that payload; exact content-based
-priority would require additional metadata.
-
-The octree artefact determines:
-
-- magnitude-to-natural-level packing;
-- node geometry and topology;
-- terminal aggregation and available priority metadata; and
-- physical payload order, currently depth-first/Morton in
-  [`packing/dfs.py`](../src/foundinspace/octree/packing/dfs.py).
-
-The client determines:
-
-- the chosen `q` and whether completeness is required;
+- the chosen `q` and whether approximation is acceptable;
 - traversal and visible-benefit priority;
 - request coalescing and batch size;
 - decode/upload scheduling and cancellation; and
-- cache and memory policy.
+- cache, concurrency, and memory policy.
 
-Breadth-first versus depth-first request order, sorting shell nodes by expected
-brightness, and preventing low-value batches from occupying all request slots
-are therefore primarily client-side work. Changing physical payload order or
-adding exact minimum-magnitude metadata would be octree-format work, but should
-follow client instrumentation and controlled benchmarks rather than be assumed
-necessary.
+Changing physical payload order or adding exact minimum-magnitude metadata is
+format work. Breadth-first versus depth-first requests and preventing low-value
+batches from occupying request slots are loader work. Format changes should
+follow instrumentation showing that loader policy alone cannot meet the target.
 
-## Implementation implications
+## 9. Related documents
 
-The current code does not yet implement this accepted contract end to end:
-
-- [`mag_levels.py`](../src/foundinspace/octree/mag_levels.py) contains the
-  half-width reassignment; its use of the level `L+1` threshold makes level `L`
-  satisfy approximately `H(L)/2 < R <= H(L)`.
-- [`reader/__init__.py`](../src/foundinspace/octree/reader/__init__.py), the
-  stats path, terminal-memory testbed, and packing benchmark all use
-  `node.half_size * scale`, which is `q=1`.
-- [`star-v2.md`](star-v2.md) correctly documents `brightest_level`,
-  `star_count`, and terminal structure, but the version does not serialize a
-  full-width/half-width policy flag.
-
-The half-width source change and the original full-width artefacts are not
-distinguishable from `mag_limit` and STAR version alone. The migration should
-define full width as the canonical meaning, restore the original band
-placement, make `q` explicit in readers and benchmarks, and rebuild half-width
-artefacts from newly routed and prepared data. Routing and preparation must be
-rerun because they contain the assigned natural `level` column; the upstream
-merged catalogue and identifier map remain reusable. `stars_brighter_than`
-should default to `q=2`, because its name promises a complete result;
-performance clients may deliberately select a smaller `q`.
-
-Tests must cover both halves of the contract:
-
-1. every encoded magnitude at natural level `L` has `H(L) <= R < 2H(L)`, after
-   render-magnitude quantisation and boundary handling; and
-2. a complete AABB query reaches all and only the current/immediate-neighbour
-   ring, with explicit lattice-boundary cases.
+- [`octree-spec.md`](octree-spec.md) — normative writer and loader contract
+- [`products.md`](products.md) — pipeline product and invalidation boundaries
+- [`star-v2.md`](star-v2.md) — terminal topology and binary metadata
+- [`reader.md`](reader.md) — Python reader implementation design
+- [`terminal-memory-testbed.md`](terminal-memory-testbed.md) — runtime memory
+  experiments for terminal payloads

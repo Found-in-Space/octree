@@ -4,6 +4,11 @@ STAR v2 adds terminal subtree packing and serialized payload star counts while
 leaving the existing header, descriptor, shard header, payload codec, and star
 record unchanged.
 
+STAR version and magnitude assignment are independent. Both STAR v1 and v2 use
+the full-width natural-assignment contract in
+[`octree-spec.md`](octree-spec.md). This document defines the v2 topology and
+encoding delta.
+
 ## Build policy
 
 New project files default to:
@@ -145,6 +150,18 @@ The structural flag byte remains unchanged and its upper nibble stays reserved.
 `star_count` is zero for index-only nodes, the node's own payload count for
 ordinary payload-bearing nodes, and the complete collapsed-subtree count for a
 terminal. A terminal must have a payload, `IS_TERMINAL`, and no children.
+
+## Loading semantics
+
+For loading, `brightest_level` is the node's `B` value from `octree-spec.md`.
+Node-selection radius and priority must derive from `H(B)`, not from the
+potentially coarser emitted-node half-width. `star_count` can inform
+benefit-per-star or memory-cost priority, but it does not alter the geometric
+completeness predicate.
+
+The loader-quality factor is runtime policy and is not serialized in STAR v2.
+Terminal packing therefore changes payload and topology granularity without
+changing natural magnitude bands or forcing one loader quality.
 
 ## Reader compatibility
 

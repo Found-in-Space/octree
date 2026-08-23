@@ -20,14 +20,21 @@ the faintest into the deepest (smallest cells). The placement threshold at each
 level is derived from `limiting_magnitude` (default 6.5, roughly the naked-eye
 limit).
 
-The accepted production contract uses **full-width magnitude packing**: stars
-at level `L` have visibility radii between the cell half-width and full width.
-This retains finer spatial cells and lets the runtime trade a fast
-nearest-eight-cell core against a complete immediate-neighbour shell. See
+The accepted production contract uses **full-width natural magnitude
+assignment**: stars at natural level `N` have visibility radii between the cell
+half-width and full width. This retains finer spatial cells. The loader then
+chooses independently between a fast nearest-eight-cell core and a complete
+immediate-neighbour shell. See [`docs/octree-spec.md`](docs/octree-spec.md) for
+the normative writer and loader contracts, and
 [`docs/magnitude-packing-and-loading.md`](docs/magnitude-packing-and-loading.md)
-for the exact geometry, measured trade-offs, and implementation implications.
+for the decision evidence and measured trade-offs.
 
-At runtime, the viewer computes a visibility radius for each level. Bright-star cells have large visibility radii and are loaded from anywhere in the scene; faint-star cells have small radii and load only when the observer is nearby. This gives progressive, distance-dependent detail that mirrors how real starlight works.
+At runtime, the viewer computes a node-selection radius from the requested
+display magnitude, the brightest natural level represented by a node, and an
+explicit quality factor. Bright-star cells have large selection radii and are
+loaded from anywhere in the scene; faint-star cells have small radii and load
+only when the observer is nearby. This gives progressive, distance-dependent
+detail that mirrors how real starlight works.
 
 ## Build products
 
@@ -302,19 +309,32 @@ src/foundinspace/octree/
 
 ## Documentation
 
-Pipeline architecture and supporting notes:
+Normative artifact specifications:
 
-- [`docs/products.md`](docs/products.md) — purpose-named product boundaries
-- [`docs/pipeline-plan.md`](docs/pipeline-plan.md) — bounded-memory,
-  immutable-contribution architecture and remaining refinements
-- [`docs/sidecars.md`](docs/sidecars.md)
+- [`docs/octree-spec.md`](docs/octree-spec.md) — canonical star-octree writer
+  and loader contracts
+- [`docs/star-v2.md`](docs/star-v2.md) — terminal topology and binary metadata
 - [`docs/identifiers-order.md`](docs/identifiers-order.md)
 - [`docs/identity-lookup-index.md`](docs/identity-lookup-index.md)
-- [`docs/reader.md`](docs/reader.md)
-- [`docs/star-v2.md`](docs/star-v2.md)
-- [`docs/terminal-memory-testbed.md`](docs/terminal-memory-testbed.md)
+- [`docs/sidecars.md`](docs/sidecars.md)
+
+Implementation architecture and plans:
+
+- [`docs/products.md`](docs/products.md) — purpose-named product boundaries
+- [`docs/streaming-pipeline.md`](docs/streaming-pipeline.md) — bounded streaming
+  architecture
+- [`docs/pipeline-plan.md`](docs/pipeline-plan.md) — implementation status and
+  remaining refinements
+- [`docs/reader.md`](docs/reader.md) — Python reader implementation design
 - [`docs/glow.md`](docs/glow.md)
 - [`docs/roadmap.md`](docs/roadmap.md)
+
+Decision evidence and testbeds:
+
+- [`docs/magnitude-packing-and-loading.md`](docs/magnitude-packing-and-loading.md)
+  — full-width assignment and runtime-quality decision
+- [`docs/terminal-memory-testbed.md`](docs/terminal-memory-testbed.md)
+- [`docs/identity-locator-v2-benchmark.md`](docs/identity-locator-v2-benchmark.md)
 
 ## Tests
 

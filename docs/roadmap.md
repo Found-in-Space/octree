@@ -114,6 +114,8 @@ These remain part of every profile:
 
 ## Related documentation
 
+- [`octree-spec.md`](octree-spec.md)
+- [`magnitude-packing-and-loading.md`](magnitude-packing-and-loading.md)
 - [`streaming-pipeline.md`](streaming-pipeline.md)
 - [`pipeline-plan.md`](pipeline-plan.md)
 - [`products.md`](products.md)

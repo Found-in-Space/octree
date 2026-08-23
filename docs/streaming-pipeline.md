@@ -3,6 +3,10 @@
 This document defines the octree build architecture. Durable products, commands,
 paths, manifests, and state are named by their purpose.
 
+The artifact's magnitude-assignment and loading semantics are defined in
+[`octree-spec.md`](octree-spec.md). This document owns execution architecture,
+not runtime query quality.
+
 ## Non-negotiable properties
 
 - Catalogue data is processed with bounded-memory streams.
