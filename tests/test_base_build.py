@@ -56,6 +56,7 @@ from foundinspace.octree.sources.routing import (
     RoutingConfig,
     route_contributions,
 )
+from magnitude_helpers import represented_magnitude_for_level
 
 
 def test_final_pair_lock_preserves_live_temp_across_work_dirs(tmp_path: Path) -> None:
@@ -227,6 +228,12 @@ def _write_input(
 ) -> None:
     shard_dir = root / shard_id
     shard_dir.mkdir(parents=True, exist_ok=True)
+    magnitudes = [row.get("mag_abs", 7.0) for row in rows]
+    if include_routing:
+        magnitudes = [
+            represented_magnitude_for_level(row["level"], magnitude)
+            for row, magnitude in zip(rows, magnitudes, strict=True)
+        ]
     columns = {
         "source": pa.array(
             [row.get("source", "gaia") for row in rows],
@@ -239,10 +246,7 @@ def _write_input(
         "x_icrs_pc": pa.array([row["x_icrs_pc"] for row in rows], pa.float64()),
         "y_icrs_pc": pa.array([row["y_icrs_pc"] for row in rows], pa.float64()),
         "z_icrs_pc": pa.array([row["z_icrs_pc"] for row in rows], pa.float64()),
-        "mag_abs": pa.array(
-            [row.get("mag_abs", 7.0) for row in rows],
-            type=pa.float64(),
-        ),
+        "mag_abs": pa.array(magnitudes, type=pa.float64()),
     }
     if any("teff" in row for row in rows):
         columns["teff"] = pa.array(
@@ -271,13 +275,20 @@ def _write_legacy_input(root: Path, rows: list[dict], *, max_level: int) -> None
         dtype=np.int32,
     )
     morton_codes = np.array([row["morton_code"] for row in rows], dtype=np.uint64)
+    magnitudes = np.array(
+        [
+            represented_magnitude_for_level(row["level"], row["mag_abs"])
+            for row in rows
+        ],
+        dtype=np.float64,
+    )
     renders = encode_render_records(
         morton_codes=morton_codes,
         positions=np.array(
             [[row["x_icrs_pc"], row["y_icrs_pc"], row["z_icrs_pc"]] for row in rows],
             dtype=np.float64,
         ),
-        mag_abs=np.array([row["mag_abs"] for row in rows], dtype=np.float64),
+        mag_abs=magnitudes,
         teff=np.array([row.get("teff", 5800.0) for row in rows], dtype=np.float64),
         levels=levels,
     )
@@ -286,8 +297,15 @@ def _write_legacy_input(root: Path, rows: list[dict], *, max_level: int) -> None
         | {
             "level": int(level),
             "render": render.tobytes(),
+            "mag_abs": float(magnitude),
         }
-        for row, level, render in zip(rows, levels, renders, strict=True)
+        for row, level, render, magnitude in zip(
+            rows,
+            levels,
+            renders,
+            magnitudes,
+            strict=True,
+        )
     ]
     shard_dir = root / "100"
     shard_dir.mkdir(parents=True, exist_ok=True)
@@ -606,7 +624,7 @@ def test_classic_v2_packs_terminal_and_preserves_order_and_positions(
     with IdentifiersOrderReader(identifiers_path) as reader:
         [(record, identities)] = list(reader.iter_cells())
     assert (record.level, record.node_id, record.star_count) == (0, 0, 2)
-    assert identities == [("gaia", "first"), ("gaia", "later")]
+    assert identities == [("gaia", "later"), ("gaia", "first")]
 
     with OctreeReader(output_path) as reader:
         stars = sorted(
@@ -618,12 +636,12 @@ def test_classic_v2_packs_terminal_and_preserves_order_and_positions(
         stars[0].position.x,
         stars[0].position.y,
         stars[0].position.z,
-    ) == pytest.approx(child_center, abs=1e-5)
+    ) == pytest.approx((20_000.0, 40_000.0, 60_000.0), abs=0.01)
     assert (
         stars[1].position.x,
         stars[1].position.y,
         stars[1].position.z,
-    ) == pytest.approx((20_000.0, 40_000.0, 60_000.0), abs=0.01)
+    ) == pytest.approx(child_center, abs=1e-5)
 
 
 def test_classic_v2_counts_index_only_and_nested_terminal_nodes(
@@ -855,10 +873,10 @@ def test_classic_build_merges_sorted_preparation_groups_in_canonical_order(
         cells = list(reader.iter_cells())
     assert len(cells) == 1
     assert cells[0][1] == [
-        ("gaia", "a"),
-        ("gaia", "b"),
         ("gaia", "m"),
+        ("gaia", "b"),
         ("gaia", "z"),
+        ("gaia", "a"),
     ]
 
 
@@ -1083,10 +1101,10 @@ def test_classic_build_externally_merges_folded_group_batches(
         cells = list(reader.iter_cells())
     assert len(cells) == 1
     assert cells[0][1] == [
-        ("gaia", "b"),
-        ("gaia", "a"),
         ("gaia", "y"),
         ("gaia", "z"),
+        ("gaia", "b"),
+        ("gaia", "a"),
     ]
 
 
@@ -1422,7 +1440,10 @@ def test_classic_build_rejects_preparation_without_raw_fields(tmp_path: Path) ->
                 "morton_code": pa.array([rows[0]["morton_code"]], pa.uint64()),
                 "render": pa.array([rows[0]["render"]], pa.binary(16)),
                 "level": pa.array([1], pa.int32()),
-                "mag_abs": pa.array([7.0], pa.float64()),
+                "mag_abs": pa.array(
+                    [represented_magnitude_for_level(1, 7.0)],
+                    pa.float64(),
+                ),
             }
         ),
         shard_dir / "part.parquet",

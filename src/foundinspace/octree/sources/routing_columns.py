@@ -29,6 +29,7 @@ from foundinspace.octree.config import (
 from foundinspace.octree.duckdb_util import configure_connection
 from foundinspace.octree.encoding.morton import morton3d_u64_from_xyz_arrays
 from foundinspace.octree.mag_levels import MagLevelConfig
+from foundinspace.octree.magnitudes import quantize_render_magnitudes
 
 
 def _compute_level(
@@ -36,8 +37,8 @@ def _compute_level(
     mag_config: MagLevelConfig,
 ) -> np.ndarray:
     """Compute the natural magnitude-assigned level for each row."""
-    mag_abs = np.where(np.isfinite(mag_abs), mag_abs.astype(np.float64), 99.0)
-    return mag_config.assign_level_array(mag_abs)
+    represented = quantize_render_magnitudes(mag_abs)
+    return mag_config.assign_level_array(represented)
 
 
 def _compression_from_metadata(file_meta) -> str:

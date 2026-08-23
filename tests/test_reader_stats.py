@@ -12,15 +12,23 @@ from foundinspace.octree.packing import PackingPlan, pack_octree
 from foundinspace.octree.packing.records import (
     DESCRIPTOR_SIZE,
     HEADER_SIZE,
+    IS_TERMINAL,
     SHARD_MAGIC,
     PackedDescriptorFields,
     PackedHeaderFields,
     pack_descriptor,
     pack_top_level_header,
 )
-from foundinspace.octree.reader import NodeEntry, OctreeReader, Point, read_header
+from foundinspace.octree.reader import (
+    NodeEntry,
+    OctreeHeader,
+    OctreeReader,
+    Point,
+    read_header,
+)
 from foundinspace.octree.reader.index import GridCoord
 from foundinspace.octree.reader.stats import collect_stats
+from foundinspace.octree.reader.visibility import should_prune_magnitude_node
 from packing_helpers import (
     PayloadNode,
     build_intermediates,
@@ -79,6 +87,81 @@ def _build_small_octree(tmp_path: Path) -> Path:
         ),
     )
     return output
+
+
+def _build_full_width_shell_octree(tmp_path: Path) -> Path:
+    payload = b"".join(
+        [
+            _encode_star(
+                x_rel=1.0,
+                y_rel=0.0,
+                z_rel=0.0,
+                abs_mag=-14.72,
+                teff_log8=128,
+            ),
+            _encode_star(
+                x_rel=1.0,
+                y_rel=0.0,
+                z_rel=0.0,
+                abs_mag=-14.0,
+                teff_log8=80,
+            ),
+        ]
+    )
+    manifest_path = build_intermediates(
+        tmp_path / "shell-intermediates",
+        [PayloadNode(level=1, node_id=0, star_count=2, raw_payload=payload)],
+        max_level=1,
+        mag_limit=6.5,
+    )
+    output = tmp_path / "shell-stars.octree"
+    pack_octree(
+        manifest_path,
+        output,
+        plan=PackingPlan(max_open_files=2, star_format_version=1),
+        descriptor=PackedDescriptorFields(
+            artifact_kind="render",
+            dataset_uuid=DATASET_UUID,
+        ),
+    )
+    return output
+
+
+def _synthetic_header(*, version: int) -> OctreeHeader:
+    return OctreeHeader(
+        version=version,
+        artifact_kind="render",
+        index_offset=0,
+        index_length=0,
+        world_center=(0.0, 0.0, 0.0),
+        world_half_size=200_000.0,
+        payload_record_size=STAR_RECORD_FMT.size,
+        max_level=2,
+        mag_limit=6.5,
+        dataset_uuid=None,
+        parent_dataset_uuid=None,
+        sidecar_uuid=None,
+        sidecar_kind=None,
+    )
+
+
+def _synthetic_node(*, flags: int, brightest_level: int | None) -> NodeEntry:
+    return NodeEntry(
+        level=1,
+        grid=GridCoord(0, 0, 0),
+        center=Point(0.0, 0.0, 0.0),
+        half_size=100_000.0,
+        flags=flags,
+        child_mask=0,
+        payload_offset=0,
+        payload_length=0,
+        _shard_offset=0,
+        _node_index=1,
+        _first_child=0,
+        _local_depth=1,
+        _local_path=0,
+        brightest_level=brightest_level,
+    )
 
 
 def _build_small_octree_with_meta(tmp_path: Path) -> tuple[Path, Path]:
@@ -241,6 +324,63 @@ def test_octree_reader_queries_and_teff_sentinel(tmp_path: Path) -> None:
     assert any(math.isnan(star.teff) for star in bright)
 
 
+def test_load_factor_two_is_exhaustive_and_one_is_approximate(tmp_path: Path) -> None:
+    octree_path = _build_full_width_shell_octree(tmp_path)
+    observer = Point(150_000.0, -100_000.0, -100_000.0)
+
+    with OctreeReader(octree_path) as reader:
+        exhaustive = list(
+            reader.stars_brighter_than(observer, 6.5, load_factor=2.0)
+        )
+        approximate = list(
+            reader.stars_brighter_than(observer, 6.5, load_factor=1.0)
+        )
+
+    assert [star.magnitude for star in exhaustive] == pytest.approx([-14.72])
+    assert approximate == []
+
+
+@pytest.mark.parametrize("flags", [0, IS_TERMINAL])
+def test_v2_uses_brightest_level_while_v1_falls_back_to_emitted_level(
+    flags: int,
+) -> None:
+    observer = Point(225_000.0, 0.0, 0.0)
+    v2_node = _synthetic_node(flags=flags, brightest_level=2)
+    v1_node = _synthetic_node(flags=flags, brightest_level=None)
+
+    assert should_prune_magnitude_node(
+        header=_synthetic_header(version=2),
+        node=v2_node,
+        point=observer,
+        limiting_magnitude=6.5,
+    )
+    assert not should_prune_magnitude_node(
+        header=_synthetic_header(version=1),
+        node=v1_node,
+        point=observer,
+        limiting_magnitude=6.5,
+    )
+
+
+@pytest.mark.parametrize("load_factor", [0.999, 2.001, float("inf"), float("nan")])
+def test_octree_reader_rejects_invalid_load_factor(
+    tmp_path: Path,
+    load_factor: float,
+) -> None:
+    octree_path = _build_small_octree(tmp_path)
+    with (
+        OctreeReader(octree_path) as reader,
+        pytest.raises(ValueError, match="load_factor"),
+    ):
+        list(
+            reader.stars_brighter_than(
+                Point(0.0, 0.0, 0.0),
+                6.5,
+                load_factor=load_factor,
+            )
+        )
+
+
 def test_collect_stats_level_totals_and_nearest(tmp_path: Path) -> None:
     octree_path = _build_small_octree(tmp_path)
     report = collect_stats(
@@ -263,6 +403,8 @@ def test_collect_stats_level_totals_and_nearest(tmp_path: Path) -> None:
     assert report.totals.nodes == row.nodes
     assert report.totals.stars_loaded == row.stars_loaded
     assert report.totals.stars_rendered == row.stars_rendered
+    assert report.load_factor == 2.0
+    assert report.m_complete == pytest.approx(6.5)
 
     assert report.coalesced.input_ranges == 1
     assert report.coalesced.output_batches == 1
@@ -270,6 +412,37 @@ def test_collect_stats_level_totals_and_nearest(tmp_path: Path) -> None:
 
     assert len(report.nearest) == 2
     assert report.nearest[0].distance_pc <= report.nearest[1].distance_pc
+
+
+def test_collect_stats_uses_and_reports_load_factor(tmp_path: Path) -> None:
+    octree_path = _build_full_width_shell_octree(tmp_path)
+    observer = Point(150_000.0, -100_000.0, -100_000.0)
+
+    exhaustive = collect_stats(
+        octree_path,
+        point=observer,
+        limiting_magnitude=6.5,
+        load_factor=2.0,
+        radius_pc=0.0,
+    )
+    approximate = collect_stats(
+        octree_path,
+        point=observer,
+        limiting_magnitude=6.5,
+        load_factor=1.0,
+        radius_pc=0.0,
+    )
+
+    assert exhaustive.load_factor == 2.0
+    assert exhaustive.m_complete == pytest.approx(6.5)
+    assert exhaustive.totals.stars_loaded == 2
+    assert exhaustive.totals.stars_rendered == 1
+    assert approximate.load_factor == 1.0
+    assert approximate.m_complete == pytest.approx(
+        6.5 + 5.0 * math.log10(0.5)
+    )
+    assert approximate.totals.stars_loaded == 0
+    assert approximate.totals.stars_rendered == 0
 
 
 def test_collect_stats_includes_identifiers_from_meta_octree(tmp_path: Path) -> None:

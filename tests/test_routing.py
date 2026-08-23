@@ -17,6 +17,7 @@ from foundinspace.octree.sources.routing import (
     RoutingConfig,
     route_contributions,
 )
+from magnitude_helpers import represented_magnitude_for_level
 from project_helpers import project_text
 
 
@@ -35,7 +36,13 @@ def _routing_table(rows: list[dict], *, shard_id: str) -> pa.Table:
             ),
             "render": pa.array([b"\x00" * 16 for _ in rows], type=pa.binary(16)),
             "level": pa.array([r["level"] for r in rows], type=pa.int32()),
-            "mag_abs": pa.array([r["mag_abs"] for r in rows], type=pa.float64()),
+            "mag_abs": pa.array(
+                [
+                    represented_magnitude_for_level(r["level"], r["mag_abs"])
+                    for r in rows
+                ],
+                type=pa.float64(),
+            ),
             "healpix_id": pa.array([shard_id for _ in rows], type=pa.string()),
         }
     )
@@ -160,7 +167,9 @@ def test_routing_writes_tree_manifest_and_state(tmp_path: Path) -> None:
             "limiting_magnitude": 6.5,
             "bucket_rows": 100,
             "morton_bits": MORTON_BITS,
-            "row_schema_version": "routing-row-schema/v3",
+            "row_schema_version": "routing-row-schema/v4",
+            "natural_level_policy": "full-width/v1",
+            "render_magnitude_codec": "centimag-round-clip/v1",
         }
         == manifest["tree_identity"]
     )
@@ -267,7 +276,7 @@ def test_routing_explicit_raw_filter_preserves_row_count_and_records_filter(
         "level",
     }.issubset(table.schema.names)
     assert "render" not in table.schema.names
-    assert table.column("level").to_pylist() == [13, 13]
+    assert table.column("level").to_pylist() == [14, 14]
     assert table.select(
         ["x_icrs_pc", "y_icrs_pc", "z_icrs_pc", "mag_abs", "teff"]
     ).to_pylist() == [
@@ -286,6 +295,68 @@ def test_routing_explicit_raw_filter_preserves_row_count_and_records_filter(
             "teff": 5000.0,
         },
     ]
+
+
+def test_pre_routed_input_rejects_inconsistent_natural_level(tmp_path: Path) -> None:
+    input_root = tmp_path / "input"
+    pixel_dir = input_root / "100"
+    pixel_dir.mkdir(parents=True)
+    table = _routing_table(
+        [
+            {
+                "source": "gaia",
+                "source_id": "half-width",
+                "morton_code": _morton_for_node(1, 0),
+                "level": 1,
+                "mag_abs": 7.0,
+            }
+        ],
+        shard_id="100",
+    )
+    table = table.set_column(
+        table.schema.get_field_index("level"),
+        "level",
+        pa.array([2], type=pa.int32()),
+    )
+    pq.write_table(table, pixel_dir / "part.parquet")
+
+    with pytest.raises(
+        ValueError,
+        match="Pre-routed natural levels do not match full-width/v1",
+    ):
+        route_contributions(_routing_config(input_root, tmp_path / "routing"))
+
+
+def test_old_routing_identity_cannot_resume(tmp_path: Path) -> None:
+    input_root = tmp_path / "input"
+    _write_routing_pixel(
+        input_root,
+        "100",
+        [
+            {
+                "source": "gaia",
+                "source_id": "a",
+                "morton_code": _morton_for_node(1, 0),
+                "level": 1,
+                "mag_abs": 7.0,
+            }
+        ],
+    )
+    out_dir = tmp_path / "routing"
+    config = _routing_config(input_root, out_dir)
+    route_contributions(config)
+
+    for name in ("tree-manifest.json", "pipeline-state.json"):
+        path = out_dir / name
+        document = json.loads(path.read_text(encoding="utf-8"))
+        identity = document["tree_identity"]
+        identity["row_schema_version"] = "routing-row-schema/v3"
+        identity.pop("natural_level_policy")
+        identity.pop("render_magnitude_codec")
+        path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="rerun route with --force"):
+        route_contributions(config)
 
 
 def test_routing_fails_if_input_mode_changes_row_count(
@@ -624,7 +695,10 @@ def test_routing_normalizes_legacy_quality_flags_schema_drift(
         "x_icrs_pc": pa.array([1.0], type=pa.float64()),
         "y_icrs_pc": pa.array([0.0], type=pa.float64()),
         "z_icrs_pc": pa.array([0.0], type=pa.float64()),
-        "mag_abs": pa.array([8.0], type=pa.float64()),
+        "mag_abs": pa.array(
+            [represented_magnitude_for_level(2, 8.0)],
+            type=pa.float64(),
+        ),
     }
     pq.write_table(
         pa.table(common | {"quality_flags": pa.array([1], type=pa.uint16())}),
@@ -694,7 +768,10 @@ def test_routing_still_rejects_unrelated_schema_drift(tmp_path: Path) -> None:
         "source_id": pa.array(["a"], type=pa.string()),
         "morton_code": pa.array([_morton_for_node(2, 0)], type=pa.uint64()),
         "level": pa.array([2], type=pa.int32()),
-        "mag_abs": pa.array([8.0], type=pa.float64()),
+        "mag_abs": pa.array(
+            [represented_magnitude_for_level(2, 8.0)],
+            type=pa.float64(),
+        ),
         "quality_flags": pa.array([1], type=pa.uint16()),
     }
     pq.write_table(

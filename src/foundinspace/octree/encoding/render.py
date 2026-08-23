@@ -8,6 +8,7 @@ from foundinspace.octree.config import (
     WORLD_HALF_SIZE_PC,
 )
 from foundinspace.octree.encoding.teff import encode_teff
+from foundinspace.octree.magnitudes import encode_render_magnitude_ticks
 
 RENDER_RECORD_SIZE = 16
 _RENDER_DTYPE = np.dtype(
@@ -77,7 +78,7 @@ def encode_render_records(
     if not np.isfinite(half_size) or half_size <= 0:
         raise ValueError("half_size must be finite and > 0")
 
-    normalized_mag = np.where(np.isfinite(mag_abs), mag_abs, 99.0)
+    magnitude_ticks = encode_render_magnitude_ticks(mag_abs)
     normalized_teff = np.where(np.isfinite(teff), teff, 5800.0)
     teff_log8 = encode_teff(normalized_teff)
     render_out = np.zeros(n, dtype=_RENDER_DTYPE)
@@ -150,11 +151,7 @@ def encode_render_records(
             -1.0,
             1.0,
         )
-        records["mag"] = np.clip(
-            np.round(normalized_mag[indices] * 100.0),
-            -32768,
-            32767,
-        )
+        records["mag"] = magnitude_ticks[indices]
         records["teff"] = teff_log8[indices]
         render_out[indices] = records
 

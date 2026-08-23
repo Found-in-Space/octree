@@ -17,6 +17,7 @@ import pyarrow.parquet as pq
 
 from foundinspace.octree.config import MORTON_BITS, WORLD_CENTER, WORLD_HALF_SIZE_PC
 from foundinspace.octree.mag_levels import MagLevelConfig
+from foundinspace.octree.magnitudes import RENDER_MAG_CODEC_IDENTITY
 
 from .semantic_checksum import (
     SEMANTIC_CHECKSUM_ALGORITHM,
@@ -24,8 +25,9 @@ from .semantic_checksum import (
 )
 
 ROUTING_GROUP_CHECKSUM_ALGORITHM = SEMANTIC_CHECKSUM_ALGORITHM
-ROUTING_ROW_SCHEMA_VERSION = "routing-row-schema/v3"
+ROUTING_ROW_SCHEMA_VERSION = "routing-row-schema/v4"
 ROUTING_SPLIT_POLICY = "lower-mag-limited-bucket/v0"
+NATURAL_LEVEL_POLICY = "full-width/v1"
 ROUTING_INPUT_MODE_PRE_ROUTED = "pre-routed"
 ROUTING_INPUT_MODE_CARTESIAN = "cartesian"
 ROUTING_INPUT_MODES = (
@@ -256,6 +258,8 @@ class _RoutingBuilder:
         self._rows_after_filter += len(filtered)
         normalized = _normalize_routing_input_schema(filtered)
         routed = _ensure_routing_columns(normalized)
+        if self._config.input_mode == ROUTING_INPUT_MODE_PRE_ROUTED:
+            _validate_pre_routed_levels(routed, self._config.mag_config)
         self._route_table(
             self._node_for_path(()),
             routed,
@@ -1260,6 +1264,8 @@ def _tree_identity_values(
         "bucket_rows": bucket_rows,
         "input_mode": input_mode,
         "split_policy": ROUTING_SPLIT_POLICY,
+        "natural_level_policy": NATURAL_LEVEL_POLICY,
+        "render_magnitude_codec": RENDER_MAG_CODEC_IDENTITY,
         "row_schema_version": ROUTING_ROW_SCHEMA_VERSION,
         "group_checksum_algorithm": ROUTING_GROUP_CHECKSUM_ALGORITHM,
     }
@@ -1393,7 +1399,8 @@ def _validate_resumable_routing_state(
     expected_identity = _tree_identity(config)
     if manifest.get("tree_identity") != expected_identity:
         raise ValueError(
-            "Existing Routing tree identity does not match current project config"
+            "Existing Routing tree identity does not match current project config; "
+            "rerun route with --force."
         )
     if state.get("tree_identity") != expected_identity:
         raise ValueError("Routing state identity does not match tree manifest")
@@ -1725,6 +1732,31 @@ def _ensure_routing_columns(table: pa.Table) -> pa.Table:
         if table.column(name).null_count:
             raise ValueError(f"Routing column must not contain nulls: {name}")
     return table
+
+
+def _validate_pre_routed_levels(
+    table: pa.Table,
+    mag_config: MagLevelConfig,
+) -> None:
+    if "mag_abs" not in table.schema.names:
+        raise ValueError(
+            "Pre-routed input requires mag_abs to validate natural levels"
+        )
+    from .routing_columns import _compute_level
+
+    magnitudes = np.asarray(table.column("mag_abs"), dtype=np.float64)
+    supplied = np.asarray(table.column("level"), dtype=np.int32)
+    expected = _compute_level(magnitudes, mag_config)
+    mismatches = np.flatnonzero(supplied != expected)
+    if len(mismatches) == 0:
+        return
+    first = int(mismatches[0])
+    raise ValueError(
+        "Pre-routed natural levels do not match full-width/v1 assignment from "
+        "the represented render magnitude: "
+        f"mismatches={len(mismatches)}, first_row={first}, "
+        f"supplied={int(supplied[first])}, expected={int(expected[first])}"
+    )
 
 
 def _routing_group_key(

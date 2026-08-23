@@ -9,10 +9,17 @@ from typing import Any
 
 import numpy as np
 
+from foundinspace.octree.visibility import (
+    DEFAULT_LOAD_FACTOR,
+    complete_through_magnitude,
+    validate_load_factor,
+)
+
 from .header import OctreeHeader, read_header
 from .index import IndexNavigator, NodeEntry, Point
 from .payload import decode_payload
 from .source import OctreeSource, SeekableBinaryReader, open_octree_source
+from .visibility import should_prune_magnitude_node
 
 DEFAULT_SHELL_COALESCE_GAP_BYTES = 64 * 1024
 
@@ -53,6 +60,8 @@ class NearestStar:
 @dataclass(frozen=True, slots=True)
 class StatsReport:
     header: OctreeHeader
+    load_factor: float
+    m_complete: float
     by_level: tuple[LevelStats, ...]
     totals: LevelStats
     coalesced: CoalesceStats
@@ -83,7 +92,9 @@ def collect_stats(
     metadata_path: OctreeSource | None = None,
     nearest_n: int = 10,
     coalesce_gap_bytes: int = DEFAULT_SHELL_COALESCE_GAP_BYTES,
+    load_factor: float = DEFAULT_LOAD_FACTOR,
 ) -> StatsReport:
+    load_factor = validate_load_factor(load_factor)
     header = read_header(source)
     with (
         IndexNavigator(source, header) as nav,
@@ -96,6 +107,7 @@ def collect_stats(
             header,
             point=point,
             limiting_magnitude=limiting_magnitude,
+            load_factor=load_factor,
         )
         nearest = _collect_nearest(
             nav,
@@ -144,6 +156,11 @@ def collect_stats(
     )
     return StatsReport(
         header=header,
+        load_factor=load_factor,
+        m_complete=complete_through_magnitude(
+            limiting_magnitude,
+            load_factor=load_factor,
+        ),
         by_level=level_rows,
         totals=totals,
         coalesced=coalesced,
@@ -196,16 +213,20 @@ def _collect_shell_level_stats(
     *,
     point: Point,
     limiting_magnitude: float,
+    load_factor: float,
 ) -> tuple[dict[int, _MutableLevelStats], list[tuple[int, int]]]:
     by_level: dict[int, _MutableLevelStats] = {}
     payload_ranges: list[tuple[int, int]] = []
     stack = list(nav.root_entries())
     while stack:
         node = stack.pop()
-        load_radius = node.half_size * (
-            10.0 ** ((limiting_magnitude - header.mag_limit) / 5.0)
-        )
-        if node.aabb_distance(point) > load_radius:
+        if should_prune_magnitude_node(
+            header=header,
+            node=node,
+            point=point,
+            limiting_magnitude=limiting_magnitude,
+            load_factor=load_factor,
+        ):
             continue
         level_stats = by_level.setdefault(node.level, _MutableLevelStats())
         level_stats.nodes += 1

@@ -272,7 +272,8 @@ def _validate_routing_identity(
     existing = manifest.get("tree_identity")
     if existing != expected:
         raise ValueError(
-            "Existing Routing tree identity does not match current project config"
+            "Existing Routing tree identity does not match current project config; "
+            "rerun route with --force."
         )
     if state.get("tree_identity") != existing:
         raise ValueError("Routing state identity does not match tree manifest")

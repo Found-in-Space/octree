@@ -41,7 +41,7 @@ node level as a conservative fallback. The exact contract and trade-offs are in
 [`octree-spec.md`](octree-spec.md).
 
 ```
-stars_brighter_than(point, limiting_magnitude, load_factor=2.0) → Iterator[Star]
+stars_brighter_than(point, limiting_magnitude, *, load_factor=2.0) → Iterator[Star]
 ```
 
 ### 2. Nearby stars from a point

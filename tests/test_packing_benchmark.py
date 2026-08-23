@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pyarrow as pa
@@ -25,6 +26,7 @@ from foundinspace.octree.sources.preparation import (
     prepare_contributions,
 )
 from foundinspace.octree.sources.routing import RoutingConfig, route_contributions
+from magnitude_helpers import represented_magnitude_for_level
 from project_helpers import project_text
 
 
@@ -58,7 +60,16 @@ def _routing_table(rows: list[dict], *, shard_id: str) -> pa.Table:
             "source_id": pa.array([r["source_id"] for r in rows], pa.string()),
             "morton_code": pa.array([r["morton_code"] for r in rows], pa.uint64()),
             "level": pa.array([r["level"] for r in rows], pa.int32()),
-            "mag_abs": pa.array([r.get("mag_abs", 7.0) for r in rows], pa.float64()),
+            "mag_abs": pa.array(
+                [
+                    represented_magnitude_for_level(
+                        r["level"],
+                        r.get("mag_abs", 7.0),
+                    )
+                    for r in rows
+                ],
+                pa.float64(),
+            ),
             "x_icrs_pc": pa.array(
                 [position[0] for position in positions], pa.float64()
             ),
@@ -125,6 +136,7 @@ def _benchmark_config(
     profiles: tuple[str, ...] = ("classic", "unbounded"),
     orders: tuple[str, ...] = ("dfs", "level-major"),
     scenarios: tuple[str, ...] = ("observer-shell",),
+    load_factor: float = 2.0,
 ) -> PackingBenchmarkConfig:
     return PackingBenchmarkConfig(
         routed_dir=routing_dir,
@@ -134,6 +146,7 @@ def _benchmark_config(
         scenarios=scenarios,
         center=Point3(0.0, 0.0, 0.0),
         limiting_magnitude=20.0,
+        load_factor=load_factor,
         coalesce_gap_bytes=0,
         batch_rows=10,
     )
@@ -165,6 +178,8 @@ def test_packing_benchmark_reports_orders_and_range_metrics(tmp_path: Path) -> N
 
     assert report["profiles"] == ["classic", "unbounded"]
     assert report["orders"] == ["dfs", "level-major"]
+    assert report["load_factor"] == 2.0
+    assert report["m_complete"] == pytest.approx(20.0)
     assert len(report["results"]) == 4
     result = report["results"][0]
     assert result["final_node_count"] == 3
@@ -202,6 +217,46 @@ def test_packing_benchmark_classic_folds_deeper_nodes(tmp_path: Path) -> None:
     )
 
     assert report["profile_node_counts"] == {"classic": 1, "unbounded": 2}
+
+
+def test_packing_benchmark_selects_folded_node_with_brightest_level(
+    tmp_path: Path,
+) -> None:
+    routing_dir, preparation_dir = _build_preparation(
+        tmp_path,
+        [
+            {
+                "source_id": "deep",
+                "morton_code": _morton_for_node(15, 0),
+                "level": 15,
+            }
+        ],
+    )
+    emitted_center = _node_center(14, 0)
+    emitted_half_size = WORLD_HALF_SIZE_PC / (2**14)
+    observer = Point3(
+        emitted_center[0] + 2.5 * emitted_half_size,
+        emitted_center[1],
+        emitted_center[2],
+    )
+
+    report = run_packing_benchmark(
+        PackingBenchmarkConfig(
+            routed_dir=routing_dir,
+            prepared_dir=preparation_dir,
+            profiles=("classic",),
+            orders=("level-major",),
+            scenarios=("observer-shell",),
+            center=observer,
+            limiting_magnitude=6.5,
+            load_factor=2.0,
+            coalesce_gap_bytes=0,
+            batch_rows=10,
+        )
+    )
+
+    # The observer is inside 2 H(E) but outside 2 H(B), where E=14 and B=15.
+    assert report["results"][0]["selected_node_count"] == 0
 
 
 def test_packing_benchmark_rejects_dirty_preparation_groups(tmp_path: Path) -> None:
@@ -278,11 +333,17 @@ def test_packing_benchmark_cli_json(tmp_path: Path) -> None:
             "observer-shell",
             "--magnitude",
             "20",
+            "--load-factor",
+            "1.5",
             "--json",
         ],
     )
 
     assert result.exit_code == 0, result.output
     report = json.loads(result.output)
+    assert report["load_factor"] == 1.5
+    assert report["m_complete"] == pytest.approx(
+        20.0 + 5.0 * math.log10(0.75)
+    )
     assert report["results"][0]["profile"] == "classic"
     assert report["results"][0]["order"] == "level-major"

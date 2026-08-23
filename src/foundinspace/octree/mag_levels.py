@@ -17,7 +17,11 @@ from foundinspace.octree.config import MORTON_BITS
 
 @dataclass(slots=True)
 class Level:
-    """Single octree level with magnitude band [m_min, m_max)."""
+    """Single octree level with its full-width magnitude thresholds.
+
+    ``m_min`` is exclusive except for the root saturation band. ``m_max`` is
+    inclusive except for the deepest saturation band.
+    """
 
     id: int
     m_min: float
@@ -34,6 +38,11 @@ def _half_size_at_level(world_half_size: float, level: int) -> float:
     return world_half_size / (2**level)
 
 
+def _node_width_at_level(world_half_size: float, level: int) -> float:
+    """Level L cell width (pc): 2 H(L)."""
+    return 2.0 * _half_size_at_level(world_half_size, level)
+
+
 def _mag_threshold_at_level(v_mag: float, world_half_size: float, level: int) -> float:
     """Magnitude whose visibility radius equals H(L)."""
     h = _half_size_at_level(world_half_size, level)
@@ -43,8 +52,9 @@ def _mag_threshold_at_level(v_mag: float, world_half_size: float, level: int) ->
 class MagLevelConfig:
     """Level-from-magnitude mapping derived from v_mag and world_half_size.
 
-    Placement rule: star at level L where r_V <= H(L) = world_half_size / 2^L,
-    with r_V = 10^((v_mag - mag_abs + 5) / 5) pc.
+    Interior placement rule: assign natural level N where
+    H(N) <= r_V < 2 H(N), with
+    r_V = 10^((v_mag - mag_abs + 5) / 5) pc.
     """
 
     def __init__(
@@ -57,23 +67,39 @@ class MagLevelConfig:
         self.world_half_size = world_half_size
         self.morton_bits = morton_bits
         self._levels_cache: list[Level] | None = None
+        self._thresholds_cache: np.ndarray | None = None
+
+    def _thresholds(self) -> np.ndarray:
+        if self._thresholds_cache is None:
+            self._thresholds_cache = np.asarray(
+                [
+                    _mag_threshold_at_level(
+                        self.v_mag,
+                        self.world_half_size,
+                        level,
+                    )
+                    for level in range(self.morton_bits)
+                ],
+                dtype=np.float64,
+            )
+        return self._thresholds_cache
 
     def _build_levels(self) -> list[Level]:
         if self._levels_cache is not None:
             return self._levels_cache
-        levels: list[Level] = []
-        level_id = 0
-        m_prev = -math.inf
-        while True:
-            if self.morton_bits == level_id:
-                levels.append(Level(id=level_id, m_min=m_prev, m_max=math.inf))
-                break
-            m_next = _mag_threshold_at_level(
-                self.v_mag, self.world_half_size, level_id + 1
+        thresholds = self._thresholds()
+        levels = [
+            Level(
+                id=level_id,
+                m_min=-math.inf if level_id == 0 else float(thresholds[level_id - 1]),
+                m_max=(
+                    math.inf
+                    if level_id == self.morton_bits
+                    else float(thresholds[level_id])
+                ),
             )
-            levels.append(Level(id=level_id, m_min=m_prev, m_max=m_next))
-            m_prev = m_next
-            level_id += 1
+            for level_id in range(self.morton_bits + 1)
+        ]
         self._levels_cache = levels
         return levels
 
@@ -91,29 +117,19 @@ class MagLevelConfig:
 
     def level_for_mag(self, mag_abs: float) -> int:
         """Return level id for a single absolute magnitude."""
-        levs = self._build_levels()
-        for lev in levs:
-            if lev.m_min <= mag_abs < lev.m_max:
-                return lev.id
-        if levs and mag_abs < levs[0].m_max:
-            return levs[0].id
-        return levs[-1].id if levs else 0
+        if math.isnan(mag_abs):
+            raise ValueError("magnitude has no level assigned")
+        return int(np.searchsorted(self._thresholds(), mag_abs, side="left"))
 
     def assign_level_array(self, mag_abs: np.ndarray) -> np.ndarray:
         """Assign level id per star from mag_abs. Returns int32 array of level ids."""
-        levs = self._build_levels()
-        out = np.full(mag_abs.shape[0], -1, dtype=np.int32)
-        for lev in levs:
-            if lev.m_min == -math.inf:
-                mask = mag_abs < lev.m_max
-            elif lev.m_max == math.inf:
-                mask = mag_abs >= lev.m_min
-            else:
-                mask = (mag_abs >= lev.m_min) & (mag_abs < lev.m_max)
-            out[mask] = lev.id
-        unset = (out == -1).sum()
-        if unset > 0:
+        values = np.asarray(mag_abs, dtype=np.float64)
+        invalid = int(np.count_nonzero(np.isnan(values)))
+        if invalid:
             raise ValueError(
-                f"{unset} star(s) have no level assigned; check magnitude range."
+                f"{invalid} star(s) have no level assigned; check magnitude range."
             )
-        return out
+        return np.searchsorted(self._thresholds(), values, side="left").astype(
+            np.int32,
+            copy=False,
+        )

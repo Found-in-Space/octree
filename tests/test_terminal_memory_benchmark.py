@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import math
 import struct
 from pathlib import Path
 from uuid import UUID
 
+import pytest
 from click.testing import CliRunner
 
 from foundinspace.octree._cli import cli
@@ -36,6 +38,7 @@ def _logical_node(
     magnitudes: tuple[float, ...] = (),
     children: tuple[LogicalNode, ...] = (),
     payload_length: int | None = None,
+    minimum_natural_level: int | None = None,
 ) -> LogicalNode:
     magnitudes_centi = tuple(sorted(round(value * 100) for value in magnitudes))
     return LogicalNode(
@@ -50,6 +53,7 @@ def _logical_node(
         ),
         magnitudes_centi=magnitudes_centi,
         children=children,
+        minimum_natural_level=minimum_natural_level,
         subtree_star_count=len(magnitudes_centi)
         + sum(child.subtree_star_count for child in children),
         subtree_node_count=1 + sum(child.subtree_node_count for child in children),
@@ -211,6 +215,47 @@ def test_trace_replay_separates_waterline_from_chunk_size() -> None:
     assert by_policy[("terminal-logical-chunked", 2)]["final_raw_cache_rows"] == 10
 
 
+def test_terminal_benchmark_uses_brightest_level_for_virtual_terminal() -> None:
+    child = _logical_node(
+        key=(1, 0, 0, 0),
+        center=Point(0.0, 0.0, 0.0),
+        half_size=50.0,
+        magnitudes=(0.0,),
+    )
+    root = _logical_node(
+        key=(0, 0, 0, 0),
+        center=Point(0.0, 0.0, 0.0),
+        half_size=100.0,
+        children=(child,),
+        minimum_natural_level=1,
+    )
+    spec = SampleSpec("route", Point(0.0, 0.0, 0.0), 0)
+    sample = ExtractedSample(
+        spec=spec,
+        source="fixture",
+        index_magnitude=6.5,
+        root=root,
+    )
+    views = (TraceView("outside", Point(225.0, 0.0, 0.0), 6.5),)
+    config = TerminalMemoryBenchmarkConfig(
+        source=Path("fixture"),
+        samples=(spec,),
+        views=views,
+        load_factor=2.0,
+        waterlines=(10,),
+        chunk_star_counts=(2,),
+    )
+
+    report = _benchmark_sample(sample, views, config)
+    by_policy = {row["policy"]: row for row in report["scenarios"]}
+
+    # V1 falls back to E=0 and enters the root; virtual v2 uses B=1 and prunes it.
+    assert by_policy["v1"]["max_index_record_bytes"] == 40
+    assert by_policy["terminal-monolithic"]["max_index_record_bytes"] == 24
+    assert by_policy["terminal-magnitude-chunked"]["max_index_record_bytes"] == 24
+    assert by_policy["terminal-logical-chunked"]["max_index_record_bytes"] == 24
+
+
 def test_terminal_memory_benchmark_cli_reads_local_octree(tmp_path: Path) -> None:
     octree = _build_octree(tmp_path)
     runner = CliRunner()
@@ -225,6 +270,8 @@ def test_terminal_memory_benchmark_cli_reads_local_octree(tmp_path: Path) -> Non
             "fixture:0,0,0@0",
             "--waterline",
             "10",
+            "--load-factor",
+            "1.25",
             "--chunk-stars",
             "2",
             "--cache-dir",
@@ -235,7 +282,11 @@ def test_terminal_memory_benchmark_cli_reads_local_octree(tmp_path: Path) -> Non
 
     assert result.exit_code == 0, result.output
     report = json.loads(result.output)
-    assert report["format"].endswith("/v0")
+    assert report["format"].endswith("/v1")
+    assert report["load_factor"] == 1.25
+    assert report["samples"][0]["views"][0]["m_complete"] == pytest.approx(
+        6.5 + 5.0 * math.log10(1.25 / 2.0)
+    )
     assert report["samples"][0]["classic"] == {
         "index_record_bytes": 40,
         "node_count": 2,

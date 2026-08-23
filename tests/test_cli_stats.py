@@ -177,6 +177,8 @@ def test_cli_stats_output_sections(tmp_path: Path) -> None:
             "0,0,0",
             "--magnitude",
             "6.5",
+            "--load-factor",
+            "1.0",
             "--radius",
             "3.0",
             "--nearest",
@@ -185,10 +187,23 @@ def test_cli_stats_output_sections(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 0, result.output
+    assert "load_factor=1.00" in result.output
+    assert "m_complete=4.995" in result.output
     assert "By level (shell set at Sun)" in result.output
     assert "Coalesced" in result.output
     assert "Total span bytes" in result.output
     assert "Nearest 2 stars" in result.output
+
+
+def test_cli_stats_rejects_invalid_load_factor(tmp_path: Path) -> None:
+    octree_path = _build_small_octree(tmp_path)
+    result = CliRunner().invoke(
+        cli,
+        ["stats", str(octree_path), "--load-factor", "0.5"],
+    )
+
+    assert result.exit_code != 0
+    assert "load_factor must be finite and in [1.0, 2.0]" in result.output
 
 
 def test_cli_stats_uses_explicit_meta_octree_and_stars_alias(tmp_path: Path) -> None:

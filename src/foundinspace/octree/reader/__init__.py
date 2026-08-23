@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 
+from foundinspace.octree.visibility import DEFAULT_LOAD_FACTOR, validate_load_factor
+
 from .header import OctreeHeader, read_header
 from .index import IndexNavigator, NodeEntry, Point
 from .payload import Star, decode_payload
 from .source import OctreeSource, SeekableBinaryReader, open_octree_source
+from .visibility import should_prune_magnitude_node
 
 
 class OctreeReader:
@@ -33,7 +36,10 @@ class OctreeReader:
         self,
         point: Point,
         limiting_magnitude: float,
+        *,
+        load_factor: float = DEFAULT_LOAD_FACTOR,
     ) -> Iterator[Star]:
+        load_factor = validate_load_factor(load_factor)
         stack = list(self._navigator.root_entries())
         while stack:
             node = stack.pop()
@@ -41,6 +47,7 @@ class OctreeReader:
                 node=node,
                 point=point,
                 limiting_magnitude=limiting_magnitude,
+                load_factor=load_factor,
             ):
                 continue
             if node.has_payload:
@@ -85,11 +92,15 @@ class OctreeReader:
         node: NodeEntry,
         point: Point,
         limiting_magnitude: float,
+        load_factor: float,
     ) -> bool:
-        radius = node.half_size * (
-            10.0 ** ((limiting_magnitude - self._header.mag_limit) / 5.0)
+        return should_prune_magnitude_node(
+            header=self._header,
+            node=node,
+            point=point,
+            limiting_magnitude=limiting_magnitude,
+            load_factor=load_factor,
         )
-        return node.aabb_distance(point) > radius
 
 
 __all__ = [

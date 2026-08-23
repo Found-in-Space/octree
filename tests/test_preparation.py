@@ -15,6 +15,7 @@ from foundinspace.octree.sources.preparation import (
     prepare_contributions,
 )
 from foundinspace.octree.sources.routing import RoutingConfig, route_contributions
+from magnitude_helpers import represented_magnitude_for_level
 
 
 def _morton_for_node(level: int, node_id: int) -> int:
@@ -35,7 +36,13 @@ def _routing_table(rows: list[dict], *, shard_id: str) -> pa.Table:
                 type=pa.binary(16),
             ),
             "level": pa.array([r["level"] for r in rows], type=pa.int32()),
-            "mag_abs": pa.array([r["mag_abs"] for r in rows], type=pa.float64()),
+            "mag_abs": pa.array(
+                [
+                    represented_magnitude_for_level(r["level"], r["mag_abs"])
+                    for r in rows
+                ],
+                type=pa.float64(),
+            ),
             "healpix_id": pa.array([shard_id for _ in rows], type=pa.string()),
         }
     )
@@ -581,6 +588,40 @@ def test_preparation_rejects_missing_manifest_and_identity_mismatch(
         )
 
 
+def test_preparation_rejects_old_routing_policy_identity(tmp_path: Path) -> None:
+    input_root = tmp_path / "input"
+    routing_dir = tmp_path / "routing"
+    preparation_dir = tmp_path / "preparation"
+    _write_routing_pixel(
+        input_root,
+        "100",
+        [
+            {
+                "source": "gaia",
+                "source_id": "a",
+                "morton_code": _morton_for_node(1, 0),
+                "level": 1,
+                "mag_abs": 7.0,
+            }
+        ],
+    )
+    route_contributions(_routing_config(input_root, routing_dir))
+
+    for name in ("tree-manifest.json", "pipeline-state.json"):
+        path = routing_dir / name
+        document = json.loads(path.read_text(encoding="utf-8"))
+        identity = document["tree_identity"]
+        identity["row_schema_version"] = "routing-row-schema/v3"
+        identity.pop("natural_level_policy")
+        identity.pop("render_magnitude_codec")
+        path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="rerun route with --force"):
+        prepare_contributions(
+            _preparation_config(routing_dir, preparation_dir)
+        )
+
+
 def test_preparation_rejects_routing_group_schema_drift(tmp_path: Path) -> None:
     input_root = tmp_path / "input"
     _write_routing_pixel(
@@ -785,7 +826,7 @@ def test_preparation_external_sort_matches_arrow_null_and_nan_ordering(
             "source": "gaia",
             "source_id": source_id,
             "morton_code": _morton_for_node(1, 0),
-            "level": 1,
+            "level": MORTON_BITS,
             "mag_abs": magnitude,
         }
         for source_id, magnitude in (

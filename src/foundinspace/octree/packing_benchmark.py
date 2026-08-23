@@ -26,6 +26,13 @@ from foundinspace.octree.sources.routing import (
     TREE_MANIFEST_NAME,
     _read_json,
 )
+from foundinspace.octree.visibility import (
+    DEFAULT_LOAD_FACTOR,
+    complete_through_magnitude,
+    half_size_at_level,
+    load_radius_for_magnitude_shell,
+    validate_load_factor,
+)
 
 DEFAULT_TARGET_VERTICAL_FOV_DEG = 40.0
 DEFAULT_TARGET_ASPECT_RATIO = 16.0 / 9.0
@@ -64,6 +71,7 @@ class PackingBenchmarkConfig:
     center: Point3 = Point3(0.0, 0.0, 0.0)
     target: Point3 = Point3(1000.0, 0.0, 0.0)
     limiting_magnitude: float | None = None
+    load_factor: float = DEFAULT_LOAD_FACTOR
     vertical_fov_deg: float = DEFAULT_TARGET_VERTICAL_FOV_DEG
     aspect_ratio: float = DEFAULT_TARGET_ASPECT_RATIO
     tile_prefix_depth: int = DEFAULT_TILE_PREFIX_DEPTH
@@ -82,6 +90,7 @@ class _World:
 class _FinalNode:
     level: int
     node_id: int
+    brightest_level: int
     star_count: int
     payload_length: int
 
@@ -125,6 +134,7 @@ def run_packing_benchmark(config: PackingBenchmarkConfig) -> dict[str, Any]:
                     center=config.center,
                     target=config.target,
                     limiting_magnitude=limiting_magnitude,
+                    load_factor=config.load_factor,
                     vertical_fov_deg=config.vertical_fov_deg,
                     aspect_ratio=config.aspect_ratio,
                 )
@@ -149,6 +159,11 @@ def run_packing_benchmark(config: PackingBenchmarkConfig) -> dict[str, Any]:
         "center": _point_dict(config.center),
         "target": _point_dict(config.target),
         "limiting_magnitude": limiting_magnitude,
+        "load_factor": config.load_factor,
+        "m_complete": complete_through_magnitude(
+            limiting_magnitude,
+            load_factor=config.load_factor,
+        ),
         "vertical_fov_deg": config.vertical_fov_deg,
         "aspect_ratio": config.aspect_ratio,
         "tile_prefix_depth": config.tile_prefix_depth,
@@ -168,6 +183,7 @@ def _validate_config(config: PackingBenchmarkConfig) -> None:
     _validate_choices(config.profiles, PROFILES, "profile")
     _validate_choices(config.orders, PACKING_ORDERS, "order")
     _validate_choices(config.scenarios, SCENARIOS, "scenario")
+    validate_load_factor(config.load_factor)
     if config.vertical_fov_deg <= 0 or config.vertical_fov_deg >= 180:
         raise ValueError("vertical_fov_deg must be > 0 and < 180")
     if config.aspect_ratio <= 0:
@@ -289,11 +305,12 @@ def _iter_final_nodes(
         current_key: tuple[int, int] | None = None
         renders = bytearray()
         star_count = 0
+        brightest_level: int | None = None
         while True:
             batch = con.fetchmany(batch_rows)
             if not batch:
                 break
-            parsed_rows: list[tuple[int, int]] = []
+            parsed_rows: list[tuple[int, int, int]] = []
             positions = np.empty((len(batch), 3), dtype=np.float64)
             magnitudes = np.empty(len(batch), dtype=np.float64)
             temperatures = np.empty(len(batch), dtype=np.float64)
@@ -338,7 +355,7 @@ def _iter_final_nodes(
                     raise ValueError(
                         f"Final node level {level} exceeds source level {source_level}"
                     )
-                parsed_rows.append((level, node_id))
+                parsed_rows.append((level, node_id, source_level))
                 positions[index] = (float(x_raw), float(y_raw), float(z_raw))
                 magnitudes[index] = np.nan if mag_raw is None else float(mag_raw)
                 temperatures[index] = np.nan if teff_raw is None else float(teff_raw)
@@ -352,21 +369,39 @@ def _iter_final_nodes(
                 teff=temperatures,
                 levels=final_levels,
             )
-            for (level, node_id), render in zip(
+            for (level, node_id, source_level), render in zip(
                 parsed_rows,
                 encoded_renders,
                 strict=True,
             ):
                 key = (level, node_id)
                 if current_key is not None and key != current_key:
-                    yield _compressed_node(current_key, renders, star_count)
+                    assert brightest_level is not None
+                    yield _compressed_node(
+                        current_key,
+                        renders,
+                        star_count,
+                        brightest_level,
+                    )
                     renders = bytearray()
                     star_count = 0
+                    brightest_level = None
                 current_key = key
                 renders.extend(render.tobytes())
                 star_count += 1
+                brightest_level = (
+                    source_level
+                    if brightest_level is None
+                    else min(brightest_level, source_level)
+                )
         if current_key is not None:
-            yield _compressed_node(current_key, renders, star_count)
+            assert brightest_level is not None
+            yield _compressed_node(
+                current_key,
+                renders,
+                star_count,
+                brightest_level,
+            )
     finally:
         con.close()
 
@@ -375,10 +410,12 @@ def _compressed_node(
     key: tuple[int, int],
     renders: bytearray,
     star_count: int,
+    brightest_level: int,
 ) -> _FinalNode:
     return _FinalNode(
         level=key[0],
         node_id=key[1],
+        brightest_level=brightest_level,
         star_count=star_count,
         payload_length=len(gzip.compress(bytes(renders), mtime=0)),
     )
@@ -487,6 +524,7 @@ def _select_nodes(
     center: Point3,
     target: Point3,
     limiting_magnitude: float,
+    load_factor: float,
     vertical_fov_deg: float,
     aspect_ratio: float,
 ) -> list[_FinalNode]:
@@ -498,10 +536,17 @@ def _select_nodes(
     )
     for node in nodes:
         geometry = _node_geometry(node.level, node.node_id, world)
-        load_radius = geometry.half_size * (
-            10.0 ** ((limiting_magnitude - world.index_magnitude) / 5.0)
+        brightest_half_size = half_size_at_level(
+            world.half_size_pc,
+            node.brightest_level,
         )
-        if _aabb_distance(center, geometry) > load_radius:
+        load_radius = load_radius_for_magnitude_shell(
+            brightest_half_size,
+            limiting_magnitude,
+            world.index_magnitude,
+            load_factor=load_factor,
+        )
+        if _aabb_distance(center, geometry) >= load_radius:
             continue
         if frustum is not None and not frustum.intersects(geometry, load_radius):
             continue

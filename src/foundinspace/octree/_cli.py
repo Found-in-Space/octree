@@ -14,6 +14,7 @@ from foundinspace.octree.project import load_project, render_project_template
 from foundinspace.octree.reader import Point
 from foundinspace.octree.reader.source import OctreeSource, is_url_source
 from foundinspace.octree.reader.stats import StatsReport, collect_stats
+from foundinspace.octree.visibility import validate_load_factor
 
 
 @click.group()
@@ -820,6 +821,13 @@ def build_sidecars(
     help="Limiting apparent magnitude. Defaults to dataset.limiting_magnitude.",
 )
 @click.option(
+    "--load-factor",
+    type=float,
+    default=2.0,
+    show_default=True,
+    help="Loader quality q in [1, 2]; 2 is complete.",
+)
+@click.option(
     "--target",
     type=str,
     default="1000,0,0",
@@ -867,6 +875,7 @@ def packing_order_benchmark(
     scenarios: tuple[str, ...],
     center: str,
     magnitude: float | None,
+    load_factor: float,
     target: str,
     vertical_fov: float,
     aspect_ratio: float,
@@ -899,6 +908,7 @@ def packing_order_benchmark(
         limiting_magnitude=magnitude
         if magnitude is not None
         else project.dataset.limiting_magnitude,
+        load_factor=load_factor,
         vertical_fov_deg=vertical_fov,
         aspect_ratio=aspect_ratio,
         tile_prefix_depth=tile_prefix_depth,
@@ -920,7 +930,8 @@ def packing_order_benchmark(
         f"{config.prepared_dir} | "
         f"profiles={','.join(config.profiles)} | "
         f"orders={','.join(config.orders)} | "
-        f"scenarios={','.join(config.scenarios)}"
+        f"scenarios={','.join(config.scenarios)} | "
+        f"load_factor={config.load_factor:.2f}"
     )
     _render_packing_benchmark(console, report)
 
@@ -966,6 +977,13 @@ def packing_order_benchmark(
     help="Decoded LRU cache budget used by the replay.",
 )
 @click.option(
+    "--load-factor",
+    type=float,
+    default=2.0,
+    show_default=True,
+    help="Loader quality q in [1, 2]; 2 is complete.",
+)
+@click.option(
     "--terminal-directory-record-bytes",
     type=click.IntRange(min=0),
     default=24,
@@ -1005,6 +1023,7 @@ def terminal_memory_benchmark(
     waterlines: tuple[int, ...],
     chunk_star_counts: tuple[int, ...],
     decoded_cache_mib: float,
+    load_factor: float,
     terminal_directory_record_bytes: int,
     max_inflight_payloads: int,
     workers: int,
@@ -1031,6 +1050,7 @@ def terminal_memory_benchmark(
                 source=source,
                 samples=samples,
                 views=views,
+                load_factor=load_factor,
                 waterlines=waterlines or DEFAULT_WATERLINES,
                 chunk_star_counts=(chunk_star_counts or DEFAULT_CHUNK_STAR_COUNTS),
                 decoded_cache_bytes=round(decoded_cache_mib * 1024 * 1024),
@@ -1052,7 +1072,8 @@ def terminal_memory_benchmark(
         "Terminal memory benchmark: "
         f"{_format_source_label(source)} | "
         f"samples={len(samples)} | "
-        f"views={'trace' if views else 'sample defaults'}"
+        f"views={'trace' if views else 'sample defaults'} | "
+        f"load_factor={report['load_factor']:.2f}"
     )
     _render_terminal_memory_benchmark(console, report)
 
@@ -1366,6 +1387,13 @@ def _render_stats(console: Console, report: StatsReport, nearest_n: int) -> None
     help="Limiting apparent magnitude for shell visibility query.",
 )
 @click.option(
+    "--load-factor",
+    type=float,
+    default=2.0,
+    show_default=True,
+    help="Loader quality q in [1, 2]; 2 is complete.",
+)
+@click.option(
     "--radius",
     type=float,
     default=10.0,
@@ -1391,6 +1419,7 @@ def stats(
     octree_source: str,
     point: str,
     magnitude: float,
+    load_factor: float,
     radius: float,
     nearest: int,
     meta_octree: str | None,
@@ -1400,6 +1429,10 @@ def stats(
         raise click.BadParameter("--radius must be >= 0")
     if nearest <= 0:
         raise click.BadParameter("--nearest must be > 0")
+    try:
+        load_factor = validate_load_factor(load_factor)
+    except ValueError as exc:
+        raise click.BadParameter(str(exc), param_hint="--load-factor") from exc
 
     query_point = _parse_point(point)
     resolved_octree_source, meta_octree_source = _resolve_stats_sources(
@@ -1410,6 +1443,7 @@ def stats(
         resolved_octree_source,
         point=query_point,
         limiting_magnitude=magnitude,
+        load_factor=load_factor,
         radius_pc=radius,
         metadata_path=meta_octree_source,
         nearest_n=nearest,
@@ -1421,7 +1455,9 @@ def stats(
         f"| world_center={report.header.world_center} "
         f"| half_size={report.header.world_half_size:.1f} pc "
         f"| max_level={report.header.max_level} "
-        f"| mag_limit={report.header.mag_limit:.2f}"
+        f"| mag_limit={report.header.mag_limit:.2f} "
+        f"| load_factor={report.load_factor:.2f} "
+        f"| m_complete={report.m_complete:.3f}"
     )
     if report.header.dataset_uuid is not None:
         header_line += f" | octree_uuid={report.header.dataset_uuid}"

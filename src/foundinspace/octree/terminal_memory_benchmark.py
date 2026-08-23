@@ -18,9 +18,15 @@ from foundinspace.octree.reader.header import OctreeHeader, read_header
 from foundinspace.octree.reader.index import IndexNavigator, NodeEntry, Point
 from foundinspace.octree.reader.payload import STAR_RECORD_FMT
 from foundinspace.octree.reader.source import OctreeSource, is_url_source
+from foundinspace.octree.visibility import (
+    DEFAULT_LOAD_FACTOR,
+    complete_through_magnitude,
+    load_radius_for_magnitude_shell,
+    validate_load_factor,
+)
 
-BENCHMARK_FORMAT = "foundinspace.octree.terminal-memory-benchmark/v0"
-SAMPLE_CACHE_FORMAT = "foundinspace.octree.terminal-memory-sample/v0"
+BENCHMARK_FORMAT = "foundinspace.octree.terminal-memory-benchmark/v1"
+SAMPLE_CACHE_FORMAT = "foundinspace.octree.terminal-memory-sample/v1"
 
 V2_INDEX_RECORD_BYTES = 24
 TERMINAL_DIRECTORY_RECORD_BYTES = 24
@@ -70,6 +76,7 @@ class TerminalMemoryBenchmarkConfig:
     source: OctreeSource
     samples: tuple[SampleSpec, ...]
     views: tuple[TraceView, ...] = ()
+    load_factor: float = DEFAULT_LOAD_FACTOR
     waterlines: tuple[int, ...] = DEFAULT_WATERLINES
     chunk_star_counts: tuple[int, ...] = DEFAULT_CHUNK_STAR_COUNTS
     decoded_cache_bytes: int = DEFAULT_DECODED_CACHE_BYTES
@@ -91,6 +98,7 @@ class LogicalNode:
     payload_length: int
     magnitudes_centi: tuple[int, ...] = ()
     children: tuple[LogicalNode, ...] = ()
+    minimum_natural_level: int | None = None
     subtree_star_count: int = 0
     subtree_node_count: int = 1
     subtree_payload_count: int = 0
@@ -106,6 +114,20 @@ class LogicalNode:
     @property
     def has_payload(self) -> bool:
         return self.natural_star_count > 0
+
+    @property
+    def brightest_level(self) -> int:
+        """Return the shallowest natural level represented by this subtree."""
+        if self.minimum_natural_level is not None:
+            return self.minimum_natural_level
+        represented = [
+            child.brightest_level
+            for child in self.children
+            if child.subtree_star_count > 0
+        ]
+        if self.has_payload:
+            represented.append(self.level)
+        return min(represented, default=self.level)
 
     def aabb_distance(self, point: Point) -> float:
         dx = max(abs(point.x - self.center.x) - self.half_size, 0.0)
@@ -252,6 +274,7 @@ def run_terminal_memory_benchmark(
         "format": BENCHMARK_FORMAT,
         "scope": "sample-subtrees",
         "source": str(config.source),
+        "load_factor": config.load_factor,
         "header": {
             "version": header.version,
             "index_magnitude": header.mag_limit,
@@ -271,6 +294,7 @@ def run_terminal_memory_benchmark(
             "renderer_gpu_bytes_per_star": RENDERER_GPU_BYTES_PER_STAR,
             "live_bytes_per_star": LIVE_BYTES_PER_STAR,
             "decoded_cache_bytes": config.decoded_cache_bytes,
+            "load_factor": config.load_factor,
             "raw_cache_policy": "unbounded",
             "index_cache_policy": "unbounded-record-model",
             "compressed_terminal_bytes": "sum-of-v1-members",
@@ -379,6 +403,7 @@ def _validate_config(config: TerminalMemoryBenchmarkConfig) -> None:
         raise ValueError("At least one sample is required")
     if len({sample.name for sample in config.samples}) != len(config.samples):
         raise ValueError("Sample names must be unique")
+    validate_load_factor(config.load_factor)
     for label, values in (
         ("waterline", config.waterlines),
         ("chunk star count", config.chunk_star_counts),
@@ -489,6 +514,7 @@ def _hydrate_topology(
         payload_length=entry.payload_length,
         magnitudes_centi=magnitudes,
         children=children,
+        minimum_natural_level=entry.brightest_level,
         subtree_star_count=len(magnitudes)
         + sum(child.subtree_star_count for child in children),
         subtree_node_count=1 + sum(child.subtree_node_count for child in children),
@@ -584,6 +610,10 @@ def _benchmark_sample(
                     view.observer.z,
                 ],
                 "limiting_magnitude": view.limiting_magnitude,
+                "m_complete": complete_through_magnitude(
+                    view.limiting_magnitude,
+                    load_factor=config.load_factor,
+                ),
             }
             for view in views
         ],
@@ -674,7 +704,13 @@ def _replay_policy(
 
     for view in views:
         if policy == "v1":
-            selection = _select_logical(sample.root, view, sample.index_magnitude)
+            selection = _select_logical(
+                sample.root,
+                view,
+                sample.index_magnitude,
+                config.load_factor,
+                use_brightest_level=False,
+            )
             entries = {
                 entry.key: entry
                 for entry in (
@@ -687,6 +723,7 @@ def _replay_policy(
                 plan,
                 view,
                 sample.index_magnitude,
+                config.load_factor,
             )
             if policy == "terminal-monolithic":
                 entries = _monolithic_entries(
@@ -896,12 +933,21 @@ def _select_logical(
     root: LogicalNode,
     view: TraceView,
     index_magnitude: float,
+    load_factor: float,
+    *,
+    use_brightest_level: bool,
 ) -> _Selection:
     selection = _Selection()
 
     def visit(node: LogicalNode) -> None:
         selection.inspected_keys.add(node.key)
-        if not _node_relevant(node, view, index_magnitude):
+        if not _node_relevant(
+            node,
+            view,
+            index_magnitude,
+            load_factor,
+            use_brightest_level=use_brightest_level,
+        ):
             return
         if node.has_payload:
             selection.payload_nodes.append(node)
@@ -916,17 +962,30 @@ def _select_terminal_plan(
     plan: TerminalPlanNode,
     view: TraceView,
     index_magnitude: float,
+    load_factor: float,
 ) -> _Selection:
     selection = _Selection()
 
     def visit(node_plan: TerminalPlanNode) -> None:
         node = node_plan.logical
         selection.inspected_keys.add(node.key)
-        if not _node_relevant(node, view, index_magnitude):
+        if not _node_relevant(
+            node,
+            view,
+            index_magnitude,
+            load_factor,
+            use_brightest_level=True,
+        ):
             return
         if node_plan.terminal:
             selection.loaded_terminals.add(node.key)
-            internal = _select_logical(node, view, index_magnitude)
+            internal = _select_logical(
+                node,
+                view,
+                index_magnitude,
+                load_factor,
+                use_brightest_level=True,
+            )
             selection.payload_nodes.extend(internal.payload_nodes)
             return
         if node.has_payload:
@@ -942,11 +1001,19 @@ def _node_relevant(
     node: LogicalNode,
     view: TraceView,
     index_magnitude: float,
+    load_factor: float,
+    *,
+    use_brightest_level: bool,
 ) -> bool:
-    load_radius = node.half_size * (
-        10.0 ** ((view.limiting_magnitude - index_magnitude) / 5.0)
+    level = node.brightest_level if use_brightest_level else node.level
+    brightest_half_size = node.half_size / (2 ** (level - node.level))
+    load_radius = load_radius_for_magnitude_shell(
+        brightest_half_size,
+        view.limiting_magnitude,
+        index_magnitude,
+        load_factor=load_factor,
     )
-    return node.aabb_distance(view.observer) <= load_radius
+    return node.aabb_distance(view.observer) < load_radius
 
 
 def _terminal_mapping(plan: TerminalPlanNode) -> dict[NodeKey, TerminalPlanNode]:
@@ -1171,6 +1238,7 @@ def _sample_cache_path(
         )
     identity = json.dumps(
         {
+            "cache_format": SAMPLE_CACHE_FORMAT,
             "source": source_details,
             "version": header.version,
             "index_offset": header.index_offset,
@@ -1248,6 +1316,7 @@ def _node_to_json(node: LogicalNode) -> dict[str, Any]:
         "payload_offset": node.payload_offset,
         "payload_length": node.payload_length,
         "magnitudes_centi": list(node.magnitudes_centi),
+        "minimum_natural_level": node.minimum_natural_level,
         "children": [_node_to_json(child) for child in node.children],
     }
 
@@ -1263,6 +1332,11 @@ def _node_from_json(raw: dict[str, Any]) -> LogicalNode:
         payload_length=int(raw["payload_length"]),
         magnitudes_centi=magnitudes,
         children=children,
+        minimum_natural_level=(
+            int(raw["minimum_natural_level"])
+            if raw["minimum_natural_level"] is not None
+            else None
+        ),
         subtree_star_count=len(magnitudes)
         + sum(child.subtree_star_count for child in children),
         subtree_node_count=1 + sum(child.subtree_node_count for child in children),
