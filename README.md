@@ -13,7 +13,19 @@ CloudFront Terraform root that used to live in this repository moved there as
 
 ## How it works
 
-The octree divides 3D space into nested cells across the 21-bit Morton address space. Each star is assigned to a level based on its absolute magnitude, not its position: the brightest stars go into the shallowest levels (largest cells), the faintest into the deepest (smallest cells). The placement threshold at each level is derived from `limiting_magnitude` (default 6.5, roughly the naked-eye limit) — a star is placed at the level whose cell half-size matches the distance from which that star would just be visible to the human eye.
+The octree divides 3D space into nested cells across the 21-bit Morton address
+space. Each star is assigned to a level based on its absolute magnitude, not its
+position: the brightest stars go into the shallowest levels (largest cells),
+the faintest into the deepest (smallest cells). The placement threshold at each
+level is derived from `limiting_magnitude` (default 6.5, roughly the naked-eye
+limit).
+
+The accepted production contract uses **full-width magnitude packing**: stars
+at level `L` have visibility radii between the cell half-width and full width.
+This retains finer spatial cells and lets the runtime trade a fast
+nearest-eight-cell core against a complete immediate-neighbour shell. See
+[`docs/magnitude-packing-and-loading.md`](docs/magnitude-packing-and-loading.md)
+for the exact geometry, measured trade-offs, and implementation implications.
 
 At runtime, the viewer computes a visibility radius for each level. Bright-star cells have large visibility radii and are loaded from anywhere in the scene; faint-star cells have small radii and load only when the observer is nearby. This gives progressive, distance-dependent detail that mirrors how real starlight works.
 
