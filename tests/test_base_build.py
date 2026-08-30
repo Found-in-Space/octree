@@ -15,6 +15,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import foundinspace.octree.base_build as base_build_module
+import foundinspace.octree.materialization.classic_parts as classic_parts
 import foundinspace.octree.materialization.pipeline as materialization
 import foundinspace.octree.packing.streaming_index as streaming_index
 from foundinspace.octree.assembly import BuildPlan, build_intermediates
@@ -52,7 +53,6 @@ from foundinspace.octree.sources.preparation import (
     prepare_contributions,
 )
 from foundinspace.octree.sources.routing import (
-    ROUTING_INPUT_MODE_CARTESIAN,
     RoutingConfig,
     route_contributions,
 )
@@ -276,10 +276,7 @@ def _write_legacy_input(root: Path, rows: list[dict], *, max_level: int) -> None
     )
     morton_codes = np.array([row["morton_code"] for row in rows], dtype=np.uint64)
     magnitudes = np.array(
-        [
-            represented_magnitude_for_level(row["level"], row["mag_abs"])
-            for row in rows
-        ],
+        [represented_magnitude_for_level(row["level"], row["mag_abs"]) for row in rows],
         dtype=np.float64,
     )
     renders = encode_render_records(
@@ -348,6 +345,7 @@ def _build_products(
     rows: list[dict],
     *,
     input_mode: str = "pre-routed",
+    bucket_rows: int = 100,
 ) -> tuple[Path, Path, Path]:
     input_root = tmp_path / "input"
     routing_dir = tmp_path / "routing"
@@ -362,7 +360,7 @@ def _build_products(
             input_shards_dir=input_root,
             routed_dir=routing_dir,
             mag_config=MagLevelConfig(v_mag=6.5),
-            bucket_rows=100,
+            bucket_rows=bucket_rows,
             scan_batch_rows=10,
             fragment_target_rows=10,
             compact_after_files=0,
@@ -374,7 +372,7 @@ def _build_products(
             routed_dir=routing_dir,
             prepared_dir=preparation_dir,
             limiting_magnitude=6.5,
-            bucket_rows=100,
+            bucket_rows=bucket_rows,
             input_mode=input_mode,
             batch_rows=10,
             fragment_target_rows=10,
@@ -489,13 +487,18 @@ def test_classic_build_matches_legacy_builder_when_rows_are_within_cap(
     assert classic_identifiers.read_bytes() == legacy_identifiers.read_bytes()
 
 
-def test_classic_build_folds_deep_rows_into_capped_node(tmp_path: Path) -> None:
+def test_classic_build_folds_deep_rows_into_capped_node(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     source_level = 15
     node_zero_center = _node_center(source_level, 0)
     node_one_center = _node_center(source_level, 1)
     rows = [
         {
             "source_id": "b",
+            "morton_code": _morton_for_node(source_level, 1),
+            "level": source_level,
             "x_icrs_pc": node_one_center[0],
             "y_icrs_pc": node_one_center[1],
             "z_icrs_pc": node_one_center[2],
@@ -503,21 +506,20 @@ def test_classic_build_folds_deep_rows_into_capped_node(tmp_path: Path) -> None:
         },
         {
             "source_id": "a",
+            "morton_code": _morton_for_node(source_level, 0),
+            "level": source_level,
             "x_icrs_pc": node_zero_center[0],
             "y_icrs_pc": node_zero_center[1],
             "z_icrs_pc": node_zero_center[2],
             "mag_abs": 8.0,
         },
     ]
-    _input_root, routing_dir, preparation_dir = _build_products(
-        tmp_path,
-        rows,
-        input_mode=ROUTING_INPUT_MODE_CARTESIAN,
-    )
+    _input_root, routing_dir, preparation_dir = _build_products(tmp_path, rows)
     preparation_file = next(preparation_dir.rglob("*.parquet"))
     assert "render" not in pq.read_schema(preparation_file).names
     output_path = tmp_path / "stars.octree"
     identifiers_path = tmp_path / "identifiers.order"
+    monkeypatch.setattr(classic_parts, "CLASSIC_TASK_IN_MEMORY_MAX_ROWS", 1)
 
     result = build_base_artifacts(
         BaseBuildConfig(
@@ -527,7 +529,7 @@ def test_classic_build_folds_deep_rows_into_capped_node(tmp_path: Path) -> None:
             identifiers_order_path=identifiers_path,
             limiting_magnitude=6.5,
             max_level=14,
-            batch_rows=10,
+            batch_rows=1,
             max_open_files=4,
             star_format_version=1,
         ),
@@ -561,6 +563,40 @@ def test_classic_build_folds_deep_rows_into_capped_node(tmp_path: Path) -> None:
             star.position.y,
             star.position.z,
         ) == pytest.approx(expected, abs=1e-5)
+
+    legacy_input_root = tmp_path / "legacy-input"
+    _write_legacy_input(legacy_input_root, rows, max_level=14)
+    legacy_intermediates = tmp_path / "legacy-intermediates"
+    legacy_render_manifest = build_intermediates(
+        (legacy_input_root / "**" / "*.parquet").as_posix(),
+        legacy_intermediates,
+        plan=BuildPlan(
+            max_level=14,
+            deep_shard_from_level=99,
+            deep_prefix_bits=3,
+            batch_size=10,
+            mag_limit=6.5,
+        ),
+    )
+    legacy_output = tmp_path / "legacy.octree"
+    legacy_identifiers = tmp_path / "legacy.identifiers.order"
+    pack_octree(
+        legacy_render_manifest,
+        legacy_output,
+        plan=PackingPlan(max_open_files=4),
+        descriptor=PackedDescriptorFields(
+            artifact_kind="render",
+            dataset_uuid=_DATASET_UUID,
+        ),
+    )
+    pack_identifiers_order(
+        legacy_intermediates / "identifiers-manifest.json",
+        legacy_identifiers,
+        parent_dataset_uuid=_DATASET_UUID,
+        artifact_uuid=_IDENTIFIERS_UUID,
+    )
+    assert output_path.read_bytes() == legacy_output.read_bytes()
+    assert identifiers_path.read_bytes() == legacy_identifiers.read_bytes()
 
 
 def test_classic_v2_packs_terminal_and_preserves_order_and_positions(
@@ -1222,10 +1258,25 @@ def test_classic_build_supports_isolated_intermediates_and_work_dirs(
         batch_rows=10,
         max_open_files=2,
         star_format_version=1,
+        terminal_waterline=1,
+        topology_dir=tmp_path / "topology",
     )
     build_base_artifacts(v1_config)
     v1_intermediates = preparation_dir / base_build_module.DEFAULT_MATERIALIZED_DIR_NAME
     assert (v1_intermediates / "render-manifest.json").is_file()
+    v1_work = preparation_dir / base_build_module.DEFAULT_BUILD_WORK_DIR_NAME
+    assert (v1_work / "classic-parts").is_dir()
+    assert not (v1_work / "runs").exists()
+    topology_before = {
+        path.relative_to(v1_config.topology_dir).as_posix(): (
+            path.stat().st_ino,
+            path.stat().st_mtime_ns,
+            path.read_bytes(),
+        )
+        for path in sorted(v1_config.topology_dir.rglob("*"))
+        if path.is_file()
+    }
+    assert any(name.endswith("terminal-map.json") for name in topology_before)
 
     v2_intermediates = tmp_path / "v2-intermediates"
     v2_work = tmp_path / "v2-work"
@@ -1247,6 +1298,15 @@ def test_classic_build_supports_isolated_intermediates_and_work_dirs(
     assert (v2_work / materialization.MATERIALIZATION_WORK_STATE_NAME).is_file()
     assert (v2_work / "runs").is_dir()
     assert (v2_work / "partition-cache").is_dir()
+    assert {
+        path.relative_to(v1_config.topology_dir).as_posix(): (
+            path.stat().st_ino,
+            path.stat().st_mtime_ns,
+            path.read_bytes(),
+        )
+        for path in sorted(v1_config.topology_dir.rglob("*"))
+        if path.is_file()
+    } == topology_before
 
 
 @pytest.mark.parametrize("damage", ("missing-reference", "missing-level-file"))
@@ -1346,7 +1406,9 @@ def test_classic_build_resumes_completed_spatial_partitions(
             "z_icrs_pc": node_thirty_two_center[2],
         },
     ]
-    _input_root, routing_dir, preparation_dir = _build_products(tmp_path, rows)
+    _input_root, routing_dir, preparation_dir = _build_products(
+        tmp_path, rows, bucket_rows=1
+    )
     config = BaseBuildConfig(
         routed_dir=routing_dir,
         prepared_dir=preparation_dir,
@@ -1359,44 +1421,40 @@ def test_classic_build_resumes_completed_spatial_partitions(
         partition_from_level=1,
         partition_prefix_bits=1,
         star_format_version=1,
+        terminal_waterline=1,
     )
-    original = materialization._materialize_partition
+    original = classic_parts._materialize_pack
     calls = 0
 
-    def fail_second_partition(*args, **kwargs):
+    def fail_second_pack(*args, **kwargs):
         nonlocal calls
         calls += 1
         if calls == 2:
-            raise RuntimeError("simulated partition failure")
+            raise RuntimeError("simulated pack failure")
         return original(*args, **kwargs)
 
     monkeypatch.setattr(
-        materialization,
-        "_materialize_partition",
-        fail_second_partition,
+        classic_parts,
+        "_materialize_pack",
+        fail_second_pack,
     )
-    with pytest.raises(RuntimeError, match="simulated partition failure"):
+    with pytest.raises(RuntimeError, match="simulated pack failure"):
         build_base_artifacts(config)
 
     work_dir = preparation_dir / base_build_module.DEFAULT_BUILD_WORK_DIR_NAME
     state = json.loads(
-        (work_dir / materialization.MATERIALIZATION_WORK_STATE_NAME).read_text(
+        (work_dir / "classic-parts" / classic_parts.CLASSIC_PARTS_STATE_NAME).read_text(
             encoding="utf-8"
         )
     )
-    assert len(state["completed_partitions"]) == 1
-    monkeypatch.setattr(
-        materialization,
-        "_materialize_partition",
-        original,
-    )
-    monkeypatch.setattr(
-        materialization,
-        "_normalize_group",
-        lambda *_args, **_kwargs: pytest.fail(
-            "completed Preparation groups should be reused"
-        ),
-    )
+    assert len(state["completed_packs"]) == 1
+    rebuilt: list[int] = []
+
+    def track_pack(*args, **kwargs):
+        rebuilt.append(int(kwargs["pack"]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(classic_parts, "_materialize_pack", track_pack)
 
     build_base_artifacts(
         config,
@@ -1404,8 +1462,11 @@ def test_classic_build_resumes_completed_spatial_partitions(
         identifiers_uuid=_IDENTIFIERS_UUID,
     )
 
-    assert (work_dir / materialization.MATERIALIZATION_WORK_STATE_NAME).is_file()
-    assert (work_dir / "partition-cache").is_dir()
+    assert rebuilt == [128]
+    assert (
+        work_dir / "classic-parts" / classic_parts.CLASSIC_PARTS_STATE_NAME
+    ).is_file()
+    assert (work_dir / "classic-parts" / "packs").is_dir()
     manifest = json.loads(
         (
             preparation_dir
@@ -1415,6 +1476,69 @@ def test_classic_build_resumes_completed_spatial_partitions(
     )
     level_two = next(row for row in manifest["levels"] if row["level"] == 2)
     assert [shard["prefix"] for shard in level_two["shards"]] == [0, 1]
+
+
+def test_parallel_classic_spatial_packs_match_sequential_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = []
+    for source_id, node_id in (("a", 0), ("b", 32)):
+        center = _node_center(2, node_id)
+        rows.append(
+            {
+                "source_id": source_id,
+                "morton_code": _morton_for_node(2, node_id),
+                "level": 2,
+                "mag_abs": 7.0,
+                "x_icrs_pc": center[0],
+                "y_icrs_pc": center[1],
+                "z_icrs_pc": center[2],
+            }
+        )
+    _input_root, routing_dir, preparation_dir = _build_products(
+        tmp_path, rows, bucket_rows=1
+    )
+    sequential = BaseBuildConfig(
+        routed_dir=routing_dir,
+        prepared_dir=preparation_dir,
+        output_path=tmp_path / "sequential.octree",
+        identifiers_order_path=tmp_path / "sequential.identifiers.order",
+        limiting_magnitude=6.5,
+        max_level=2,
+        batch_rows=1,
+        max_open_files=2,
+        partition_from_level=1,
+        partition_prefix_bits=1,
+        star_format_version=1,
+        terminal_waterline=1,
+    )
+    build_base_artifacts(
+        sequential,
+        dataset_uuid=_DATASET_UUID,
+        identifiers_uuid=_IDENTIFIERS_UUID,
+    )
+
+    monkeypatch.setattr(classic_parts, "CLASSIC_PARALLEL_MIN_ROWS", 1)
+    monkeypatch.setattr(classic_parts, "CLASSIC_PACK_WORKERS", 2)
+    parallel = replace(
+        sequential,
+        output_path=tmp_path / "parallel.octree",
+        identifiers_order_path=tmp_path / "parallel.identifiers.order",
+        materialized_dir=tmp_path / "parallel-materialized",
+        build_work_dir=tmp_path / "parallel-work",
+    )
+    build_base_artifacts(
+        parallel,
+        dataset_uuid=_DATASET_UUID,
+        identifiers_uuid=_IDENTIFIERS_UUID,
+    )
+
+    assert parallel.output_path.read_bytes() == sequential.output_path.read_bytes()
+    assert (
+        parallel.identifiers_order_path.read_bytes()
+        == sequential.identifiers_order_path.read_bytes()
+    )
 
 
 def test_classic_build_rejects_preparation_without_raw_fields(tmp_path: Path) -> None:

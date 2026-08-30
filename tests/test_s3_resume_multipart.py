@@ -69,3 +69,30 @@ def test_completion_payload_sorted(tmp_path: Path) -> None:
     )
     parts = uploaded_parts_for_completion(state)
     assert [p["PartNumber"] for p in parts] == [1, 2, 3]
+
+
+def test_completion_payload_includes_part_checksums(tmp_path: Path) -> None:
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"x" * 20)
+    state = make_new_state(
+        source_path=source,
+        bucket="bucket",
+        key="obj",
+        region=None,
+        profile="profile",
+        part_size=20,
+        checksum_algorithm="sha256",
+        object_params={},
+    )
+    merge_remote_parts(
+        state,
+        {1: {"ETag": '"1"', "Checksum": "checksum-value"}},
+    )
+
+    assert uploaded_parts_for_completion(state) == [
+        {
+            "PartNumber": 1,
+            "ETag": '"1"',
+            "ChecksumSHA256": "checksum-value",
+        }
+    ]

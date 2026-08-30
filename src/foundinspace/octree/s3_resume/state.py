@@ -102,12 +102,19 @@ def expected_parts(state: dict[str, Any]) -> list[int]:
 
 def uploaded_parts_for_completion(state: dict[str, Any]) -> list[dict[str, Any]]:
     parts: list[dict[str, Any]] = []
+    checksum_algorithm = state["multipart"].get("checksum_algorithm", "NONE")
     for part_number in expected_parts(state):
         part = state["parts"][str(part_number)]
         etag = part.get("etag")
         if not etag:
             raise ValueError(f"missing ETag for part {part_number}")
-        parts.append({"PartNumber": part_number, "ETag": etag})
+        completion_part = {"PartNumber": part_number, "ETag": etag}
+        if checksum_algorithm != "NONE":
+            checksum = part.get("checksum")
+            if not checksum:
+                raise ValueError(f"missing checksum for part {part_number}")
+            completion_part[f"Checksum{checksum_algorithm}"] = checksum
+        parts.append(completion_part)
     return parts
 
 

@@ -16,6 +16,7 @@ input_shards_dir = "../processed/merged/healpix"
 identifiers_map_path = "../processed/identifiers_map.parquet"
 routed_dir = "artifacts/routed"
 prepared_dir = "artifacts/prepared"
+topology_dir = "artifacts/topology"
 materialized_dir = "artifacts/materialized"
 build_work_dir = "artifacts/work"
 render_output_path = "artifacts/stars.octree"
@@ -41,11 +42,11 @@ compact_after_files = 64
 [materialization]
 partition_from_level = 8
 partition_prefix_bits = 6
+terminal_waterline = 1000
 
 [profile]
 name = "terminal-packed"
 max_level = 14
-terminal_waterline = 1000
 
 [packing]
 index_emission_strategy = "temp-pwrite-batched"
@@ -73,6 +74,7 @@ def test_load_project_resolves_relative_paths_from_project_file_dir(
 
     assert project.paths.routed_dir == project_dir / "artifacts" / "routed"
     assert project.paths.prepared_dir == project_dir / "artifacts" / "prepared"
+    assert project.paths.topology_dir == project_dir / "artifacts" / "topology"
     assert project.paths.materialized_dir == project_dir / "artifacts" / "materialized"
     assert (
         project.paths.render_output_path == project_dir / "artifacts" / "stars.octree"
@@ -81,7 +83,7 @@ def test_load_project_resolves_relative_paths_from_project_file_dir(
     assert project.routing.input_mode == "cartesian"
     assert project.profile.name == "terminal-packed"
     assert project.profile.star_format_version == 2
-    assert project.profile.terminal_waterline == 1_000
+    assert project.materialization.terminal_waterline == 1_000
     assert project.sidecars.families[0].name == "meta"
     assert project.sidecars.families[0].fields == ("proper_name",)
 
@@ -124,7 +126,7 @@ def test_load_project_rejects_unknown_routing_input_mode(tmp_path: Path) -> None
         load_project(project_path)
 
 
-def test_classic_profile_selects_star_v1_without_terminal_waterline(
+def test_classic_profile_selects_star_v1_with_shared_terminal_waterline(
     tmp_path: Path,
 ) -> None:
     project_path = tmp_path / "project.toml"
@@ -136,7 +138,7 @@ def test_classic_profile_selects_star_v1_without_terminal_waterline(
     project = load_project(project_path)
 
     assert project.profile.star_format_version == 1
-    assert project.profile.terminal_waterline is None
+    assert project.materialization.terminal_waterline == 1_000
 
 
 def test_render_project_template_is_complete_and_unversioned() -> None:

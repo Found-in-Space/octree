@@ -20,6 +20,7 @@ _DEFAULT_INPUT_SHARDS_DIR = "../data/processed/merged/healpix"
 _DEFAULT_IDENTIFIERS_MAP_PATH = "../data/processed/identifiers_map.parquet"
 _DEFAULT_ROUTED_DIR = "octree/routed"
 _DEFAULT_PREPARED_DIR = "octree/prepared"
+_DEFAULT_TOPOLOGY_DIR = "octree/topology"
 _DEFAULT_MATERIALIZED_DIR = "octree/materialized"
 _DEFAULT_BUILD_WORK_DIR = "octree/work"
 _DEFAULT_RENDER_OUTPUT_PATH = "products/stars-v2.octree"
@@ -38,6 +39,7 @@ class ProjectPaths:
     identifiers_map_path: Path
     routed_dir: Path
     prepared_dir: Path
+    topology_dir: Path
     materialized_dir: Path
     build_work_dir: Path
     render_output_path: Path
@@ -71,13 +73,13 @@ class RoutingProjectConfig:
 class MaterializationProjectConfig:
     partition_from_level: int
     partition_prefix_bits: int
+    terminal_waterline: int
 
 
 @dataclass(frozen=True, slots=True)
 class ProfileProjectConfig:
     name: str
     max_level: int
-    terminal_waterline: int | None
 
     @property
     def star_format_version(self) -> int:
@@ -190,6 +192,7 @@ def load_project(project_path: Path) -> OctreeProject:
         ),
         routed_dir=_project_path(project_dir, paths_raw, "routed_dir"),
         prepared_dir=_project_path(project_dir, paths_raw, "prepared_dir"),
+        topology_dir=_project_path(project_dir, paths_raw, "topology_dir"),
         materialized_dir=_project_path(project_dir, paths_raw, "materialized_dir"),
         build_work_dir=_project_path(project_dir, paths_raw, "build_work_dir"),
         render_output_path=_project_path(project_dir, paths_raw, "render_output_path"),
@@ -243,11 +246,14 @@ def load_project(project_path: Path) -> OctreeProject:
         partition_prefix_bits=_require_int(
             materialization_raw, "partition_prefix_bits"
         ),
+        terminal_waterline=_require_int(materialization_raw, "terminal_waterline"),
     )
     if materialization.partition_from_level < 0:
         raise ValueError("materialization.partition_from_level must be >= 0")
     if materialization.partition_prefix_bits < 0:
         raise ValueError("materialization.partition_prefix_bits must be >= 0")
+    if materialization.terminal_waterline <= 0:
+        raise ValueError("materialization.terminal_waterline must be > 0")
 
     profile_name = _require_str(profile_raw, "name")
     if profile_name not in _PROFILE_NAMES:
@@ -257,17 +263,9 @@ def load_project(project_path: Path) -> OctreeProject:
     max_level = _require_int(profile_raw, "max_level")
     if max_level < 0 or max_level > MORTON_BITS:
         raise ValueError(f"profile.max_level must be in 0..{MORTON_BITS}")
-    terminal_waterline = (
-        _require_int(profile_raw, "terminal_waterline")
-        if profile_name == "terminal-packed"
-        else None
-    )
-    if terminal_waterline is not None and terminal_waterline <= 0:
-        raise ValueError("profile.terminal_waterline must be > 0")
     profile = ProfileProjectConfig(
         name=profile_name,
         max_level=max_level,
-        terminal_waterline=terminal_waterline,
     )
 
     packing = PackingProjectConfig(
@@ -337,6 +335,7 @@ def render_project_template() -> str:
         f'identifiers_map_path = "{_DEFAULT_IDENTIFIERS_MAP_PATH}"\n'
         f'routed_dir = "{_DEFAULT_ROUTED_DIR}"\n'
         f'prepared_dir = "{_DEFAULT_PREPARED_DIR}"\n'
+        f'topology_dir = "{_DEFAULT_TOPOLOGY_DIR}"\n'
         f'materialized_dir = "{_DEFAULT_MATERIALIZED_DIR}"\n'
         f'build_work_dir = "{_DEFAULT_BUILD_WORK_DIR}"\n'
         f'render_output_path = "{_DEFAULT_RENDER_OUTPUT_PATH}"\n'
@@ -357,11 +356,11 @@ def render_project_template() -> str:
         "compact_after_files = 64\n\n"
         "[materialization]\n"
         f"partition_from_level = {DEFAULT_CLASSIC_PARTITION_FROM_LEVEL}\n"
-        f"partition_prefix_bits = {DEFAULT_CLASSIC_PARTITION_PREFIX_BITS}\n\n"
+        f"partition_prefix_bits = {DEFAULT_CLASSIC_PARTITION_PREFIX_BITS}\n"
+        f"terminal_waterline = {DEFAULT_TERMINAL_WATERLINE}\n\n"
         "[profile]\n"
         'name = "terminal-packed"\n'
-        f"max_level = {DEFAULT_CLASSIC_MAX_LEVEL}\n"
-        f"terminal_waterline = {DEFAULT_TERMINAL_WATERLINE}\n\n"
+        f"max_level = {DEFAULT_CLASSIC_MAX_LEVEL}\n\n"
         "[packing]\n"
         'index_emission_strategy = "temp-pwrite-batched"\n\n'
         "[sidecars]\n"

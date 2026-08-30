@@ -40,6 +40,7 @@ def _object_params(
     *,
     storage_class: str | None,
     content_type: str | None,
+    cache_control: str | None,
     metadata: tuple[str, ...],
     sse: str | None,
     sse_kms_key_id: str | None,
@@ -49,6 +50,8 @@ def _object_params(
         params["StorageClass"] = storage_class
     if content_type:
         params["ContentType"] = content_type
+    if cache_control:
+        params["CacheControl"] = cache_control
     if metadata:
         out: dict[str, str] = {}
         for pair in metadata:
@@ -179,6 +182,7 @@ def main() -> None:
 )
 @click.option("--storage-class", default=None, type=str)
 @click.option("--content-type", default=None, type=str)
+@click.option("--cache-control", default=None, type=str)
 @click.option("--metadata", "metadata", multiple=True)
 @click.option("--sse", default=None, type=str)
 @click.option("--sse-kms-key-id", default=None, type=str)
@@ -200,6 +204,7 @@ def put(
     retry_mode: str,
     storage_class: str | None,
     content_type: str | None,
+    cache_control: str | None,
     metadata: tuple[str, ...],
     sse: str | None,
     sse_kms_key_id: str | None,
@@ -214,6 +219,7 @@ def put(
     object_params = _object_params(
         storage_class=storage_class,
         content_type=content_type,
+        cache_control=cache_control,
         metadata=metadata,
         sse=sse,
         sse_kms_key_id=sse_kms_key_id,
@@ -385,6 +391,7 @@ def resume_cmd(
         retry_mode=retry_mode,
         storage_class=state.get("object_params", {}).get("StorageClass"),
         content_type=state.get("object_params", {}).get("ContentType"),
+        cache_control=state.get("object_params", {}).get("CacheControl"),
         metadata=tuple(
             f"{k}={v}"
             for k, v in state.get("object_params", {}).get("Metadata", {}).items()

@@ -9,6 +9,7 @@ def project_text(
     input_shards_dir: Path | None = None,
     routed_dir: Path | None = None,
     prepared_dir: Path | None = None,
+    topology_dir: Path | None = None,
     materialized_dir: Path | None = None,
     build_work_dir: Path | None = None,
     render_output_path: Path | None = None,
@@ -26,6 +27,7 @@ def project_text(
     input_shards_dir = input_shards_dir or root / "input"
     routed_dir = routed_dir or root / "routed"
     prepared_dir = prepared_dir or root / "prepared"
+    topology_dir = topology_dir or root / "topology"
     materialized_dir = materialized_dir or root / "materialized"
     build_work_dir = build_work_dir or root / "work"
     render_output_path = render_output_path or root / "stars.octree"
@@ -41,6 +43,7 @@ input_shards_dir = "{input_shards_dir.as_posix()}"
 identifiers_map_path = "{(root / "identifiers-map.parquet").as_posix()}"
 routed_dir = "{routed_dir.as_posix()}"
 prepared_dir = "{prepared_dir.as_posix()}"
+topology_dir = "{topology_dir.as_posix()}"
 materialized_dir = "{materialized_dir.as_posix()}"
 build_work_dir = "{build_work_dir.as_posix()}"
 render_output_path = "{render_output_path.as_posix()}"
@@ -66,11 +69,11 @@ compact_after_files = 64
 [materialization]
 partition_from_level = 8
 partition_prefix_bits = 6
+terminal_waterline = {terminal_waterline}
 
 [profile]
 name = "{profile_name}"
 max_level = {max_level}
-terminal_waterline = {terminal_waterline}
 
 [packing]
 index_emission_strategy = "{index_emission_strategy}"

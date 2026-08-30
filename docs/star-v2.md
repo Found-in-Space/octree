@@ -14,17 +14,25 @@ encoding delta.
 New project files default to:
 
 ```toml
+[paths]
+topology_dir = "octree/topology"
+
+[materialization]
+terminal_waterline = 1000
+
 [profile]
 name = "terminal-packed"
 max_level = 14
-terminal_waterline = 1000
 ```
 
-Selecting `name = "classic"` disables terminal packing and emits the STAR v1
-index; omit `terminal_waterline` for that profile. Build policy has no
-command-line override.
+Both profiles get or build the same content-addressed terminal map under
+`paths.topology_dir`. Selecting `name = "classic"` emits the STAR v1 index and
+uses terminal nodes only as bounded, spatially contiguous work partitions; it
+does not collapse the published v1 topology. Selecting `name =
+"terminal-packed"` also uses the map as the authoritative STAR v2 terminal
+topology. There is no separate classic topology path or command-line override.
 
-For v2, topology planning first writes immutable, content-addressed count runs
+Shared topology planning first writes immutable, content-addressed count runs
 for each sorted input group and occupied octree level. Input is read in bounded
 batches; each batch is vector-counted with NumPy and added to a levelled run
 accumulator. Runs are reduced through a bounded fan-in merge, so memory and
@@ -67,8 +75,9 @@ geometry. The combined payload is ordered by absolute magnitude, then source
 and source ID; null magnitudes sort last. `identifiers.order` uses the same
 cell topology and ordinal order.
 
-The waterline is build policy and is not serialized. `max_level` remains the
-configured classic level cap even when no emitted node reaches that level.
+The shared waterline is build policy and is not serialized into either final
+artifact. `max_level` remains the configured classic level cap even when no
+emitted v2 node reaches that level.
 
 ## Shared index packing
 

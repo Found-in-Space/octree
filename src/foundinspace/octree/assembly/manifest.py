@@ -156,6 +156,7 @@ def write_manifest(
     mag_limit: float,
     name: str = "manifest.json",
     terminal_map_path: Path | None = None,
+    payload_layout: str | None = None,
 ) -> Path:
     for entry in shard_entries:
         validate_shard(out_dir, entry, expected_magic=index_magic)
@@ -203,6 +204,8 @@ def write_manifest(
         manifest["terminal_map_path"] = terminal_map_path.relative_to(
             out_dir
         ).as_posix()
+    if payload_layout is not None:
+        manifest["payload_layout"] = payload_layout
 
     out_manifest = manifest_path(out_dir, name=name)
     tmp_path = out_dir / f".{name}.tmp"

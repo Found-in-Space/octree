@@ -170,6 +170,50 @@ def test_preparation_first_run_writes_sorted_groups_and_state(tmp_path: Path) ->
     assert "final_nodes" not in state["products"]["prepared_groups"][0]
 
 
+def test_clean_preparation_reuse_does_not_write_files(tmp_path: Path) -> None:
+    input_root = tmp_path / "input"
+    _write_routing_pixel(
+        input_root,
+        "100",
+        [
+            {
+                "source": "gaia",
+                "source_id": "a",
+                "morton_code": _morton_for_node(1, 0),
+                "level": 1,
+                "mag_abs": 7.0,
+            }
+        ],
+    )
+    routing_dir = tmp_path / "routing"
+    preparation_dir = tmp_path / "preparation"
+    route_contributions(_routing_config(input_root, routing_dir))
+    report_path = prepare_contributions(
+        _preparation_config(routing_dir, preparation_dir)
+    )
+
+    def snapshot() -> dict[str, tuple[int, int, int, bytes]]:
+        return {
+            path.relative_to(tmp_path).as_posix(): (
+                path.stat().st_ino,
+                path.stat().st_size,
+                path.stat().st_mtime_ns,
+                path.read_bytes(),
+            )
+            for root in (routing_dir, preparation_dir)
+            for path in sorted(root.rglob("*"))
+            if path.is_file()
+        }
+
+    before = snapshot()
+    reused_report_path = prepare_contributions(
+        _preparation_config(routing_dir, preparation_dir)
+    )
+
+    assert reused_report_path == report_path
+    assert snapshot() == before
+
+
 def test_preparation_all_rebuilds_existing_groups(tmp_path: Path) -> None:
     input_root = tmp_path / "input"
     _write_routing_pixel(
@@ -617,9 +661,7 @@ def test_preparation_rejects_old_routing_policy_identity(tmp_path: Path) -> None
         path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="rerun route with --force"):
-        prepare_contributions(
-            _preparation_config(routing_dir, preparation_dir)
-        )
+        prepare_contributions(_preparation_config(routing_dir, preparation_dir))
 
 
 def test_preparation_rejects_routing_group_schema_drift(tmp_path: Path) -> None:

@@ -98,6 +98,11 @@ def prepare_contributions(config: PreparationConfig) -> Path:
     state = _read_json(state_path)
     _validate_routing_identity(config, manifest, state)
 
+    if not config.force and _published_preparation_is_current(config, state):
+        # Preparation is a shared immutable product. A second profile may
+        # validate and reuse it, but must not checkpoint, clean, or rewrite it.
+        return config.prepared_dir / REPORT_NAME
+
     if config.force and config.prepared_dir.exists():
         shutil.rmtree(config.prepared_dir)
     config.prepared_dir.mkdir(parents=True, exist_ok=True)
@@ -257,6 +262,46 @@ def prepare_contributions(config: PreparationConfig) -> Path:
     report_path = config.prepared_dir / REPORT_NAME
     _atomic_write_json(report_path, report)
     return report_path
+
+
+def _published_preparation_is_current(
+    config: PreparationConfig,
+    state: dict[str, Any],
+) -> bool:
+    if not config.prepared_dir.is_dir():
+        return False
+    report_path = config.prepared_dir / REPORT_NAME
+    if not report_path.is_file():
+        return False
+    build = state.get("builds", {}).get("preparation")
+    if not isinstance(build, dict) or build.get("status") != "complete":
+        return False
+    dirty = state.get("dirty", {}).get("preparation")
+    if not isinstance(dirty, dict):
+        return False
+    if (
+        dirty.get("all")
+        or dirty.get("group_keys")
+        or dirty.get("deleted_routed_group_keys")
+    ):
+        return False
+    groups = state.get("products", {}).get("prepared_groups")
+    if not isinstance(groups, list) or not groups:
+        return False
+    seen: set[Path] = set()
+    for group in groups:
+        files = group.get("files")
+        if not isinstance(files, list) or not files:
+            return False
+        for raw_path in files:
+            relative = Path(str(raw_path))
+            if relative.is_absolute() or ".." in relative.parts:
+                return False
+            path = config.prepared_dir / relative
+            if path in seen or not path.is_file():
+                return False
+            seen.add(path)
+    return True
 
 
 def _validate_routing_identity(

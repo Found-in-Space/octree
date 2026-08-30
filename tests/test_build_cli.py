@@ -102,14 +102,14 @@ def test_build_builds_classic_output_from_project(monkeypatch, tmp_path: Path) -
     assert calls[0].retain_relocation_files is True
     assert calls[0].max_level == 14
     assert calls[0].star_format_version == 1
-    assert calls[0].terminal_waterline is None
+    assert calls[0].terminal_waterline == 1_000
     assert calls[0].index_emission_strategy == IndexEmissionStrategy.FORWARD
     assert calls[0].materialized_dir == tmp_path / "materialized"
     assert calls[0].build_work_dir == tmp_path / "work"
     assert "rows=12" in result.output
     assert "folded_rows=3" in result.output
     assert "profile=classic" in result.output
-    assert "terminal_waterline=disabled" in result.output
+    assert "terminal_waterline=1000" in result.output
     assert "index_emission_strategy=forward" in result.output
 
 

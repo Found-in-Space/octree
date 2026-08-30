@@ -163,6 +163,7 @@ def _make_project(
             identifiers_map_path=identifiers_map_path,
             routed_dir=tmp_path / "routed",
             prepared_dir=preparation_dir,
+            topology_dir=tmp_path / "topology",
             materialized_dir=tmp_path / "materialized",
             build_work_dir=tmp_path / "work",
             render_output_path=render_path,
@@ -186,11 +187,11 @@ def _make_project(
         materialization=MaterializationProjectConfig(
             partition_from_level=8,
             partition_prefix_bits=6,
+            terminal_waterline=1_000,
         ),
         profile=ProfileProjectConfig(
             name="classic",
             max_level=0,
-            terminal_waterline=None,
         ),
         packing=PackingProjectConfig(index_emission_strategy="temp-pwrite-batched"),
         sidecars=SidecarsProjectConfig(

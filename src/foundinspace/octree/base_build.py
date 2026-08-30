@@ -41,7 +41,7 @@ from .sources.routing import (
     PIPELINE_STATE_NAME,
     TREE_MANIFEST_NAME,
 )
-from .terminal_packing import TerminalMap
+from .terminal_packing import TerminalMap, get_or_build_terminal_map
 
 DEFAULT_MATERIALIZED_DIR_NAME = "materialized"
 DEFAULT_BUILD_WORK_DIR_NAME = ".build-work"
@@ -69,6 +69,7 @@ class BaseBuildConfig:
     )
     materialized_dir: Path | None = None
     build_work_dir: Path | None = None
+    topology_dir: Path | None = None
 
     def validate(self) -> None:
         if not self.routed_dir.is_dir():
@@ -89,9 +90,7 @@ class BaseBuildConfig:
             raise ValueError("limiting_magnitude must be finite")
         if self.star_format_version not in (1, 2):
             raise ValueError("star_format_version must be 1 or 2")
-        if self.star_format_version == 2 and (
-            self.terminal_waterline is None or self.terminal_waterline <= 0
-        ):
+        if self.terminal_waterline is None or self.terminal_waterline <= 0:
             raise ValueError("terminal_waterline must be > 0")
         strategy = IndexEmissionStrategy(self.index_emission_strategy)
         if strategy not in (
@@ -124,9 +123,7 @@ def _final_base_identity(config: BaseBuildConfig, *, input_identity: str) -> str
         "algorithm": BASE_PACKING_ALGORITHM,
         "input_identity": input_identity,
         "star_format_version": config.star_format_version,
-        "terminal_waterline": (
-            config.terminal_waterline if config.star_format_version == 2 else None
-        ),
+        "terminal_waterline": config.terminal_waterline,
         "output_path": str(config.output_path.resolve()),
         "identifiers_order_path": str(config.identifiers_order_path.resolve()),
     }
@@ -316,7 +313,9 @@ def _tracked_preparation_groups(
 
     groups: list[PreparationGroupInput] = []
     seen: set[Path] = set()
-    for group in sorted(prepared_groups, key=lambda row: row["key"]):
+    for contributor_order, group in enumerate(
+        sorted(prepared_groups, key=lambda row: row["key"])
+    ):
         files: list[Path] = []
         for rel_path in group.get("files", []):
             path = prepared_dir / str(rel_path)
@@ -333,6 +332,9 @@ def _tracked_preparation_groups(
                 row_count=int(group["row_count"]),
                 files=tuple(files),
                 natural_max_level=_group_natural_max_level(group),
+                path_octants=tuple(int(value) for value in group["path_octants"]),
+                kind=str(group["kind"]),
+                contributor_order=contributor_order,
             )
         )
     if not groups:
@@ -400,6 +402,15 @@ def build_base_artifacts(
         config.routed_dir,
         config.prepared_dir,
     )
+    topology_dir = config.topology_dir or (config.prepared_dir.parent / "topology")
+    terminal_map_path = get_or_build_terminal_map(
+        groups=preparation_groups,
+        topology_dir=topology_dir,
+        max_level=config.max_level,
+        waterline=int(config.terminal_waterline),
+        batch_size=config.batch_rows,
+        merge_fan_in=max(2, config.max_open_files),
+    )
     materialization_plan = MaterializationPlan(
         max_level=config.max_level,
         limiting_magnitude=config.limiting_magnitude,
@@ -464,11 +475,23 @@ def build_base_artifacts(
         plan=materialization_plan,
     )
     if materialized is None:
-        materialized = materialize_groups(
-            groups=preparation_groups,
-            build_work_dir=build_work_dir,
-            plan=materialization_plan,
-        )
+        if config.star_format_version == 1:
+            from .materialization.classic_parts import materialize_classic_parts
+
+            materialized = materialize_classic_parts(
+                groups=preparation_groups,
+                build_work_dir=build_work_dir,
+                terminal_map_path=terminal_map_path,
+                plan=materialization_plan,
+                input_identity=input_identity,
+            )
+        else:
+            materialized = materialize_groups(
+                groups=preparation_groups,
+                build_work_dir=build_work_dir,
+                plan=materialization_plan,
+                terminal_map_path=terminal_map_path,
+            )
         work_artifacts_dir = materialized.render_manifest_path.parent
         _publish_intermediates(
             temporary_dir=work_artifacts_dir,

@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import BinaryIO
 from uuid import UUID
 
+import numpy as np
+
 from .assembly.formats import INDEX_FILE_HDR, INDEX_RECORD
 from .assembly.identity_encoder import iter_identity_rows
 from .packing.lookup import FixedRecordFile
@@ -337,6 +339,14 @@ def pack_identifiers_order(
         raise ValueError(
             f"Expected identifiers manifest, got {manifest.artifact_kind!r}"
         )
+    if manifest.payload_layout == "per-shard-contiguous/v1":
+        _pack_contiguous_identifiers_order(
+            manifest,
+            output_path,
+            parent_dataset_uuid=parent_dataset_uuid,
+            artifact_uuid=artifact_uuid,
+        )
+        return
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload_tmp = output_path.with_name(f".{output_path.name}.payload.tmp")
     directory_tmp = output_path.with_name(f".{output_path.name}.directory.tmp")
@@ -396,6 +406,114 @@ def pack_identifiers_order(
                 shutil.copyfileobj(dir_fp, out_fp)
             with open(payload_tmp, "rb") as payload_fp:
                 shutil.copyfileobj(payload_fp, out_fp)
+    finally:
+        payload_tmp.unlink(missing_ok=True)
+        directory_tmp.unlink(missing_ok=True)
+
+
+_INDEX_ARRAY_DTYPE = np.dtype(
+    [
+        ("node_id", "<u8"),
+        ("payload_offset", "<u8"),
+        ("payload_length", "<u4"),
+        ("star_count", "<u4"),
+    ]
+)
+_DIRECTORY_ARRAY_DTYPE = np.dtype(
+    {
+        "names": (
+            "level",
+            "padding",
+            "node_id",
+            "star_count",
+            "payload_offset",
+            "payload_length",
+        ),
+        "formats": ("<u2", "V2", "<u8", "<u4", "<u8", "<u8"),
+        "offsets": (0, 2, 4, 12, 16, 24),
+        "itemsize": DIRECTORY_RECORD_SIZE,
+    }
+)
+
+
+def _pack_contiguous_identifiers_order(
+    manifest,
+    output_path: Path,
+    *,
+    parent_dataset_uuid: UUID,
+    artifact_uuid: UUID,
+) -> None:
+    """Assemble direct classic identity shards with blockwise directories."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    payload_tmp = output_path.with_name(f".{output_path.name}.payload.tmp")
+    directory_tmp = output_path.with_name(f".{output_path.name}.directory.tmp")
+    record_count = 0
+    try:
+        with open(payload_tmp, "wb") as payload_fp, open(directory_tmp, "wb") as dir_fp:
+            for shard in manifest.shards:
+                shard_base = payload_fp.tell()
+                described_bytes = 0
+                with open(shard.index_path, "rb") as index_fp:
+                    header = index_fp.read(INDEX_FILE_HDR.size)
+                    if len(header) != INDEX_FILE_HDR.size:
+                        raise ValueError(
+                            f"Truncated identifiers index: {shard.index_path}"
+                        )
+                    remaining = shard.record_count
+                    while remaining:
+                        take = min(remaining, 1_000_000)
+                        source = np.fromfile(
+                            index_fp, dtype=_INDEX_ARRAY_DTYPE, count=take
+                        )
+                        if len(source) != take:
+                            raise ValueError(
+                                f"Truncated identifiers records: {shard.index_path}"
+                            )
+                        directory = np.zeros(take, dtype=_DIRECTORY_ARRAY_DTYPE)
+                        directory["level"] = shard.key.level
+                        directory["node_id"] = source["node_id"]
+                        directory["star_count"] = source["star_count"]
+                        directory["payload_offset"] = source[
+                            "payload_offset"
+                        ] + np.uint64(shard_base)
+                        directory["payload_length"] = source["payload_length"]
+                        dir_fp.write(directory.tobytes())
+                        described_bytes += int(
+                            source["payload_length"].sum(dtype=np.uint64)
+                        )
+                        record_count += take
+                        remaining -= take
+                    if index_fp.read(1):
+                        raise ValueError(
+                            f"Trailing identifiers index bytes: {shard.index_path}"
+                        )
+                shard_size = shard.payload_path.stat().st_size
+                if described_bytes != shard_size:
+                    raise ValueError(
+                        "Identifiers shard directory does not cover its payload: "
+                        f"{shard.payload_path}"
+                    )
+                with open(shard.payload_path, "rb") as source_fp:
+                    shutil.copyfileobj(source_fp, payload_fp, 8 << 20)
+
+        directory_length = directory_tmp.stat().st_size
+        payload_length = payload_tmp.stat().st_size
+        payload_offset = HEADER_SIZE + directory_length
+        header = _pack_header(
+            parent_dataset_uuid=parent_dataset_uuid,
+            artifact_uuid=artifact_uuid,
+            directory_offset=HEADER_SIZE,
+            directory_length=directory_length,
+            payload_offset=payload_offset,
+            payload_length=payload_length,
+            record_count=record_count,
+        )
+        with open(output_path, "wb") as out_fp:
+            out_fp.write(header)
+            with open(directory_tmp, "rb") as dir_fp:
+                shutil.copyfileobj(dir_fp, out_fp, 8 << 20)
+            with open(payload_tmp, "rb") as payload_fp:
+                shutil.copyfileobj(payload_fp, out_fp, 8 << 20)
     finally:
         payload_tmp.unlink(missing_ok=True)
         directory_tmp.unlink(missing_ok=True)

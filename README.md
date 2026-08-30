@@ -182,8 +182,9 @@ the locator from 23.55 GB to 7.83 GB without a measured lookup regression.
 The default temporary-index packing strategy needs scratch capacity
 approximately equal to the final index section in addition to the atomic
 final-output temporary file. Select the lower-scratch `forward` strategy with
-`packing.index_emission_strategy` in the project file. Scratch files and the
-topology cache live below `paths.build_work_dir`.
+`packing.index_emission_strategy` in the project file. Scratch files live below
+`paths.build_work_dir`; the profile-neutral terminal map lives below
+`paths.topology_dir`.
 
 Generate a starter config:
 
@@ -222,13 +223,18 @@ object is:
 Cache-Control: public, max-age=31536000, immutable
 ```
 
-> **Before the next production upload:** the current `s3-resume` implementation
-> supports `ContentType` and user-defined metadata, but does not yet expose
-> S3's `CacheControl` parameter. Add a `--cache-control` option, pass it as
-> `CacheControl` when creating the multipart upload, persist it in the resume
-> state, and add tests before publishing. Do not use `--metadata
-> Cache-Control=...`; that creates `x-amz-meta-cache-control` rather than the
-> HTTP `Cache-Control` response header.
+Pass the policy with `--cache-control` when initiating an upload. The value is
+stored in the resume state and sent as S3's `CacheControl` system parameter:
+
+```bash
+uv run s3-resume put path/to/stars.octree \
+  s3://foundinspace/<versioned-prefix>/stars.octree \
+  --cache-control "public, max-age=31536000, immutable"
+```
+
+Do not use `--metadata Cache-Control=...`; that creates
+`x-amz-meta-cache-control` rather than the HTTP `Cache-Control` response
+header.
 
 After upload, verify the S3 metadata before making the URL public:
 

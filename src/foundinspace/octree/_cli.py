@@ -717,6 +717,7 @@ def build(
         BaseBuildConfig(
             routed_dir=project.paths.routed_dir,
             prepared_dir=project.paths.prepared_dir,
+            topology_dir=project.paths.topology_dir,
             output_path=project.paths.render_output_path,
             identifiers_order_path=project.paths.identifiers_order_output_path,
             limiting_magnitude=project.dataset.limiting_magnitude,
@@ -727,7 +728,7 @@ def build(
             partition_prefix_bits=project.materialization.partition_prefix_bits,
             retain_relocation_files=retain_relocation_files,
             star_format_version=project.profile.star_format_version,
-            terminal_waterline=project.profile.terminal_waterline,
+            terminal_waterline=project.materialization.terminal_waterline,
             index_emission_strategy=IndexEmissionStrategy(
                 project.packing.index_emission_strategy
             ),
@@ -744,7 +745,7 @@ def build(
         f"max_level={project.profile.max_level}, "
         f"index_emission_strategy={project.packing.index_emission_strategy}, "
         "terminal_waterline="
-        f"{project.profile.terminal_waterline or 'disabled'}, "
+        f"{project.materialization.terminal_waterline}, "
         f"dataset_uuid={result.dataset_uuid}"
     )
     click.echo(f"Wrote {result.output_path}")

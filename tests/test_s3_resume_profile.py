@@ -27,6 +27,31 @@ def test_put_uses_aws_profile_env_in_state(tmp_path: Path) -> None:
     assert state["aws"]["profile"] == "env-profile"
 
 
+def test_put_persists_cache_control_as_system_metadata(tmp_path: Path) -> None:
+    source = tmp_path / "input.bin"
+    source.write_bytes(b"x" * 1024)
+    state_path = tmp_path / ".input.bin.s3mpu.json"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "put",
+            str(source),
+            "s3://bucket/key",
+            "--cache-control",
+            "public, max-age=31536000, immutable",
+            "--dry-run-init",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["object_params"]["CacheControl"] == (
+        "public, max-age=31536000, immutable"
+    )
+
+
 def test_make_s3_client_uses_default_chain_when_profile_is_none(
     monkeypatch: Any,
 ) -> None:

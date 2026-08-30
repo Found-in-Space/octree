@@ -39,6 +39,7 @@ class PackingManifest:
     payload_codec: str
     shards: tuple[ShardEntry, ...]
     terminal_map_path: Path | None
+    payload_layout: str | None
 
 
 def _parse_world_center(raw: object) -> tuple[float, float, float]:
@@ -142,4 +143,7 @@ def read_packing_manifest(
         payload_codec=payload_codec,
         shards=tuple(shards),
         terminal_map_path=terminal_map_path,
+        payload_layout=(
+            str(raw["payload_layout"]) if "payload_layout" in raw else None
+        ),
     )

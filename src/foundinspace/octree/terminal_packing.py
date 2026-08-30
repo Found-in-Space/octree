@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -477,6 +478,39 @@ def build_terminal_map(
         source_identity=source_identity,
         counts_identity=counts_identity,
     )
+
+
+def get_or_build_terminal_map(
+    *,
+    groups: Sequence[Any],
+    topology_dir: Path,
+    max_level: int,
+    waterline: int,
+    batch_size: int,
+    merge_fan_in: int = _DEFAULT_MERGE_FAN_IN,
+) -> Path:
+    """Return the shared terminal map, building it once when necessary.
+
+    The map is output-profile neutral: STAR v2 uses it as published topology,
+    while STAR v1 uses the same terminal roots only as bounded work partitions.
+    A filesystem lock serializes v1/v2 builds that start concurrently.
+    """
+    topology_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = topology_dir / ".terminal-map.lock"
+    with open(lock_path, "a+b") as lock_fp:
+        fcntl.flock(lock_fp.fileno(), fcntl.LOCK_EX)
+        try:
+            return build_terminal_map(
+                groups=groups,
+                work_dir=topology_dir / ".work",
+                artifacts_dir=topology_dir,
+                max_level=max_level,
+                waterline=waterline,
+                batch_size=batch_size,
+                merge_fan_in=merge_fan_in,
+            )
+        finally:
+            fcntl.flock(lock_fp.fileno(), fcntl.LOCK_UN)
 
 
 def _source_input_identity(groups: Sequence[Any], *, max_level: int) -> str:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
+
+import numpy as np
 
 from ..terminal_packing import TerminalMap
 from .dfs import iter_cells_dfs
@@ -275,6 +278,8 @@ def relocate_payloads_dfs(
     plan: PackingPlan,
 ) -> PayloadPassResult:
     manifest = read_packing_manifest(manifest_path, deep_validation=False)
+    if manifest.payload_layout == "global-dfs/v1":
+        return _relocate_global_dfs_payload(manifest, output_fp)
     shard_by_key = {
         (s.key.level, s.key.prefix_bits, s.key.prefix): s for s in manifest.shards
     }
@@ -366,6 +371,92 @@ def relocate_payloads_dfs(
         flush=True,
     )
 
+    return PayloadPassResult(
+        payload_end_offset=output_fp.tell(),
+        relocation_files=tuple(relocation_paths),
+    )
+
+
+_INDEX_DTYPE = np.dtype(
+    [
+        ("node_id", "<u8"),
+        ("payload_offset", "<u8"),
+        ("payload_length", "<u4"),
+        ("star_count", "<u4"),
+    ]
+)
+
+
+def _relocate_global_dfs_payload(
+    manifest,
+    output_fp: BinaryIO,
+) -> PayloadPassResult:
+    """Copy a direct classic payload once and translate offsets blockwise."""
+    payload_paths = {shard.payload_path for shard in manifest.shards}
+    if len(payload_paths) != 1:
+        raise ValueError("global-dfs payload layout requires one shared payload file")
+    payload_path = next(iter(payload_paths))
+    payload_base = output_fp.tell()
+    with open(payload_path, "rb") as source:
+        shutil.copyfileobj(source, output_fp, 8 << 20)
+    payload_size = payload_path.stat().st_size
+    if output_fp.tell() != payload_base + payload_size:
+        raise ValueError("Global DFS payload copy length mismatch")
+
+    relocation_paths: list[Path] = []
+    copied_cells = 0
+    described_bytes = 0
+    for shard in manifest.shards:
+        reloc_path = manifest.root_dir / f"{shard.index_path.name}.reloc"
+        with open(shard.index_path, "rb") as source, open(reloc_path, "wb") as target:
+            header = source.read(RELOC_HEADER_SIZE)
+            if len(header) != RELOC_HEADER_SIZE:
+                raise ValueError(f"Truncated direct classic index: {shard.index_path}")
+            target.write(
+                RELOC_HEADER_FMT.pack(
+                    RELOC_MAGIC,
+                    1,
+                    RELOC_HEADER_SIZE,
+                    shard.key.level,
+                    shard.key.prefix_bits,
+                    0,
+                    RELOC_RECORD_SIZE,
+                    shard.key.prefix,
+                    shard.record_count,
+                )
+            )
+            remaining = shard.record_count
+            while remaining:
+                take = min(remaining, 1_000_000)
+                records = np.fromfile(source, dtype=_INDEX_DTYPE, count=take)
+                if len(records) != take:
+                    raise ValueError(
+                        f"Truncated direct classic records: {shard.index_path}"
+                    )
+                records = records.copy()
+                records["payload_offset"] += np.uint64(payload_base)
+                described_bytes += int(records["payload_length"].sum(dtype=np.uint64))
+                target.write(records.tobytes())
+                copied_cells += take
+                remaining -= take
+            if source.read(1):
+                raise ValueError(
+                    f"Trailing direct classic index bytes: {shard.index_path}"
+                )
+        relocation_paths.append(reloc_path)
+    if described_bytes != payload_size:
+        raise ValueError(
+            "Global DFS payload directory does not cover the payload exactly: "
+            f"described={described_bytes}, payload={payload_size}"
+        )
+    print(
+        (
+            "Packing: Phase A direct-part copy "
+            f"cells={copied_cells:,}, bytes={_format_bytes(payload_size)}, "
+            f"files=1, out_offset={output_fp.tell():,}"
+        ),
+        flush=True,
+    )
     return PayloadPassResult(
         payload_end_offset=output_fp.tell(),
         relocation_files=tuple(relocation_paths),

@@ -115,6 +115,9 @@ class PreparationGroupInput:
     row_count: int
     files: tuple[Path, ...]
     natural_max_level: int | None = None
+    path_octants: tuple[int, ...] = ()
+    kind: str = "pack"
+    contributor_order: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,9 +172,7 @@ def materialization_input_identity(
         "partition_from_level": plan.partition_from_level,
         "partition_prefix_bits": plan.partition_prefix_bits,
         "star_format_version": plan.star_format_version,
-        "terminal_waterline": (
-            plan.terminal_waterline if plan.star_format_version == 2 else None
-        ),
+        "terminal_waterline": plan.terminal_waterline,
         "row_schema": list(_RAW_COLUMNS),
         "render_record_size": RENDER_RECORD_SIZE,
         "sort_keys": [name for name, _order in _CANONICAL_SORT_KEYS],
@@ -351,6 +352,7 @@ def materialize_groups(
     groups: Sequence[PreparationGroupInput],
     build_work_dir: Path,
     plan: MaterializationPlan,
+    terminal_map_path: Path | None = None,
 ) -> MaterializationResult:
     if not groups:
         raise ValueError("Materialization requires Preparation groups")
@@ -369,18 +371,19 @@ def materialize_groups(
     partition_cache_dir.mkdir(parents=True, exist_ok=True)
     topology_cache_dir.mkdir(parents=True, exist_ok=True)
     terminal_map: TerminalMap | None = None
-    cached_terminal_map_path: Path | None = None
+    cached_terminal_map_path: Path | None = terminal_map_path
     if plan.star_format_version == 2:
         if plan.terminal_waterline is None:
             raise ValueError("STAR v2 materialization requires a terminal waterline")
-        cached_terminal_map_path = build_terminal_map(
-            groups=groups,
-            work_dir=build_work_dir,
-            artifacts_dir=topology_cache_dir,
-            max_level=plan.max_level,
-            waterline=plan.terminal_waterline,
-            batch_size=plan.batch_rows,
-        )
+        if cached_terminal_map_path is None:
+            cached_terminal_map_path = build_terminal_map(
+                groups=groups,
+                work_dir=build_work_dir,
+                artifacts_dir=topology_cache_dir,
+                max_level=plan.max_level,
+                waterline=plan.terminal_waterline,
+                batch_size=plan.batch_rows,
+            )
         terminal_map = TerminalMap(cached_terminal_map_path)
     topology_identity = _topology_identity(plan, cached_terminal_map_path)
 
@@ -489,7 +492,9 @@ def materialize_groups(
         build_work_dir=build_work_dir,
         artifacts_dir=artifacts_dir,
         completed_partitions=completed_partitions,
-        cached_terminal_map_path=cached_terminal_map_path,
+        cached_terminal_map_path=(
+            cached_terminal_map_path if plan.star_format_version == 2 else None
+        ),
     )
 
     render_entries: list[dict[str, Any]] = []
